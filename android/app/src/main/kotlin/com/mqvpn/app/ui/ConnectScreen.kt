@@ -7,6 +7,7 @@ import android.app.Activity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -15,7 +16,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.layout.Row
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
@@ -24,9 +24,6 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
@@ -45,18 +42,21 @@ fun ConnectScreen(
     val state by viewModel.vpnState.collectAsStateWithLifecycle()
     val stats by viewModel.stats.collectAsStateWithLifecycle()
     val paths by viewModel.paths.collectAsStateWithLifecycle()
-
-    var serverAddress by rememberSaveable { mutableStateOf("160.251.143.149") }
-    var serverPort by rememberSaveable { mutableStateOf("443") }
-    var authKey by rememberSaveable { mutableStateOf("tiiUC0/Fx51w5XuxAnpOgdRZb19SLqglwFdhxbbsbnM=") }
-    var insecure by rememberSaveable { mutableStateOf(true) }
-    var killSwitch by rememberSaveable { mutableStateOf(false) }
+    val uiConfig by viewModel.uiConfig.collectAsStateWithLifecycle()
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
-            viewModel.connect(buildConfig(serverAddress, serverPort, authKey, insecure, killSwitch))
+            viewModel.connect(
+                buildConfig(
+                    uiConfig.serverAddress,
+                    uiConfig.serverPort,
+                    uiConfig.authKey,
+                    uiConfig.insecure,
+                    uiConfig.killSwitch,
+                )
+            )
         }
     }
 
@@ -69,11 +69,11 @@ fun ConnectScreen(
         Text("mqvpn", style = MaterialTheme.typography.headlineMedium)
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Server config inputs
+        // Server config inputs (persisted in DataStore via ViewModel)
         val isDisconnected = state is MqvpnState.Disconnected || state is MqvpnState.Error
         OutlinedTextField(
-            value = serverAddress,
-            onValueChange = { serverAddress = it },
+            value = uiConfig.serverAddress,
+            onValueChange = { viewModel.updateServerAddress(it) },
             label = { Text("Server Address") },
             modifier = Modifier.fillMaxWidth(),
             enabled = isDisconnected,
@@ -81,8 +81,8 @@ fun ConnectScreen(
         )
         Spacer(modifier = Modifier.height(8.dp))
         OutlinedTextField(
-            value = serverPort,
-            onValueChange = { serverPort = it },
+            value = uiConfig.serverPort,
+            onValueChange = { viewModel.updateServerPort(it) },
             label = { Text("Port") },
             modifier = Modifier.fillMaxWidth(),
             enabled = isDisconnected,
@@ -91,8 +91,8 @@ fun ConnectScreen(
         )
         Spacer(modifier = Modifier.height(8.dp))
         OutlinedTextField(
-            value = authKey,
-            onValueChange = { authKey = it },
+            value = uiConfig.authKey,
+            onValueChange = { viewModel.updateAuthKey(it) },
             label = { Text("Auth Key") },
             modifier = Modifier.fillMaxWidth(),
             enabled = isDisconnected,
@@ -106,14 +106,32 @@ fun ConnectScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text("Insecure (skip TLS verify)", modifier = Modifier.weight(1f))
-            Switch(checked = insecure, onCheckedChange = { insecure = it }, enabled = isDisconnected)
+            Switch(
+                checked = uiConfig.insecure,
+                onCheckedChange = { viewModel.updateInsecure(it) },
+                enabled = isDisconnected,
+            )
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text("Kill Switch", modifier = Modifier.weight(1f))
-            Switch(checked = killSwitch, onCheckedChange = { killSwitch = it }, enabled = isDisconnected)
+            Switch(
+                checked = uiConfig.killSwitch,
+                onCheckedChange = { viewModel.updateKillSwitch(it) },
+                enabled = isDisconnected,
+            )
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("Auto-start on boot", modifier = Modifier.weight(1f))
+            Switch(
+                checked = uiConfig.autoStart,
+                onCheckedChange = { viewModel.updateAutoStart(it) },
+            )
         }
         Spacer(modifier = Modifier.height(16.dp))
 
@@ -131,7 +149,13 @@ fun ConnectScreen(
                             vpnPermissionLauncher.launch(prepareIntent)
                         } else {
                             viewModel.connect(
-                                buildConfig(serverAddress, serverPort, authKey, insecure, killSwitch)
+                                buildConfig(
+                                    uiConfig.serverAddress,
+                                    uiConfig.serverPort,
+                                    uiConfig.authKey,
+                                    uiConfig.insecure,
+                                    uiConfig.killSwitch,
+                                )
                             )
                         }
                     }

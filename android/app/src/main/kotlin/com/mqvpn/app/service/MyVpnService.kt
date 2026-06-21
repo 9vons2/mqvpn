@@ -101,7 +101,10 @@ class MyVpnService : MqvpnVpnService() {
     }
 
     override fun onDestroy() {
-        clearPersistedConfig()
+        // Intentionally do NOT clear the persisted config here: BootReceiver
+        // restarts the service after device boot and relies on restoreConfig()
+        // returning the last successful config. The user can wipe it manually
+        // by clearing app data, or by toggling Auto-start off and disconnecting.
         super.onDestroy()
     }
 
