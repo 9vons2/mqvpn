@@ -110,14 +110,25 @@ class MyVpnService : MqvpnVpnService() {
 
     // --- Config persistence ---
 
+    /**
+     * Returns SharedPreferences backed by Device Protected Storage so they can
+     * be read in Direct Boot phase (before the user unlocks the device). This
+     * is required because the service is `directBootAware="true"` in the
+     * manifest and may be started by Always-on VPN immediately after boot,
+     * before the keyguard challenge is satisfied.
+     */
+    private fun prefs() =
+        applicationContext.createDeviceProtectedStorageContext()
+            .getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+
     private fun persistConfig(config: MqvpnConfig) {
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+        prefs().edit()
             .putString(KEY_CONFIG_JSON, config.toJson())
             .apply()
     }
 
     private fun restoreConfig(): MqvpnConfig? {
-        val json = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        val json = prefs()
             .getString(KEY_CONFIG_JSON, null) ?: return null
         return try {
             MqvpnConfig.fromJson(json)
@@ -127,7 +138,7 @@ class MyVpnService : MqvpnVpnService() {
     }
 
     private fun clearPersistedConfig() {
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+        prefs().edit()
             .remove(KEY_CONFIG_JSON)
             .apply()
     }
