@@ -4,22 +4,35 @@
 package com.mqvpn.app.data
 
 import android.content.Context
+import android.os.Build
 import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
-import androidx.datastore.preferences.preferencesDataStore
+import androidx.datastore.preferences.preferencesDataStoreFile
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import javax.inject.Inject
 import javax.inject.Singleton
 
-private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "mqvpn_ui")
-
 /**
- * Persistent storage for UI-side configuration. Survives reboots and force-stop.
+ * Persistent storage for UI-side configuration.
+ *
+ * Backed by Device Protected Storage (a.k.a. Device Encrypted storage) so it
+ * is readable in Direct Boot phase — before the user unlocks the device.
+ * This is required for the app to be `directBootAware="true"` and for
+ * Always-on VPN to start the service immediately after boot, before any
+ * keyguard challenge is satisfied.
+ *
+ * Trade-off: this storage is NOT encrypted with the user credential, so do
+ * not put privacy-sensitive material here. Auth key and server address are
+ * already plain text in the device today and reside in DE storage anyway.
  *
  * Note: the VPN service itself has separate SharedPreferences persistence
  * (see MyVpnService.persistConfig). This DataStore exists so the UI can show
@@ -30,7 +43,17 @@ private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(na
 class ConfigRepository @Inject constructor(
     @ApplicationContext private val context: Context,
 ) {
-    private val store: DataStore<Preferences> = context.dataStore
+    private val deStorageContext: Context =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            context.createDeviceProtectedStorageContext()
+        } else {
+            context
+        }
+
+    private val store: DataStore<Preferences> = PreferenceDataStoreFactory.create(
+        scope = CoroutineScope(Dispatchers.IO + SupervisorJob()),
+        produceFile = { deStorageContext.preferencesDataStoreFile(DATASTORE_NAME) },
+    )
 
     val config: Flow<UiConfig> = store.data.map { p ->
         UiConfig(
@@ -51,6 +74,7 @@ class ConfigRepository @Inject constructor(
     suspend fun setAutoStart(value: Boolean) = store.edit { it[KEY_AUTOSTART] = value }
 
     private companion object {
+        const val DATASTORE_NAME = "mqvpn_ui"
         val KEY_SERVER = stringPreferencesKey("server_address")
         val KEY_PORT = stringPreferencesKey("server_port")
         val KEY_AUTH = stringPreferencesKey("auth_key")
