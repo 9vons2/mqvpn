@@ -53,6 +53,37 @@
     <string name="reorder_desc">Буферизує UDP-пакети, що приходять не по черзі, коли трафік розділено між кількома шляхами, і віддає їх у правильному порядку. Допомагає відеодзвінкам та іграм на кількох каналах. CELLULAR BOND (буфер 1024 пакети) — для двох мобільних каналів; FIBER LTE (2048) — для швидкого каналу в парі з LTE. Нижче вкажіть UDP-порти для перевпорядкування.</string>
     <string name="hybrid_desc">Термінує TCP-з\'єднання на телефоні й передає їх через QUIC-стрім, тож навіть одне завантаження використовує всі шляхи одночасно (приблизно сума обох каналів замість одного). На сервері має бути [Hybrid] Enabled=1. AUTO вирішує для кожного з\'єднання окремо (рекомендовано), STREAM — завжди через TCP-смугу, RAW — вимкнено.</string>
 
+    <!-- Профілі серверів -->
+    <string name="profile_label">Профіль</string>
+    <string name="profile_save">Зберегти профіль</string>
+    <string name="profile_delete">Видалити</string>
+
+    <!-- Split tunneling -->
+    <string name="split_label">Split tunneling</string>
+    <string name="split_desc">Обрані застосунки повністю оминають VPN і працюють напряму через мережу — корисно для банківських застосунків, які блокують VPN. Набуває чинності з наступним підключенням.</string>
+    <string name="split_choose">Застосунки: %1$d</string>
+    <string name="split_dialog_title">Виключити застосунки з VPN</string>
+    <string name="split_dialog_hint">Позначені застосунки з\'єднуватимуться поза тунелем.</string>
+
+    <!-- Довірені Wi-Fi -->
+    <string name="trusted_label">Довірені Wi-Fi мережі</string>
+    <string name="trusted_desc">У цих Wi-Fi мережах VPN вимикається сам: при підключенні до мережі зі списку тунель роз\'єднується, а автозапуск після перезавантаження пропускається. Корисно, коли домашній роутер сам агрегує канали (наприклад, OpenMPTCProuter на той самий сервер). Для читання імені Wi-Fi потрібен дозвіл геолокації та ввімкнена локація.</string>
+    <string name="trusted_hint">SSID через кому (напр. HomeWiFi, Office)</string>
+    <string name="trusted_grant_location">Надати дозвіл локації (потрібен для імені Wi-Fi)</string>
+
+    <!-- Експорт / імпорт конфігу -->
+    <string name="export_button">QR-експорт</string>
+    <string name="import_button">Імпорт</string>
+    <string name="export_dialog_title">QR-код конфігурації</string>
+    <string name="export_dialog_hint">Відскануйте камерою іншого телефона, скопіюйте текст і вставте його там в «Імпорт». Код містить ваш ключ автентифікації — не показуйте стороннім.</string>
+    <string name="export_copy">Копіювати</string>
+    <string name="import_dialog_title">Імпорт конфігурації</string>
+    <string name="import_dialog_hint">Вставте JSON конфігурації (зі сканування QR або «Копіювати»).</string>
+    <string name="import_confirm">Імпортувати</string>
+    <string name="import_error">Неправильна конфігурація</string>
+    <string name="dialog_ok">OK</string>
+    <string name="dialog_cancel">Скасувати</string>
+
     <!-- Батарея / робота у фоні -->
     <string name="battery_title">Робота у фоні</string>
     <string name="battery_text">Система може вбивати VPN у фоні або блокувати автозапуск після перезавантаження. Виключіть mqvpn з оптимізації батареї; на деяких телефонах також увімкніть «Автозапуск» для застосунку в системних налаштуваннях.</string>

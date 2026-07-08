@@ -129,6 +129,20 @@ class MqvpnConfigTest {
     }
 
     @Test
+    fun excludedApps_defaultEmpty_andJsonRoundTrip() {
+        val c = MqvpnConfig(serverAddress = "h", authKey = "k")
+        assertTrue(c.excludedApps.isEmpty())
+
+        val withApps = c.copy(excludedApps = listOf("com.bank.app", "ua.gov.diia"))
+        val back = MqvpnConfig.fromJson(withApps.toJson())
+        assertEquals(withApps, back)
+
+        // Pre-split-tunneling JSON still decodes
+        val old = MqvpnConfig.fromJson("""{"serverAddress":"h","authKey":"k"}""")
+        assertTrue(old.excludedApps.isEmpty())
+    }
+
+    @Test
     fun hybridFields_parcelRoundTrip() {
         val c = MqvpnConfig(serverAddress = "h", authKey = "k",
             hybridEnabled = true, hybridTcpMode = MqvpnConfig.HybridTcpMode.STREAM)

@@ -9,12 +9,22 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.net.wifi.WifiInfo
+import android.net.wifi.WifiManager
+import android.os.Build
+import android.os.Handler
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.getSystemService
 import com.mqvpn.app.R
+import com.mqvpn.app.data.SettingsRepository
 import com.mqvpn.sdk.core.MqvpnVpnService
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnState
@@ -53,7 +63,80 @@ class MyVpnService : MqvpnVpnService() {
         )
 
         startTunnel(config)
+        startTrustedWifiWatcher()
         return START_STICKY
+    }
+
+    // --- Trusted Wi-Fi ---
+
+    private var wifiCallback: ConnectivityManager.NetworkCallback? = null
+    private var ssidAtStart: String? = null
+
+    /**
+     * Auto-disconnects when the phone JOINS a trusted Wi-Fi network while
+     * the tunnel is up (e.g. coming home to a router that already bonds
+     * links itself). The network present at start is deliberately ignored —
+     * an explicit user connect always wins over the trusted list.
+     */
+    private fun startTrustedWifiWatcher() {
+        stopTrustedWifiWatcher()
+        val trusted = SettingsRepository(applicationContext).trustedSsids
+        if (trusted.isEmpty()) return
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+
+        ssidAtStart = currentWifiSsid(applicationContext)
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+        val handler = Handler(mainLooper)
+        val onWifiCaps: (NetworkCapabilities) -> Unit = { caps ->
+            val ssid = ssidFromCaps(caps) ?: currentWifiSsid(applicationContext)
+            if (ssid != null && ssid != ssidAtStart && ssid in trusted) {
+                Log.i(TAG, "trusted Wi-Fi \"$ssid\" joined — stopping VPN")
+                handler.post {
+                    stopTunnel()
+                    stopSelf()
+                }
+            }
+        }
+        // API 31+ redacts the SSID from WifiInfo unless the callback is
+        // registered with FLAG_INCLUDE_LOCATION_INFO (plus location perm).
+        val cb = if (Build.VERSION.SDK_INT >= 31) {
+            object : ConnectivityManager.NetworkCallback(
+                ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO
+            ) {
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
+                    onWifiCaps(caps)
+            }
+        } else {
+            object : ConnectivityManager.NetworkCallback() {
+                override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
+                    onWifiCaps(caps)
+            }
+        }
+        try {
+            cm.registerNetworkCallback(request, cb)
+            wifiCallback = cb
+        } catch (e: Exception) {
+            Log.w(TAG, "trusted Wi-Fi watcher failed to start: ${e.message}")
+        }
+    }
+
+    private fun stopTrustedWifiWatcher() {
+        wifiCallback?.let { cb ->
+            try {
+                getSystemService(ConnectivityManager::class.java)
+                    ?.unregisterNetworkCallback(cb)
+            } catch (_: Exception) {
+            }
+        }
+        wifiCallback = null
+    }
+
+    private fun ssidFromCaps(caps: NetworkCapabilities): String? {
+        if (Build.VERSION.SDK_INT < 29) return null
+        val info = caps.transportInfo as? WifiInfo ?: return null
+        return normalizeSsid(info.ssid)
     }
 
     override fun onCreateTun(info: TunnelInfo, config: MqvpnConfig): ParcelFileDescriptor {
@@ -74,6 +157,15 @@ class MyVpnService : MqvpnVpnService() {
         }
 
         config.dnsServers.forEach { builder.addDnsServer(it) }
+
+        // Split tunneling: listed apps bypass the tunnel entirely.
+        config.excludedApps.forEach { pkg ->
+            try {
+                builder.addDisallowedApplication(pkg)
+            } catch (_: PackageManager.NameNotFoundException) {
+                Log.w(TAG, "excluded app not installed: $pkg")
+            }
+        }
 
         return builder.establish()
             ?: throw IllegalStateException("VPN permission denied")
@@ -113,6 +205,7 @@ class MyVpnService : MqvpnVpnService() {
     }
 
     override fun onDestroy() {
+        stopTrustedWifiWatcher()
         clearPersistedConfig()
         super.onDestroy()
     }
@@ -188,5 +281,24 @@ class MyVpnService : MqvpnVpnService() {
         /** Stop intent — used by the notification action and the QS tile. */
         fun disconnectIntent(context: Context): Intent =
             Intent(context, MyVpnService::class.java).setAction(ACTION_DISCONNECT)
+
+        /**
+         * Best-effort current Wi-Fi SSID. Needs ACCESS_FINE_LOCATION (and
+         * location services on) — returns null when unavailable/redacted.
+         */
+        fun currentWifiSsid(context: Context): String? = try {
+            @Suppress("DEPRECATION")
+            val ssid = context.applicationContext
+                .getSystemService(WifiManager::class.java)
+                ?.connectionInfo?.ssid
+            normalizeSsid(ssid)
+        } catch (_: Exception) {
+            null
+        }
+
+        fun normalizeSsid(raw: String?): String? {
+            val s = raw?.removeSurrounding("\"")?.trim() ?: return null
+            return s.takeIf { it.isNotEmpty() && it != WifiManager.UNKNOWN_SSID && it != "<unknown ssid>" }
+        }
     }
 }

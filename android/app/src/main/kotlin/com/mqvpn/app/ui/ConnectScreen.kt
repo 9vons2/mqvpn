@@ -3,8 +3,10 @@
 
 package com.mqvpn.app.ui
 
+import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.PowerManager
 import android.provider.Settings
@@ -35,6 +37,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -48,6 +51,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.mqvpn.app.R
@@ -98,18 +102,42 @@ fun ConnectScreen(
     val hybridTcpMode = MqvpnConfig.HybridTcpMode.entries.firstOrNull {
         it.name == hybridTcpModeName
     } ?: MqvpnConfig.HybridTcpMode.AUTO
+    var excludedApps by rememberSaveable {
+        mutableStateOf(ArrayList(saved?.excludedApps ?: emptyList()))
+    }
+
+    // Loads a config (profile switch / import) into every input field.
+    val applyConfig: (MqvpnConfig) -> Unit = { c ->
+        serverAddress = c.serverAddress
+        serverPort = c.serverPort.toString()
+        authKey = c.authKey
+        insecure = c.insecure
+        killSwitch = c.killSwitch
+        reorderEnabled = c.reorderEnabled
+        reorderProfileName = c.reorderProfile.name
+        reorderPorts = c.reorderPorts.joinToString(",")
+        hybridEnabled = c.hybridEnabled
+        hybridTcpModeName = c.hybridTcpMode.name
+        excludedApps = ArrayList(c.excludedApps)
+    }
+
+    var showSplitDialog by remember { mutableStateOf(false) }
+    var showExportDialog by remember { mutableStateOf(false) }
+    var showImportDialog by remember { mutableStateOf(false) }
+
+    val currentConfig = {
+        buildConfig(
+            serverAddress, serverPort, authKey, insecure, killSwitch,
+            reorderEnabled, reorderProfile, reorderPorts,
+            hybridEnabled, hybridTcpMode, excludedApps,
+        )
+    }
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
-            viewModel.connect(
-                buildConfig(
-                    serverAddress, serverPort, authKey, insecure, killSwitch,
-                    reorderEnabled, reorderProfile, reorderPorts,
-                    hybridEnabled, hybridTcpMode,
-                )
-            )
+            viewModel.connect(currentConfig())
         }
     }
 
@@ -124,6 +152,70 @@ fun ConnectScreen(
 
         // Server config inputs
         val isDisconnected = state is MqvpnState.Disconnected || state is MqvpnState.Error
+
+        // Server profiles: pick one to load it into the fields below;
+        // "save" stores the current fields under the typed name.
+        val profiles by viewModel.profiles.collectAsStateWithLifecycle()
+        var profileName by rememberSaveable {
+            mutableStateOf(viewModel.activeProfileName ?: "")
+        }
+        var profilesExpanded by remember { mutableStateOf(false) }
+        ExposedDropdownMenuBox(
+            expanded = profilesExpanded && profiles.isNotEmpty(),
+            onExpandedChange = { profilesExpanded = it },
+        ) {
+            OutlinedTextField(
+                value = profileName,
+                onValueChange = { profileName = it },
+                label = { Text(stringResource(R.string.profile_label)) },
+                trailingIcon = {
+                    if (profiles.isNotEmpty()) {
+                        ExposedDropdownMenuDefaults.TrailingIcon(expanded = profilesExpanded)
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryEditable),
+                singleLine = true,
+            )
+            ExposedDropdownMenu(
+                expanded = profilesExpanded && profiles.isNotEmpty(),
+                onDismissRequest = { profilesExpanded = false },
+            ) {
+                profiles.forEach { profile ->
+                    DropdownMenuItem(
+                        text = { Text(profile.name) },
+                        onClick = {
+                            profileName = profile.name
+                            viewModel.selectProfile(profile.name)?.let(applyConfig)
+                            profilesExpanded = false
+                        },
+                    )
+                }
+            }
+        }
+        Row(modifier = Modifier.fillMaxWidth()) {
+            TextButton(
+                onClick = {
+                    if (profileName.isNotBlank()) {
+                        viewModel.saveProfile(profileName.trim(), currentConfig())
+                    }
+                },
+            ) { Text(stringResource(R.string.profile_save)) }
+            TextButton(
+                onClick = { viewModel.deleteProfile(profileName.trim()) },
+                enabled = profiles.any { it.name == profileName.trim() },
+            ) { Text(stringResource(R.string.profile_delete)) }
+            Spacer(modifier = Modifier.weight(1f))
+            TextButton(onClick = { showExportDialog = true }) {
+                Text(stringResource(R.string.export_button))
+            }
+            TextButton(
+                onClick = { showImportDialog = true },
+                enabled = isDisconnected,
+            ) { Text(stringResource(R.string.import_button)) }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
         OutlinedTextField(
             value = serverAddress,
             onValueChange = { serverAddress = it },
@@ -316,6 +408,93 @@ fun ConnectScreen(
                 }
             }
         }
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // Split tunneling: picked apps bypass the tunnel
+        var splitInfo by remember { mutableStateOf(false) }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(stringResource(R.string.split_label), modifier = Modifier.weight(1f))
+            IconButton(onClick = { splitInfo = !splitInfo }) {
+                Icon(
+                    Icons.Outlined.Info,
+                    contentDescription = stringResource(R.string.split_label),
+                    tint = MaterialTheme.colorScheme.outline,
+                )
+            }
+            TextButton(
+                onClick = { showSplitDialog = true },
+                enabled = isDisconnected,
+            ) {
+                Text(stringResource(R.string.split_choose, excludedApps.size))
+            }
+        }
+        if (splitInfo) {
+            Text(
+                stringResource(R.string.split_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+        }
+
+        // Trusted Wi-Fi: VPN auto-stops when joining a listed network
+        var trustedInfo by remember { mutableStateOf(false) }
+        var trustedCsv by rememberSaveable {
+            mutableStateOf(viewModel.trustedSsids.joinToString(", "))
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(stringResource(R.string.trusted_label), modifier = Modifier.weight(1f))
+            IconButton(onClick = { trustedInfo = !trustedInfo }) {
+                Icon(
+                    Icons.Outlined.Info,
+                    contentDescription = stringResource(R.string.trusted_label),
+                    tint = MaterialTheme.colorScheme.outline,
+                )
+            }
+        }
+        if (trustedInfo) {
+            Text(
+                stringResource(R.string.trusted_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+        }
+        OutlinedTextField(
+            value = trustedCsv,
+            onValueChange = { value ->
+                trustedCsv = value
+                viewModel.trustedSsids = value.split(",")
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+            },
+            label = { Text(stringResource(R.string.trusted_hint)) },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+        )
+        var hasLocation by remember {
+            mutableStateOf(
+                ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.ACCESS_FINE_LOCATION,
+                ) == PackageManager.PERMISSION_GRANTED
+            )
+        }
+        val locationLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted -> hasLocation = granted }
+        if (trustedCsv.isNotBlank() && !hasLocation) {
+            TextButton(
+                onClick = { locationLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION) },
+            ) {
+                Text(stringResource(R.string.trusted_grant_location))
+            }
+        }
         Spacer(modifier = Modifier.height(16.dp))
 
         // Connect/Disconnect button
@@ -331,13 +510,7 @@ fun ConnectScreen(
                         if (prepareIntent != null) {
                             vpnPermissionLauncher.launch(prepareIntent)
                         } else {
-                            viewModel.connect(
-                                buildConfig(
-                                    serverAddress, serverPort, authKey, insecure, killSwitch,
-                                    reorderEnabled, reorderProfile, reorderPorts,
-                                    hybridEnabled, hybridTcpMode,
-                                )
-                            )
+                            viewModel.connect(currentConfig())
                         }
                     }
 
@@ -432,6 +605,32 @@ fun ConnectScreen(
 
             else -> {}
         }
+    }
+
+    if (showSplitDialog) {
+        SplitTunnelingDialog(
+            excluded = excludedApps.toSet(),
+            onDismiss = { showSplitDialog = false },
+            onConfirm = { selection ->
+                excludedApps = ArrayList(selection.sorted())
+                showSplitDialog = false
+            },
+        )
+    }
+    if (showExportDialog) {
+        ExportConfigDialog(
+            configJson = currentConfig().toJson(),
+            onDismiss = { showExportDialog = false },
+        )
+    }
+    if (showImportDialog) {
+        ImportConfigDialog(
+            onDismiss = { showImportDialog = false },
+            onImport = { config ->
+                applyConfig(config)
+                showImportDialog = false
+            },
+        )
     }
 }
 
@@ -537,6 +736,7 @@ private fun buildConfig(
     reorderPorts: String,
     hybridEnabled: Boolean,
     hybridTcpMode: MqvpnConfig.HybridTcpMode,
+    excludedApps: List<String>,
 ): MqvpnConfig {
     return MqvpnConfig(
         serverAddress = address.trim(),
@@ -551,6 +751,7 @@ private fun buildConfig(
             .filter { it in 1..65535 },
         hybridEnabled = hybridEnabled,
         hybridTcpMode = hybridTcpMode,
+        excludedApps = excludedApps,
     )
 }
 

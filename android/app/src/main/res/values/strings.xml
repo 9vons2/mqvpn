@@ -53,6 +53,37 @@
     <string name="reorder_desc">Buffers UDP packets that arrive out of order when traffic is split across several paths, and releases them in sequence. Helps video calls and games on multipath. CELLULAR BOND (buffer 1024 packets) suits two mobile links; FIBER LTE (2048) suits a fast link paired with LTE. List the UDP ports to reorder below.</string>
     <string name="hybrid_desc">Terminates TCP connections on the phone and relays them over a QUIC stream, so even a single download uses all paths at once (roughly the sum of both links instead of one). The server must have [Hybrid] Enabled=1. AUTO decides per connection (recommended), STREAM forces the TCP lane, RAW disables it.</string>
 
+    <!-- Server profiles -->
+    <string name="profile_label">Profile</string>
+    <string name="profile_save">Save profile</string>
+    <string name="profile_delete">Delete</string>
+
+    <!-- Split tunneling -->
+    <string name="split_label">Split tunneling</string>
+    <string name="split_desc">Selected apps bypass the VPN entirely and use the network directly — useful for banking apps that block VPN connections. Takes effect on the next connect.</string>
+    <string name="split_choose">Apps: %1$d</string>
+    <string name="split_dialog_title">Exclude apps from VPN</string>
+    <string name="split_dialog_hint">Checked apps will connect outside the tunnel.</string>
+
+    <!-- Trusted Wi-Fi -->
+    <string name="trusted_label">Trusted Wi-Fi networks</string>
+    <string name="trusted_desc">On these Wi-Fi networks the VPN turns itself off: connecting to a listed network disconnects the tunnel, and auto-start after reboot is skipped. Useful when the home router already bonds links itself (e.g. OpenMPTCProuter to the same server). Reading the Wi-Fi name requires the location permission and location services enabled.</string>
+    <string name="trusted_hint">SSIDs, comma-separated (e.g. HomeWiFi, Office)</string>
+    <string name="trusted_grant_location">Allow location access (needed to read the Wi-Fi name)</string>
+
+    <!-- Config export / import -->
+    <string name="export_button">QR export</string>
+    <string name="import_button">Import</string>
+    <string name="export_dialog_title">Config QR code</string>
+    <string name="export_dialog_hint">Scan with the other phone\'s camera, copy the text and paste it into Import there. The code contains your auth key — don\'t show it around.</string>
+    <string name="export_copy">Copy</string>
+    <string name="import_dialog_title">Import config</string>
+    <string name="import_dialog_hint">Paste the config JSON (from a QR scan or Copy).</string>
+    <string name="import_confirm">Import</string>
+    <string name="import_error">Invalid config</string>
+    <string name="dialog_ok">OK</string>
+    <string name="dialog_cancel">Cancel</string>
+
     <!-- Battery / background work -->
     <string name="battery_title">Background reliability</string>
     <string name="battery_text">The system may kill the VPN in the background or block auto-start after reboot. Exclude mqvpn from battery optimization; on some phones also enable "Autostart" for the app in system settings.</string>
