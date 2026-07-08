@@ -3,6 +3,7 @@
 
 package com.mqvpn.app
 
+import com.mqvpn.app.data.SettingsRepository
 import com.mqvpn.app.service.MyVpnService
 import com.mqvpn.app.ui.MqvpnViewModel
 import com.mqvpn.sdk.core.MqvpnManager
@@ -47,12 +48,17 @@ class MqvpnViewModelTest {
         every { it.reorderStats } returns reorderStatsFlow
     }
 
+    private val mockSettings = mockk<SettingsRepository>(relaxed = true).also {
+        every { it.loadConfig() } returns null
+        every { it.autoStart } returns false
+    }
+
     private lateinit var viewModel: MqvpnViewModel
 
     @Before
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
-        viewModel = MqvpnViewModel(mockManager)
+        viewModel = MqvpnViewModel(mockManager, mockSettings)
     }
 
     @After
@@ -85,6 +91,27 @@ class MqvpnViewModelTest {
         )
         viewModel.connect(config)
         verify { mockManager.connect(config, MyVpnService::class.java) }
+    }
+
+    @Test
+    fun `connect persists config for restore and boot auto-start`() {
+        val config = MqvpnConfig(
+            serverAddress = "vpn.example.com",
+            authKey = "testkey",
+        )
+        viewModel.connect(config)
+        verify { mockSettings.saveConfig(config) }
+    }
+
+    @Test
+    fun `init attaches to an already-running service`() {
+        verify { mockManager.attachIfRunning(MyVpnService::class.java) }
+    }
+
+    @Test
+    fun `autoStartEnabled writes through to settings`() {
+        viewModel.autoStartEnabled = true
+        verify { mockSettings.autoStart = true }
     }
 
     @Test

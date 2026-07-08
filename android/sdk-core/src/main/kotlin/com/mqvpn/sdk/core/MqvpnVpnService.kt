@@ -244,9 +244,14 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
      * Emit state to both Manager (StateFlow → UI) and app callback.
      */
     private fun emitState(newState: MqvpnState) {
+        lastState = newState
         manager?.updateState(newState)
         onVpnStateChanged(newState)
     }
+
+    /** Last emitted state — lets a late-binding [MqvpnManager] catch up. */
+    internal var lastState: MqvpnState = MqvpnState.Disconnected
+        private set
 
     // --- Abstract methods (app implements) ---
 

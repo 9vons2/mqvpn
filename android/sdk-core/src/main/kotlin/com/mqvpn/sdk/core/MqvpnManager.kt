@@ -55,6 +55,14 @@ class MqvpnManager(private val context: Context) {
     fun connect(config: MqvpnConfig, serviceClass: Class<out MqvpnVpnService>) {
         _vpnState.value = MqvpnState.Connecting
 
+        // Drop any binding left by attachIfRunning() before re-binding.
+        serviceConnection?.let { conn ->
+            try { context.unbindService(conn) } catch (_: Exception) {}
+        }
+        serviceConnection = null
+        boundService?.manager = null
+        boundService = null
+
         val intent = Intent(context, serviceClass).apply {
             putExtra(EXTRA_CONFIG_JSON, config.toJson())
         }
@@ -82,6 +90,41 @@ class MqvpnManager(private val context: Context) {
             context.bindService(intent, conn, Context.BIND_AUTO_CREATE)
         } catch (e: Exception) {
             Log.w(TAG, "bindService failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Attach to an already-running VpnService without starting one —
+     * e.g. after the service was auto-started at boot and the UI opens
+     * later. No-op if nothing is bound yet but the service isn't running
+     * (the binding stays dormant; without BIND_AUTO_CREATE it does not
+     * create the service).
+     */
+    fun attachIfRunning(serviceClass: Class<out MqvpnVpnService>) {
+        if (serviceConnection != null) return
+
+        val conn = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                val binder = service as? MqvpnVpnService.LocalBinder ?: return
+                val svc = binder.getService()
+                boundService = svc
+                svc.manager = this@MqvpnManager
+                _vpnState.value = svc.lastState
+            }
+
+            override fun onServiceDisconnected(name: ComponentName?) {
+                boundService?.manager = null
+                boundService = null
+                _vpnState.value = MqvpnState.Disconnected
+                resetMetrics()
+            }
+        }
+        serviceConnection = conn
+        try {
+            context.bindService(Intent(context, serviceClass), conn, 0)
+        } catch (e: Exception) {
+            Log.w(TAG, "attachIfRunning bindService failed: ${e.message}")
+            serviceConnection = null
         }
     }
 

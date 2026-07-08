@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">mqvpn</string>
+    <string name="notification_channel_name">VPN-служба mqvpn</string>
+
+    <!-- Екран підключення: поля -->
+    <string name="server_address">Адреса сервера</string>
+    <string name="server_port">Порт</string>
+    <string name="auth_key">Ключ автентифікації</string>
+    <string name="insecure_skip_tls">Небезпечно (без перевірки TLS)</string>
+    <string name="kill_switch">Kill Switch (блокування без VPN)</string>
+    <string name="autostart_on_boot">Автозапуск після перезавантаження</string>
+    <string name="reorder_buffer">Буфер перевпорядкування</string>
+    <string name="reorder_profile">Профіль перевпорядкування</string>
+    <string name="reorder_ports_hint">Порти (через кому, напр. 443,8443)</string>
+    <string name="hybrid_mode">Гібридний режим (TCP-смуга)</string>
+    <string name="hybrid_tcp_mode">Режим TCP</string>
+
+    <!-- Екран підключення: кнопка -->
+    <string name="btn_connect">Підключити</string>
+    <string name="btn_disconnect">Відключити</string>
+    <string name="btn_connecting">Підключення…</string>
+    <string name="btn_reconnecting">Перепідключення…</string>
+
+    <!-- Екран підключення: стан -->
+    <string name="status_connected">Підключено</string>
+    <string name="status_ip">IP: %1$s/%2$d</string>
+    <string name="status_ipv6">IPv6: %1$s/%2$d</string>
+    <string name="status_mtu">MTU: %1$d</string>
+    <string name="status_rtt">RTT: %1$d мс</string>
+    <string name="status_tx_rx">Надіслано: %1$s | Отримано: %2$s</string>
+    <string name="status_dgram">Дейтаграми: %1$d надісл., %2$d отрим., %3$d втрач.</string>
+    <string name="paths_title">Шляхи</string>
+    <string name="reconnecting_in">Перепідключення через %1$d с…</string>
+    <string name="error_prefix">Помилка: %1$s</string>
+
+    <!-- Картка статистики перевпорядкування -->
+    <string name="reorder_stats_title">Буфер перевпорядкування</string>
+    <string name="reorder_delivered_gaps">Доставлено: %1$d | Розриви: %2$d (заповнено %3$s)</string>
+    <string name="reorder_timeout_ack">Тайм-аут: %1$d | Пониження ACK: %2$d</string>
+    <string name="reorder_latency">Затримка буфера: p50=%1$d мс p99=%2$d мс</string>
+
+    <!-- Картка гібридних смуг -->
+    <string name="hybrid_stats_title">Гібридні смуги</string>
+    <string name="hybrid_lane_counts">TCP: %1$d | Дейтаграми: %2$d | Raw: %3$d</string>
+    <string name="hybrid_flows">TCP-потоки: %1$d активних, %2$d всього, %3$d відхилено</string>
+    <string name="hybrid_dropped">Відкинуто: %1$d | RAW-маркери: %2$d</string>
+
+    <!-- Сповіщення -->
+    <string name="notif_connecting">Підключення…</string>
+    <string name="notif_connected">Підключено: %1$s</string>
+    <string name="notif_reconnecting">Перепідключення…</string>
+    <string name="notif_reconnecting_in">Перепідключення через %1$d с…</string>
+    <string name="notif_error">Помилка: %1$s</string>
+</resources>

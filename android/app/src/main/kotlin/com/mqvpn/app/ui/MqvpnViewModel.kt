@@ -6,6 +6,7 @@ package com.mqvpn.app.ui
 import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.mqvpn.app.data.SettingsRepository
 import com.mqvpn.app.service.MyVpnService
 import com.mqvpn.sdk.core.MqvpnManager
 import com.mqvpn.sdk.core.model.MqvpnConfig
@@ -22,7 +23,20 @@ import javax.inject.Inject
 @HiltViewModel
 class MqvpnViewModel @Inject constructor(
     private val manager: MqvpnManager,
+    private val settings: SettingsRepository,
 ) : ViewModel() {
+
+    init {
+        // Pick up a service auto-started at boot (or surviving the UI).
+        manager.attachIfRunning(MyVpnService::class.java)
+    }
+
+    /** Last config the user connected with — null on first run. */
+    val savedConfig: MqvpnConfig? = settings.loadConfig()
+
+    var autoStartEnabled: Boolean
+        get() = settings.autoStart
+        set(value) { settings.autoStart = value }
 
     val vpnState: StateFlow<MqvpnState> = manager.vpnState
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), MqvpnState.Disconnected)
@@ -37,6 +51,7 @@ class MqvpnViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ReorderStats())
 
     fun connect(config: MqvpnConfig) {
+        settings.saveConfig(config)
         manager.connect(config, MyVpnService::class.java)
     }
 

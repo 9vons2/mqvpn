@@ -2,4 +2,54 @@
 <resources>
     <string name="app_name">mqvpn</string>
     <string name="notification_channel_name">mqvpn VPN</string>
+
+    <!-- Connect screen: inputs -->
+    <string name="server_address">Server Address</string>
+    <string name="server_port">Port</string>
+    <string name="auth_key">Auth Key</string>
+    <string name="insecure_skip_tls">Insecure (skip TLS verify)</string>
+    <string name="kill_switch">Kill Switch</string>
+    <string name="autostart_on_boot">Auto-start on boot</string>
+    <string name="reorder_buffer">Reorder Buffer</string>
+    <string name="reorder_profile">Reorder Profile</string>
+    <string name="reorder_ports_hint">Reorder Ports (comma-separated, e.g. 443,8443)</string>
+    <string name="hybrid_mode">Hybrid Mode (TCP lane)</string>
+    <string name="hybrid_tcp_mode">TCP Mode</string>
+
+    <!-- Connect screen: button -->
+    <string name="btn_connect">Connect</string>
+    <string name="btn_disconnect">Disconnect</string>
+    <string name="btn_connecting">Connecting…</string>
+    <string name="btn_reconnecting">Reconnecting…</string>
+
+    <!-- Connect screen: status -->
+    <string name="status_connected">Connected</string>
+    <string name="status_ip">IP: %1$s/%2$d</string>
+    <string name="status_ipv6">IPv6: %1$s/%2$d</string>
+    <string name="status_mtu">MTU: %1$d</string>
+    <string name="status_rtt">RTT: %1$dms</string>
+    <string name="status_tx_rx">TX: %1$s | RX: %2$s</string>
+    <string name="status_dgram">Dgram: %1$d sent, %2$d recv, %3$d lost</string>
+    <string name="paths_title">Paths</string>
+    <string name="reconnecting_in">Reconnecting in %1$ds…</string>
+    <string name="error_prefix">Error: %1$s</string>
+
+    <!-- Reorder stats card -->
+    <string name="reorder_stats_title">Reorder Buffer</string>
+    <string name="reorder_delivered_gaps">Delivered: %1$d | Gaps: %2$d (filled %3$s)</string>
+    <string name="reorder_timeout_ack">Timeout: %1$d | ACK demote: %2$d</string>
+    <string name="reorder_latency">Buffered latency: p50=%1$dms p99=%2$dms</string>
+
+    <!-- Hybrid lane stats card -->
+    <string name="hybrid_stats_title">Hybrid Lanes</string>
+    <string name="hybrid_lane_counts">TCP: %1$d | Dgram: %2$d | Raw: %3$d</string>
+    <string name="hybrid_flows">TCP flows: %1$d active, %2$d total, %3$d rejected</string>
+    <string name="hybrid_dropped">Dropped: %1$d | RAW markers: %2$d</string>
+
+    <!-- Notifications -->
+    <string name="notif_connecting">Connecting…</string>
+    <string name="notif_connected">Connected: %1$s</string>
+    <string name="notif_reconnecting">Reconnecting…</string>
+    <string name="notif_reconnecting_in">Reconnecting in %1$ds…</string>
+    <string name="notif_error">Error: %1$s</string>
 </resources>

@@ -6,6 +6,7 @@ package com.mqvpn.app.service
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.ParcelFileDescriptor
@@ -40,7 +41,7 @@ class MyVpnService : MqvpnVpnService() {
 
         startForeground(
             NOTIFICATION_ID,
-            buildNotification("Connecting..."),
+            buildNotification(getString(R.string.notif_connecting)),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
         )
 
@@ -74,13 +75,17 @@ class MyVpnService : MqvpnVpnService() {
     override fun onVpnStateChanged(newState: MqvpnState) {
         when (newState) {
             is MqvpnState.Connected ->
-                updateNotification("Connected: ${newState.tunnelInfo.assignedIp}")
+                updateNotification(
+                    getString(R.string.notif_connected, newState.tunnelInfo.assignedIp)
+                )
             is MqvpnState.Reconnecting ->
-                updateNotification("Reconnecting...")
+                updateNotification(getString(R.string.notif_reconnecting))
             is MqvpnState.Disconnected ->
                 stopSelf()
             is MqvpnState.Error -> {
-                updateNotification("Error: ${newState.error.message}")
+                updateNotification(
+                    getString(R.string.notif_error, newState.error.message)
+                )
                 stopSelf()
             }
             else -> {}
@@ -97,7 +102,7 @@ class MyVpnService : MqvpnVpnService() {
     }
 
     override fun onReconnectScheduled(delaySec: Int) {
-        updateNotification("Reconnecting in ${delaySec}s...")
+        updateNotification(getString(R.string.notif_reconnecting_in, delaySec))
     }
 
     override fun onDestroy() {
@@ -161,5 +166,10 @@ class MyVpnService : MqvpnVpnService() {
         private const val PREFS_NAME = "mqvpn_service"
         private const val KEY_CONFIG_JSON = "config_json"
         private const val EXTRA_CONFIG_JSON = "mqvpn_config_json"
+
+        /** Start intent carrying a config — used by [BootReceiver]. */
+        fun startIntent(context: Context, config: MqvpnConfig): Intent =
+            Intent(context, MyVpnService::class.java)
+                .putExtra(EXTRA_CONFIG_JSON, config.toJson())
     }
 }
