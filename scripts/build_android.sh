@@ -150,6 +150,14 @@ for ABI in $ABIS; do
         echo "  WARNING: libmqvpn.a not found for $ABI"
     fi
 
+    # Hybrid TCP lane: libmqvpn.a references lwIP symbols, so the JNI link
+    # needs the companion static lib (built as a dependency of mqvpn_lib).
+    if [[ -f "${MQ_BUILD}/liblwip_core.a" ]]; then
+        cp "$MQ_BUILD/liblwip_core.a" "$PREBUILT_DIR/"
+    else
+        echo "  WARNING: liblwip_core.a not found for $ABI (hybrid TCP lane disabled?)"
+    fi
+
     echo "  → ${PREBUILT_DIR}/"
     ls -la "$PREBUILT_DIR/"
     echo ""

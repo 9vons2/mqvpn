@@ -43,6 +43,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnState
 import com.mqvpn.sdk.core.model.ReorderStats
+import com.mqvpn.sdk.core.model.VpnStats
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,6 +69,13 @@ fun ConnectScreen(
         it.name == reorderProfileName
     } ?: MqvpnConfig.ReorderProfile.CELLULAR_BOND
     var reorderPorts by rememberSaveable { mutableStateOf("") }
+    var hybridEnabled by rememberSaveable { mutableStateOf(false) }
+    var hybridTcpModeName by rememberSaveable {
+        mutableStateOf(MqvpnConfig.HybridTcpMode.AUTO.name)
+    }
+    val hybridTcpMode = MqvpnConfig.HybridTcpMode.entries.firstOrNull {
+        it.name == hybridTcpModeName
+    } ?: MqvpnConfig.HybridTcpMode.AUTO
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -77,6 +85,7 @@ fun ConnectScreen(
                 buildConfig(
                     serverAddress, serverPort, authKey, insecure, killSwitch,
                     reorderEnabled, reorderProfile, reorderPorts,
+                    hybridEnabled, hybridTcpMode,
                 )
             )
         }
@@ -194,6 +203,54 @@ fun ConnectScreen(
                 singleLine = true,
             )
         }
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // Hybrid mode (TCP lane) settings
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("Hybrid Mode (TCP lane)", modifier = Modifier.weight(1f))
+            Switch(
+                checked = hybridEnabled,
+                onCheckedChange = { hybridEnabled = it },
+                enabled = isDisconnected,
+            )
+        }
+        if (hybridEnabled) {
+            Spacer(modifier = Modifier.height(8.dp))
+            var tcpModeExpanded by remember { mutableStateOf(false) }
+            ExposedDropdownMenuBox(
+                expanded = tcpModeExpanded,
+                onExpandedChange = { if (isDisconnected) tcpModeExpanded = it },
+            ) {
+                OutlinedTextField(
+                    value = hybridTcpMode.name,
+                    onValueChange = {},
+                    label = { Text("TCP Mode") },
+                    readOnly = true,
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = tcpModeExpanded) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable),
+                    enabled = isDisconnected,
+                )
+                ExposedDropdownMenu(
+                    expanded = tcpModeExpanded,
+                    onDismissRequest = { tcpModeExpanded = false },
+                ) {
+                    MqvpnConfig.HybridTcpMode.entries.forEach { mode ->
+                        DropdownMenuItem(
+                            text = { Text(mode.name) },
+                            onClick = {
+                                hybridTcpModeName = mode.name
+                                tcpModeExpanded = false
+                            },
+                        )
+                    }
+                }
+            }
+        }
         Spacer(modifier = Modifier.height(16.dp))
 
         // Connect/Disconnect button
@@ -213,6 +270,7 @@ fun ConnectScreen(
                                 buildConfig(
                                     serverAddress, serverPort, authKey, insecure, killSwitch,
                                     reorderEnabled, reorderProfile, reorderPorts,
+                                    hybridEnabled, hybridTcpMode,
                                 )
                             )
                         }
@@ -273,6 +331,11 @@ fun ConnectScreen(
                     Spacer(modifier = Modifier.height(12.dp))
                     ReorderStatsCard(reorderStats)
                 }
+
+                if (stats.pktsLaneTcp + stats.pktsLaneDgram + stats.pktsLaneRaw > 0) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    HybridLaneStatsCard(stats)
+                }
             }
 
             is MqvpnState.Reconnecting -> {
@@ -316,6 +379,30 @@ private fun ReorderStatsCard(rs: ReorderStats) {
     }
 }
 
+@Composable
+private fun HybridLaneStatsCard(stats: VpnStats) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text("Hybrid Lanes", style = MaterialTheme.typography.titleSmall)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                "TCP: ${stats.pktsLaneTcp} | Dgram: ${stats.pktsLaneDgram} | Raw: ${stats.pktsLaneRaw}",
+            )
+            Text(
+                "TCP flows: ${stats.tcpFlowsActive} active, ${stats.tcpFlowsTotal} total" +
+                    if (stats.tcpFlowsRejected > 0) ", ${stats.tcpFlowsRejected} rejected" else "",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            if (stats.pktsLaneTcpDropped > 0 || stats.rawMarkersActive > 0) {
+                Text(
+                    "Dropped: ${stats.pktsLaneTcpDropped} | RAW markers: ${stats.rawMarkersActive}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+    }
+}
+
 private fun buildConfig(
     address: String,
     port: String,
@@ -325,6 +412,8 @@ private fun buildConfig(
     reorderEnabled: Boolean,
     reorderProfile: MqvpnConfig.ReorderProfile,
     reorderPorts: String,
+    hybridEnabled: Boolean,
+    hybridTcpMode: MqvpnConfig.HybridTcpMode,
 ): MqvpnConfig {
     return MqvpnConfig(
         serverAddress = address.trim(),
@@ -337,6 +426,8 @@ private fun buildConfig(
         reorderPorts = reorderPorts.split(",")
             .mapNotNull { it.trim().toIntOrNull() }
             .filter { it in 1..65535 },
+        hybridEnabled = hybridEnabled,
+        hybridTcpMode = hybridTcpMode,
     )
 }
 

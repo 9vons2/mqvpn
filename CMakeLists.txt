@@ -83,16 +83,19 @@ if(NOT ANDROID_CROSS_COMPILE)
     endif()
 endif()
 
-# ---------- Hybrid mode TCP lane (lwIP, Linux-only in v1) ----------
+# ---------- Hybrid mode TCP lane (lwIP, Linux + Android) ----------
+# The lane's client side (classifier + lwIP termination + QUIC streams) has
+# no platform dependencies beyond POSIX sockets, so Android builds it too.
+# Windows stays excluded: the egress path assumes POSIX fd semantics.
 option(MQVPN_ENABLE_HYBRID_TCP_LANE
-       "Build the hybrid-mode lwIP TCP lane (Linux-only in v1)" ON)
-if(MQVPN_ENABLE_HYBRID_TCP_LANE AND NOT WIN32 AND NOT ANDROID_CROSS_COMPILE)
+       "Build the hybrid-mode lwIP TCP lane (Linux/Android)" ON)
+if(MQVPN_ENABLE_HYBRID_TCP_LANE AND NOT WIN32)
     set(MQVPN_HYBRID_TCP_LANE_BUILD ON)
 else()
     if(MQVPN_ENABLE_HYBRID_TCP_LANE)
         message(WARNING "MQVPN_ENABLE_HYBRID_TCP_LANE requested but target "
-                         "is Windows/Android — hybrid TCP lane is Linux-only "
-                         "in v1, ignoring.")
+                         "is Windows — hybrid TCP lane needs POSIX fd "
+                         "semantics, ignoring.")
     endif()
     set(MQVPN_HYBRID_TCP_LANE_BUILD OFF)
 endif()
@@ -201,6 +204,8 @@ list(APPEND MQVPN_LIB_SOURCES
 # sink, NO QUIC. Standalone executable, deliberately NOT part of mqvpn_lib —
 # links the hybrid sources directly. Driven by
 # benchmarks/tcp_lane_microbench/run.sh (gate: >= 10 Gbit/s).
+# Host tool — pointless on a phone, so skipped for Android cross-builds.
+if(NOT ANDROID_CROSS_COMPILE)
 add_executable(tcp_lane_microbench
     benchmarks/tcp_lane_microbench/harness.c
     src/hybrid/classifier.c
@@ -214,6 +219,7 @@ target_include_directories(tcp_lane_microbench PRIVATE
 )
 set_target_properties(tcp_lane_microbench PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+endif() # NOT ANDROID_CROSS_COMPILE (tcp_lane_microbench)
 
 # libFuzzer target: classifier + lwIP packet-intake crash-safety (see
 # fuzz/fuzz_tcp_lane.c for scope). Requires clang (-fsanitize=fuzzer is a
@@ -267,7 +273,7 @@ endif() # MQVPN_HYBRID_TCP_LANE_BUILD
 # fuzz_tcp_lane links classifier.c + lwip_glue.c directly (mirrors
 # tcp_lane_microbench) against the instrumented lwip_core_fuzz built inside
 # the block above — MQVPN_ENABLE_FUZZING with the hybrid TCP lane unavailable
-# (Windows/Android, or explicitly disabled) has nothing to build against.
+# (Windows, or explicitly disabled) has nothing to build against.
 if(MQVPN_ENABLE_FUZZING AND NOT MQVPN_HYBRID_TCP_LANE_BUILD)
     message(WARNING "MQVPN_ENABLE_FUZZING requires the hybrid TCP lane "
                      "(MQVPN_HYBRID_TCP_LANE_BUILD) — skipping fuzz_tcp_lane")
