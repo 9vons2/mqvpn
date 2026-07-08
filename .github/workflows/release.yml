@@ -465,7 +465,7 @@ jobs:
 
       - name: Verify prebuilt libraries
         run: |
-          for lib in libmqvpn.a libxquic.a libssl.a libcrypto.a; do
+          for lib in libmqvpn.a liblwip_core.a libxquic.a libssl.a libcrypto.a; do
             test -f "android/sdk-native/prebuilt/arm64-v8a/${lib}" \
               || { echo "MISSING: arm64-v8a/${lib}"; exit 1; }
           done
