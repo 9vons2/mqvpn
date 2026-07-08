@@ -4,6 +4,10 @@
 package com.mqvpn.app.ui
 
 import android.app.Activity
+import android.content.Intent
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
@@ -16,10 +20,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
@@ -35,6 +43,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -145,47 +154,81 @@ fun ConnectScreen(
         )
         Spacer(modifier = Modifier.height(8.dp))
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(stringResource(R.string.insecure_skip_tls), modifier = Modifier.weight(1f))
-            Switch(checked = insecure, onCheckedChange = { insecure = it }, enabled = isDisconnected)
-        }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(stringResource(R.string.kill_switch), modifier = Modifier.weight(1f))
-            Switch(checked = killSwitch, onCheckedChange = { killSwitch = it }, enabled = isDisconnected)
-        }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(stringResource(R.string.autostart_on_boot), modifier = Modifier.weight(1f))
-            Switch(
-                checked = autoStart,
-                onCheckedChange = {
-                    autoStart = it
-                    viewModel.autoStartEnabled = it
-                },
+        SettingSwitchRow(
+            label = stringResource(R.string.insecure_skip_tls),
+            description = stringResource(R.string.insecure_desc),
+            checked = insecure,
+            onCheckedChange = { insecure = it },
+            enabled = isDisconnected,
+        )
+        SettingSwitchRow(
+            label = stringResource(R.string.kill_switch),
+            description = stringResource(R.string.kill_switch_desc),
+            checked = killSwitch,
+            onCheckedChange = { killSwitch = it },
+            enabled = isDisconnected,
+        )
+        SettingSwitchRow(
+            label = stringResource(R.string.autostart_on_boot),
+            description = stringResource(R.string.autostart_desc),
+            checked = autoStart,
+            onCheckedChange = {
+                autoStart = it
+                viewModel.autoStartEnabled = it
+            },
+        )
+
+        // Battery-optimization hint: OEM power managers kill background
+        // VPNs and silently block boot auto-start — surface the fix inline.
+        val context = LocalContext.current
+        val powerManager = remember { context.getSystemService(PowerManager::class.java) }
+        var ignoringBatteryOpt by remember {
+            mutableStateOf(
+                powerManager?.isIgnoringBatteryOptimizations(context.packageName) ?: true
             )
+        }
+        val batteryLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) {
+            ignoringBatteryOpt =
+                powerManager?.isIgnoringBatteryOptimizations(context.packageName) ?: true
+        }
+        if (autoStart && !ignoringBatteryOpt) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(stringResource(R.string.battery_title), style = MaterialTheme.typography.titleSmall)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        stringResource(R.string.battery_text),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                        onClick = {
+                            batteryLauncher.launch(
+                                Intent(
+                                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                    Uri.parse("package:${context.packageName}"),
+                                )
+                            )
+                        },
+                    ) {
+                        Text(stringResource(R.string.battery_button))
+                    }
+                }
+            }
         }
         Spacer(modifier = Modifier.height(8.dp))
 
         // Reorder buffer settings
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(stringResource(R.string.reorder_buffer), modifier = Modifier.weight(1f))
-            Switch(
-                checked = reorderEnabled,
-                onCheckedChange = { reorderEnabled = it },
-                enabled = isDisconnected,
-            )
-        }
+        SettingSwitchRow(
+            label = stringResource(R.string.reorder_buffer),
+            description = stringResource(R.string.reorder_desc),
+            checked = reorderEnabled,
+            onCheckedChange = { reorderEnabled = it },
+            enabled = isDisconnected,
+        )
         if (reorderEnabled) {
             Spacer(modifier = Modifier.height(8.dp))
             var profileExpanded by remember { mutableStateOf(false) }
@@ -232,17 +275,13 @@ fun ConnectScreen(
         Spacer(modifier = Modifier.height(8.dp))
 
         // Hybrid mode (TCP lane) settings
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(stringResource(R.string.hybrid_mode), modifier = Modifier.weight(1f))
-            Switch(
-                checked = hybridEnabled,
-                onCheckedChange = { hybridEnabled = it },
-                enabled = isDisconnected,
-            )
-        }
+        SettingSwitchRow(
+            label = stringResource(R.string.hybrid_mode),
+            description = stringResource(R.string.hybrid_desc),
+            checked = hybridEnabled,
+            onCheckedChange = { hybridEnabled = it },
+            enabled = isDisconnected,
+        )
         if (hybridEnabled) {
             Spacer(modifier = Modifier.height(8.dp))
             var tcpModeExpanded by remember { mutableStateOf(false) }
@@ -393,6 +432,43 @@ fun ConnectScreen(
 
             else -> {}
         }
+    }
+}
+
+/**
+ * Switch row with an ⓘ toggle that expands a detailed description below —
+ * the settings are dense enough that labels alone stop being memorable.
+ */
+@Composable
+private fun SettingSwitchRow(
+    label: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true,
+) {
+    var showInfo by remember { mutableStateOf(false) }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, modifier = Modifier.weight(1f))
+        IconButton(onClick = { showInfo = !showInfo }) {
+            Icon(
+                Icons.Outlined.Info,
+                contentDescription = label,
+                tint = MaterialTheme.colorScheme.outline,
+            )
+        }
+        Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
+    }
+    if (showInfo) {
+        Text(
+            description,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(bottom = 8.dp),
+        )
     }
 }
 

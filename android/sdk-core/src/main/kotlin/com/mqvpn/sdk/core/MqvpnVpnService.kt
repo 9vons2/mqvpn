@@ -144,7 +144,7 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
      * Stop VPN tunnel. Called by [MqvpnManager.disconnect].
      * Do NOT call from onDestroy — cleanup runs automatically.
      */
-    internal fun stopTunnel() {
+    fun stopTunnel() {
         executor.enqueue { cleanup() }
     }
 

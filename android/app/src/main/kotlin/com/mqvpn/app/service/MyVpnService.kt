@@ -6,6 +6,7 @@ package com.mqvpn.app.service
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -27,6 +28,12 @@ class MyVpnService : MqvpnVpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_DISCONNECT) {
+            stopTunnel()
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         val configJson = intent?.getStringExtra(EXTRA_CONFIG_JSON)
         val config = if (configJson != null) {
             MqvpnConfig.fromJson(configJson)
@@ -146,11 +153,15 @@ class MyVpnService : MqvpnVpnService() {
     }
 
     private fun buildNotification(text: String): Notification {
+        val disconnectPi = PendingIntent.getService(
+            this, 1, disconnectIntent(this), PendingIntent.FLAG_IMMUTABLE,
+        )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_vpn)
             .setOngoing(true)
+            .addAction(0, getString(R.string.notif_action_disconnect), disconnectPi)
             .build()
     }
 
@@ -167,9 +178,15 @@ class MyVpnService : MqvpnVpnService() {
         private const val KEY_CONFIG_JSON = "config_json"
         private const val EXTRA_CONFIG_JSON = "mqvpn_config_json"
 
+        private const val ACTION_DISCONNECT = "com.mqvpn.app.action.DISCONNECT"
+
         /** Start intent carrying a config — used by [BootReceiver]. */
         fun startIntent(context: Context, config: MqvpnConfig): Intent =
             Intent(context, MyVpnService::class.java)
                 .putExtra(EXTRA_CONFIG_JSON, config.toJson())
+
+        /** Stop intent — used by the notification action and the QS tile. */
+        fun disconnectIntent(context: Context): Intent =
+            Intent(context, MyVpnService::class.java).setAction(ACTION_DISCONNECT)
     }
 }

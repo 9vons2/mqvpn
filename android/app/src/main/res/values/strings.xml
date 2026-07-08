@@ -46,7 +46,20 @@
     <string name="hybrid_flows">TCP flows: %1$d active, %2$d total, %3$d rejected</string>
     <string name="hybrid_dropped">Dropped: %1$d | RAW markers: %2$d</string>
 
+    <!-- Setting descriptions (info toggles) -->
+    <string name="insecure_desc">Skips TLS certificate verification when connecting. Only use with your own server that has no valid certificate — with a public network this allows man-in-the-middle attacks.</string>
+    <string name="kill_switch_desc">Blocks all traffic outside the tunnel, including IPv6, so nothing leaks to the open network if the VPN drops. Turn off if apps must keep working without VPN.</string>
+    <string name="autostart_desc">Starts the VPN with the last used settings after the phone reboots. Requires VPN permission granted (connect once manually). On some phones (Xiaomi/MIUI, Oppo, etc.) you must also allow "Autostart" in system app settings, and battery optimization should be disabled for reliable background work.</string>
+    <string name="reorder_desc">Buffers UDP packets that arrive out of order when traffic is split across several paths, and releases them in sequence. Helps video calls and games on multipath. CELLULAR BOND (buffer 1024 packets) suits two mobile links; FIBER LTE (2048) suits a fast link paired with LTE. List the UDP ports to reorder below.</string>
+    <string name="hybrid_desc">Terminates TCP connections on the phone and relays them over a QUIC stream, so even a single download uses all paths at once (roughly the sum of both links instead of one). The server must have [Hybrid] Enabled=1. AUTO decides per connection (recommended), STREAM forces the TCP lane, RAW disables it.</string>
+
+    <!-- Battery / background work -->
+    <string name="battery_title">Background reliability</string>
+    <string name="battery_text">The system may kill the VPN in the background or block auto-start after reboot. Exclude mqvpn from battery optimization; on some phones also enable "Autostart" for the app in system settings.</string>
+    <string name="battery_button">Disable battery optimization</string>
+
     <!-- Notifications -->
+    <string name="notif_action_disconnect">Disconnect</string>
     <string name="notif_connecting">Connecting…</string>
     <string name="notif_connected">Connected: %1$s</string>
     <string name="notif_reconnecting">Reconnecting…</string>
