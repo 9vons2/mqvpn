@@ -64,6 +64,7 @@
     <string name="split_choose">Apps: %1$d</string>
     <string name="split_dialog_title">Exclude apps from VPN</string>
     <string name="split_dialog_hint">Checked apps will connect outside the tunnel.</string>
+    <string name="split_search_hint">Search apps</string>
 
     <!-- Trusted Wi-Fi -->
     <string name="trusted_label">Trusted Wi-Fi networks</string>

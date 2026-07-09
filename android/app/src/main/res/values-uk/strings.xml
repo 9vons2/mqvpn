@@ -64,6 +64,7 @@
     <string name="split_choose">Застосунки: %1$d</string>
     <string name="split_dialog_title">Виключити застосунки з VPN</string>
     <string name="split_dialog_hint">Позначені застосунки з\'єднуватимуться поза тунелем.</string>
+    <string name="split_search_hint">Пошук застосунків</string>
 
     <!-- Довірені Wi-Fi -->
     <string name="trusted_label">Довірені Wi-Fi мережі</string>
