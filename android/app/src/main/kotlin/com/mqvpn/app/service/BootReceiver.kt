@@ -36,17 +36,12 @@ class BootReceiver : BroadcastReceiver() {
             return
         }
 
-        // Best effort: SSID may be unreadable this early in boot (location
-        // off) — then we start anyway and the in-service watcher won't fire
-        // either, so a trusted network only reliably blocks when readable.
-        val ssid = MyVpnService.currentWifiSsid(context)
-        if (ssid != null && ssid in settings.trustedSsids) {
-            Log.i(TAG, "auto-start skipped: on trusted Wi-Fi \"$ssid\"")
-            return
-        }
-
+        // On a trusted Wi-Fi the service starts PAUSED and resumes itself
+        // once the phone leaves that network — no manual tap needed.
         Log.i(TAG, "auto-starting VPN to ${config.serverAddress}")
-        context.startForegroundService(MyVpnService.startIntent(context, config))
+        context.startForegroundService(
+            MyVpnService.startIntent(context, config, pausedIfTrusted = true)
+        )
     }
 
     companion object {

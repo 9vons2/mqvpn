@@ -67,7 +67,7 @@
 
     <!-- Trusted Wi-Fi -->
     <string name="trusted_label">Trusted Wi-Fi networks</string>
-    <string name="trusted_desc">On these Wi-Fi networks the VPN turns itself off: connecting to a listed network disconnects the tunnel, and auto-start after reboot is skipped. Useful when the home router already bonds links itself (e.g. OpenMPTCProuter to the same server). Reading the Wi-Fi name requires the location permission and location services enabled. NOT compatible with the system "Always-on VPN" / "Block connections without VPN" setting — turn that off and use the app\'s own auto-start and Kill Switch instead.</string>
+    <string name="trusted_desc">On these Wi-Fi networks the VPN pauses itself: joining a listed network parks the tunnel, and it reconnects automatically as soon as you leave (to cellular or another Wi-Fi). Boot auto-start on a trusted network also parks and resumes later. Useful when the home router already bonds links itself (e.g. OpenMPTCProuter to the same server). Reading the Wi-Fi name requires the location permission and location services enabled. NOT compatible with the system "Always-on VPN" / "Block connections without VPN" setting — turn that off and use the app\'s own auto-start and Kill Switch instead.</string>
     <string name="trusted_hint">SSIDs, comma-separated (e.g. HomeWiFi, Office)</string>
     <string name="trusted_grant_location">Allow location access (needed to read the Wi-Fi name)</string>
 
@@ -97,4 +97,5 @@
     <string name="notif_reconnecting_in">Reconnecting in %1$ds…</string>
     <string name="notif_error">Error: %1$s</string>
     <string name="notif_trusted_lockdown">Trusted Wi-Fi detected, but system Always-on VPN blocks auto-disconnect. Turn off "Always-on VPN" for mqvpn in Settings → Network → VPN.</string>
+    <string name="notif_paused_trusted">Paused: trusted Wi-Fi "%1$s" — reconnects automatically when you leave it</string>
 </resources>

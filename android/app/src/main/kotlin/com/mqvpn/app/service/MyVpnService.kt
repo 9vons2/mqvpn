@@ -39,6 +39,7 @@ class MyVpnService : MqvpnVpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_DISCONNECT) {
+            pausedOnTrustedWifi = false
             stopTunnel()
             stopSelf()
             return START_NOT_STICKY
@@ -54,6 +55,7 @@ class MyVpnService : MqvpnVpnService() {
             return START_NOT_STICKY
         }
 
+        lastConfig = config
         persistConfig(config)
 
         startForeground(
@@ -62,7 +64,21 @@ class MyVpnService : MqvpnVpnService() {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
         )
 
-        startTunnel(config)
+        // Boot auto-start on a trusted network parks in paused mode and
+        // waits for the phone to leave it. A manual connect never does —
+        // the user's explicit tap always wins over the trusted list.
+        val trusted = SettingsRepository(applicationContext).trustedSsids
+        val ssid = currentWifiSsid(applicationContext)
+        val parkPaused = intent?.getBooleanExtra(EXTRA_START_PAUSED_IF_TRUSTED, false) == true &&
+            ssid != null && ssid in trusted
+        if (parkPaused) {
+            pausedOnTrustedWifi = true
+            updateNotification(getString(R.string.notif_paused_trusted, ssid ?: ""))
+            Log.i(TAG, "started paused: on trusted Wi-Fi \"$ssid\"")
+        } else {
+            pausedOnTrustedWifi = false
+            startTunnel(config)
+        }
         startTrustedWifiWatcher()
         return START_STICKY
     }
@@ -71,12 +87,17 @@ class MyVpnService : MqvpnVpnService() {
 
     private var wifiCallback: ConnectivityManager.NetworkCallback? = null
     private var ssidAtStart: String? = null
+    private var lastConfig: MqvpnConfig? = null
+
+    /** True while the tunnel is parked because we're on a trusted network. */
+    private var pausedOnTrustedWifi = false
 
     /**
-     * Auto-disconnects when the phone JOINS a trusted Wi-Fi network while
-     * the tunnel is up (e.g. coming home to a router that already bonds
-     * links itself). The network present at start is deliberately ignored —
-     * an explicit user connect always wins over the trusted list.
+     * Trusted-network pause/resume. JOINING a trusted Wi-Fi while the
+     * tunnel is up pauses it (the service stays alive, watching); leaving
+     * the trusted network — to another Wi-Fi or to cellular — resumes the
+     * tunnel automatically. The network present at start is deliberately
+     * ignored — an explicit user connect always wins over the trusted list.
      */
     private fun startTrustedWifiWatcher() {
         stopTrustedWifiWatcher()
@@ -91,24 +112,39 @@ class MyVpnService : MqvpnVpnService() {
         val handler = Handler(mainLooper)
         val onWifiCaps: (NetworkCapabilities) -> Unit = { caps ->
             val ssid = ssidFromCaps(caps) ?: currentWifiSsid(applicationContext)
-            if (ssid != null && ssid != ssidAtStart && ssid in trusted) {
-                handler.post {
-                    // System Always-on VPN fights this feature: lockdown
-                    // ("block connections without VPN") blackholes ALL
-                    // traffic the moment we stop, and plain always-on
-                    // force-restarts us in a loop. Warn instead of stopping.
-                    if (Build.VERSION.SDK_INT >= 29 && (isAlwaysOn || isLockdownEnabled)) {
-                        Log.w(
-                            TAG,
-                            "trusted Wi-Fi \"$ssid\" but system always-on VPN " +
-                                "active — skipping auto-stop",
-                        )
-                        updateNotification(getString(R.string.notif_trusted_lockdown))
-                    } else {
-                        Log.i(TAG, "trusted Wi-Fi \"$ssid\" joined — stopping VPN")
-                        stopTunnel()
-                        stopSelf()
+            handler.post {
+                when {
+                    !pausedOnTrustedWifi &&
+                        ssid != null && ssid != ssidAtStart && ssid in trusted -> {
+                        // System Always-on VPN fights this feature: lockdown
+                        // ("block connections without VPN") blackholes ALL
+                        // traffic the moment we stop, and plain always-on
+                        // force-restarts us in a loop. Warn instead.
+                        if (Build.VERSION.SDK_INT >= 29 && (isAlwaysOn || isLockdownEnabled)) {
+                            Log.w(
+                                TAG,
+                                "trusted Wi-Fi \"$ssid\" but system always-on " +
+                                    "VPN active — skipping auto-pause",
+                            )
+                            updateNotification(getString(R.string.notif_trusted_lockdown))
+                        } else {
+                            Log.i(TAG, "trusted Wi-Fi \"$ssid\" joined — pausing VPN")
+                            pausedOnTrustedWifi = true
+                            stopTunnel()
+                            updateNotification(getString(R.string.notif_paused_trusted, ssid))
+                        }
                     }
+
+                    pausedOnTrustedWifi && ssid != null && ssid !in trusted ->
+                        resumeFromTrustedPause("switched to Wi-Fi \"$ssid\"")
+                }
+            }
+        }
+        val onWifiLost: () -> Unit = {
+            handler.post {
+                // Wi-Fi gone entirely (e.g. walked out to cellular)
+                if (pausedOnTrustedWifi && currentWifiSsid(applicationContext) == null) {
+                    resumeFromTrustedPause("Wi-Fi lost")
                 }
             }
         }
@@ -120,11 +156,15 @@ class MyVpnService : MqvpnVpnService() {
             ) {
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
                     onWifiCaps(caps)
+
+                override fun onLost(network: Network) = onWifiLost()
             }
         } else {
             object : ConnectivityManager.NetworkCallback() {
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
                     onWifiCaps(caps)
+
+                override fun onLost(network: Network) = onWifiLost()
             }
         }
         try {
@@ -133,6 +173,21 @@ class MyVpnService : MqvpnVpnService() {
         } catch (e: Exception) {
             Log.w(TAG, "trusted Wi-Fi watcher failed to start: ${e.message}")
         }
+    }
+
+    private fun resumeFromTrustedPause(reason: String) {
+        if (!pausedOnTrustedWifi) return
+        val config = lastConfig ?: restoreConfig()
+        if (config == null) {
+            Log.w(TAG, "cannot resume from trusted pause: no config")
+            stopSelf()
+            return
+        }
+        Log.i(TAG, "left trusted Wi-Fi ($reason) — resuming VPN")
+        pausedOnTrustedWifi = false
+        ssidAtStart = currentWifiSsid(applicationContext)
+        updateNotification(getString(R.string.notif_connecting))
+        startTunnel(config)
     }
 
     private fun stopTrustedWifiWatcher() {
@@ -193,7 +248,9 @@ class MyVpnService : MqvpnVpnService() {
             is MqvpnState.Reconnecting ->
                 updateNotification(getString(R.string.notif_reconnecting))
             is MqvpnState.Disconnected ->
-                stopSelf()
+                // Paused on trusted Wi-Fi: the service stays alive, watching
+                // for the network change that will resume the tunnel.
+                if (!pausedOnTrustedWifi) stopSelf()
             is MqvpnState.Error -> {
                 updateNotification(
                     getString(R.string.notif_error, newState.error.message)
@@ -285,11 +342,21 @@ class MyVpnService : MqvpnVpnService() {
         private const val EXTRA_CONFIG_JSON = "mqvpn_config_json"
 
         private const val ACTION_DISCONNECT = "com.mqvpn.app.action.DISCONNECT"
+        private const val EXTRA_START_PAUSED_IF_TRUSTED = "mqvpn_start_paused_if_trusted"
 
-        /** Start intent carrying a config — used by [BootReceiver]. */
-        fun startIntent(context: Context, config: MqvpnConfig): Intent =
+        /**
+         * Start intent carrying a config — used by [BootReceiver] and the
+         * QS tile. With [pausedIfTrusted] the service parks in paused mode
+         * when the current Wi-Fi is trusted, instead of connecting.
+         */
+        fun startIntent(
+            context: Context,
+            config: MqvpnConfig,
+            pausedIfTrusted: Boolean = false,
+        ): Intent =
             Intent(context, MyVpnService::class.java)
                 .putExtra(EXTRA_CONFIG_JSON, config.toJson())
+                .putExtra(EXTRA_START_PAUSED_IF_TRUSTED, pausedIfTrusted)
 
         /** Stop intent — used by the notification action and the QS tile. */
         fun disconnectIntent(context: Context): Intent =
