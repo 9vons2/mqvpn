@@ -92,10 +92,23 @@ class MyVpnService : MqvpnVpnService() {
         val onWifiCaps: (NetworkCapabilities) -> Unit = { caps ->
             val ssid = ssidFromCaps(caps) ?: currentWifiSsid(applicationContext)
             if (ssid != null && ssid != ssidAtStart && ssid in trusted) {
-                Log.i(TAG, "trusted Wi-Fi \"$ssid\" joined — stopping VPN")
                 handler.post {
-                    stopTunnel()
-                    stopSelf()
+                    // System Always-on VPN fights this feature: lockdown
+                    // ("block connections without VPN") blackholes ALL
+                    // traffic the moment we stop, and plain always-on
+                    // force-restarts us in a loop. Warn instead of stopping.
+                    if (Build.VERSION.SDK_INT >= 29 && (isAlwaysOn || isLockdownEnabled)) {
+                        Log.w(
+                            TAG,
+                            "trusted Wi-Fi \"$ssid\" but system always-on VPN " +
+                                "active — skipping auto-stop",
+                        )
+                        updateNotification(getString(R.string.notif_trusted_lockdown))
+                    } else {
+                        Log.i(TAG, "trusted Wi-Fi \"$ssid\" joined — stopping VPN")
+                        stopTunnel()
+                        stopSelf()
+                    }
                 }
             }
         }
