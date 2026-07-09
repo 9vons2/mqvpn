@@ -82,6 +82,7 @@ fun ConnectScreen(
     var authKey by rememberSaveable {
         mutableStateOf(saved?.authKey ?: "tiiUC0/Fx51w5XuxAnpOgdRZb19SLqglwFdhxbbsbnM=")
     }
+    var tlsServerName by rememberSaveable { mutableStateOf(saved?.tlsServerName ?: "") }
     var insecure by rememberSaveable { mutableStateOf(saved?.insecure ?: true) }
     var killSwitch by rememberSaveable { mutableStateOf(saved?.killSwitch ?: false) }
     var autoStart by rememberSaveable { mutableStateOf(viewModel.autoStartEnabled) }
@@ -111,6 +112,7 @@ fun ConnectScreen(
         serverAddress = c.serverAddress
         serverPort = c.serverPort.toString()
         authKey = c.authKey
+        tlsServerName = c.tlsServerName ?: ""
         insecure = c.insecure
         killSwitch = c.killSwitch
         reorderEnabled = c.reorderEnabled
@@ -127,7 +129,7 @@ fun ConnectScreen(
 
     val currentConfig = {
         buildConfig(
-            serverAddress, serverPort, authKey, insecure, killSwitch,
+            serverAddress, serverPort, authKey, tlsServerName, insecure, killSwitch,
             reorderEnabled, reorderProfile, reorderPorts,
             hybridEnabled, hybridTcpMode, excludedApps,
         )
@@ -244,6 +246,33 @@ fun ConnectScreen(
             singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
         )
+        Spacer(modifier = Modifier.height(8.dp))
+        var sniInfo by remember { mutableStateOf(false) }
+        OutlinedTextField(
+            value = tlsServerName,
+            onValueChange = { tlsServerName = it },
+            label = { Text(stringResource(R.string.sni_label)) },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = isDisconnected,
+            singleLine = true,
+            trailingIcon = {
+                IconButton(onClick = { sniInfo = !sniInfo }) {
+                    Icon(
+                        Icons.Outlined.Info,
+                        contentDescription = stringResource(R.string.sni_label),
+                        tint = MaterialTheme.colorScheme.outline,
+                    )
+                }
+            },
+        )
+        if (sniInfo) {
+            Text(
+                stringResource(R.string.sni_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp, bottom = 4.dp),
+            )
+        }
         Spacer(modifier = Modifier.height(8.dp))
 
         SettingSwitchRow(
@@ -729,6 +758,7 @@ private fun buildConfig(
     address: String,
     port: String,
     key: String,
+    tlsServerName: String,
     insecure: Boolean,
     killSwitch: Boolean,
     reorderEnabled: Boolean,
@@ -742,6 +772,7 @@ private fun buildConfig(
         serverAddress = address.trim(),
         serverPort = port.trim().toIntOrNull() ?: 443,
         authKey = key.trim(),
+        tlsServerName = tlsServerName.trim().ifEmpty { null },
         insecure = insecure,
         killSwitch = killSwitch,
         reorderEnabled = reorderEnabled,

@@ -7,6 +7,8 @@
     <string name="server_address">Server Address</string>
     <string name="server_port">Port</string>
     <string name="auth_key">Auth Key</string>
+    <string name="sni_label">Camouflage domain (SNI, optional)</string>
+    <string name="sni_desc">The domain name sent in the TLS handshake. mqvpn traffic already looks like ordinary HTTP/3 (QUIC on UDP 443) to your ISP, but the handshake carries this name in the clear. Set it to a plausible domain (e.g. www.cloudflare.com) so a passive observer sees that instead of your server\'s hostname. Note: this does NOT hide your server\'s IP address — your ISP always sees the destination IP. To hide the real server IP, put it behind a CDN/reverse proxy. Leave empty to use the server address.</string>
     <string name="insecure_skip_tls">Insecure (skip TLS verify)</string>
     <string name="kill_switch">Kill Switch</string>
     <string name="autostart_on_boot">Auto-start on boot</string>

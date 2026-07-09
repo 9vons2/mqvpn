@@ -7,6 +7,8 @@
     <string name="server_address">Адреса сервера</string>
     <string name="server_port">Порт</string>
     <string name="auth_key">Ключ автентифікації</string>
+    <string name="sni_label">Домен маскування (SNI, необов\'язково)</string>
+    <string name="sni_desc">Ім\'я домену, що надсилається у TLS-рукостисканні. Трафік mqvpn і так виглядає як звичайний HTTP/3 (QUIC на UDP 443) для провайдера, але рукостискання містить це ім\'я у відкритому вигляді. Впишіть правдоподібний домен (напр. www.cloudflare.com), щоб пасивний спостерігач бачив саме його, а не адресу вашого сервера. Увага: це НЕ приховує IP-адресу сервера — провайдер завжди бачить IP призначення. Щоб сховати справжній IP сервера, поставте його за CDN/зворотний проксі. Порожнє = використати адресу сервера.</string>
     <string name="insecure_skip_tls">Небезпечно (без перевірки TLS)</string>
     <string name="kill_switch">Kill Switch (блокування без VPN)</string>
     <string name="autostart_on_boot">Автозапуск після перезавантаження</string>
