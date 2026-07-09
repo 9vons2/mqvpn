@@ -2,4 +2,103 @@
 <resources>
     <string name="app_name">mqvpn</string>
     <string name="notification_channel_name">mqvpn VPN</string>
+
+    <!-- Connect screen: inputs -->
+    <string name="server_address">Server Address</string>
+    <string name="server_port">Port</string>
+    <string name="auth_key">Auth Key</string>
+    <string name="sni_label">Camouflage domain (SNI, optional)</string>
+    <string name="sni_desc">The domain name sent in the TLS handshake. mqvpn traffic already looks like ordinary HTTP/3 (QUIC on UDP 443) to your ISP, but the handshake carries this name in the clear. Set it to a plausible domain (e.g. www.cloudflare.com) so a passive observer sees that instead of your server\'s hostname. Note: this does NOT hide your server\'s IP address — your ISP always sees the destination IP. To hide the real server IP, put it behind a CDN/reverse proxy. Leave empty to use the server address.</string>
+    <string name="insecure_skip_tls">Insecure (skip TLS verify)</string>
+    <string name="kill_switch">Kill Switch</string>
+    <string name="autostart_on_boot">Auto-start on boot</string>
+    <string name="reorder_buffer">Reorder Buffer</string>
+    <string name="reorder_profile">Reorder Profile</string>
+    <string name="reorder_ports_hint">Reorder Ports (comma-separated, e.g. 443,8443)</string>
+    <string name="hybrid_mode">Hybrid Mode (TCP lane)</string>
+    <string name="hybrid_tcp_mode">TCP Mode</string>
+
+    <!-- Connect screen: button -->
+    <string name="btn_connect">Connect</string>
+    <string name="btn_disconnect">Disconnect</string>
+    <string name="btn_connecting">Connecting…</string>
+    <string name="btn_reconnecting">Reconnecting…</string>
+
+    <!-- Connect screen: status -->
+    <string name="status_connected">Connected</string>
+    <string name="status_ip">IP: %1$s/%2$d</string>
+    <string name="status_ipv6">IPv6: %1$s/%2$d</string>
+    <string name="status_mtu">MTU: %1$d</string>
+    <string name="status_rtt">RTT: %1$dms</string>
+    <string name="status_tx_rx">TX: %1$s | RX: %2$s</string>
+    <string name="status_dgram">Dgram: %1$d sent, %2$d recv, %3$d lost</string>
+    <string name="paths_title">Paths</string>
+    <string name="reconnecting_in">Reconnecting in %1$ds…</string>
+    <string name="error_prefix">Error: %1$s</string>
+
+    <!-- Reorder stats card -->
+    <string name="reorder_stats_title">Reorder Buffer</string>
+    <string name="reorder_delivered_gaps">Delivered: %1$d | Gaps: %2$d (filled %3$s)</string>
+    <string name="reorder_timeout_ack">Timeout: %1$d | ACK demote: %2$d</string>
+    <string name="reorder_latency">Buffered latency: p50=%1$dms p99=%2$dms</string>
+
+    <!-- Hybrid lane stats card -->
+    <string name="hybrid_stats_title">Hybrid Lanes</string>
+    <string name="hybrid_lane_counts">TCP: %1$d | Dgram: %2$d | Raw: %3$d</string>
+    <string name="hybrid_flows">TCP flows: %1$d active, %2$d total, %3$d rejected</string>
+    <string name="hybrid_dropped">Dropped: %1$d | RAW markers: %2$d</string>
+
+    <!-- Setting descriptions (info toggles) -->
+    <string name="insecure_desc">Skips TLS certificate verification when connecting. Only use with your own server that has no valid certificate — with a public network this allows man-in-the-middle attacks.</string>
+    <string name="kill_switch_desc">Blocks all traffic outside the tunnel, including IPv6, so nothing leaks to the open network if the VPN drops. Turn off if apps must keep working without VPN.</string>
+    <string name="autostart_desc">Starts the VPN with the last used settings after the phone reboots. Requires VPN permission granted (connect once manually). On some phones (Xiaomi/MIUI, Oppo, etc.) you must also allow "Autostart" in system app settings, and battery optimization should be disabled for reliable background work.</string>
+    <string name="reorder_desc">Buffers UDP packets that arrive out of order when traffic is split across several paths, and releases them in sequence. Helps video calls and games on multipath. CELLULAR BOND (buffer 1024 packets) suits two mobile links; FIBER LTE (2048) suits a fast link paired with LTE. List the UDP ports to reorder below.</string>
+    <string name="hybrid_desc">Terminates TCP connections on the phone and relays them over a QUIC stream, so even a single download uses all paths at once (roughly the sum of both links instead of one). The server must have [Hybrid] Enabled=1. AUTO decides per connection (recommended), STREAM forces the TCP lane, RAW disables it.</string>
+
+    <!-- Server profiles -->
+    <string name="profile_label">Profile</string>
+    <string name="profile_save">Save profile</string>
+    <string name="profile_delete">Delete</string>
+
+    <!-- Split tunneling -->
+    <string name="split_label">Split tunneling</string>
+    <string name="split_desc">Selected apps bypass the VPN entirely and use the network directly — useful for banking apps that block VPN connections. Takes effect on the next connect.</string>
+    <string name="split_choose">Apps: %1$d</string>
+    <string name="split_dialog_title">Exclude apps from VPN</string>
+    <string name="split_dialog_hint">Checked apps will connect outside the tunnel.</string>
+    <string name="split_search_hint">Search apps</string>
+
+    <!-- Trusted Wi-Fi -->
+    <string name="trusted_label">Trusted Wi-Fi networks</string>
+    <string name="trusted_desc">On these Wi-Fi networks the VPN pauses itself: joining a listed network parks the tunnel, and it reconnects automatically as soon as you leave (to cellular or another Wi-Fi). Boot auto-start on a trusted network also parks and resumes later. Useful when the home router already bonds links itself (e.g. OpenMPTCProuter to the same server). Reading the Wi-Fi name requires the location permission and location services enabled. NOT compatible with the system "Always-on VPN" / "Block connections without VPN" setting — turn that off and use the app\'s own auto-start and Kill Switch instead.</string>
+    <string name="trusted_hint">SSIDs, comma-separated (e.g. HomeWiFi, Office)</string>
+    <string name="trusted_grant_location">Allow location access (needed to read the Wi-Fi name)</string>
+
+    <!-- Config export / import -->
+    <string name="export_button">QR export</string>
+    <string name="import_button">Import</string>
+    <string name="export_dialog_title">Config QR code</string>
+    <string name="export_dialog_hint">Scan with the other phone\'s camera, copy the text and paste it into Import there. The code contains your auth key — don\'t show it around.</string>
+    <string name="export_copy">Copy</string>
+    <string name="import_dialog_title">Import config</string>
+    <string name="import_dialog_hint">Paste the config JSON (from a QR scan or Copy).</string>
+    <string name="import_confirm">Import</string>
+    <string name="import_error">Invalid config</string>
+    <string name="dialog_ok">OK</string>
+    <string name="dialog_cancel">Cancel</string>
+
+    <!-- Battery / background work -->
+    <string name="battery_title">Background reliability</string>
+    <string name="battery_text">The system may kill the VPN in the background or block auto-start after reboot. Exclude mqvpn from battery optimization; on some phones also enable "Autostart" for the app in system settings.</string>
+    <string name="battery_button">Disable battery optimization</string>
+
+    <!-- Notifications -->
+    <string name="notif_action_disconnect">Disconnect</string>
+    <string name="notif_connecting">Connecting…</string>
+    <string name="notif_connected">Connected: %1$s</string>
+    <string name="notif_reconnecting">Reconnecting…</string>
+    <string name="notif_reconnecting_in">Reconnecting in %1$ds…</string>
+    <string name="notif_error">Error: %1$s</string>
+    <string name="notif_trusted_lockdown">Trusted Wi-Fi detected, but system Always-on VPN blocks auto-disconnect. Turn off "Always-on VPN" for mqvpn in Settings → Network → VPN.</string>
+    <string name="notif_paused_trusted">Paused: trusted Wi-Fi "%1$s" — reconnects automatically when you leave it</string>
 </resources>

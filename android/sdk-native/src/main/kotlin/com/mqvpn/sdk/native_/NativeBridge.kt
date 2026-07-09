@@ -31,6 +31,9 @@ object NativeBridge {
     /** mqvpn_config_set_server(cfg, host, port) */
     external fun configSetServer(cfg: Long, host: String, port: Int): Int
 
+    /** mqvpn_config_set_tls_server_name(cfg, name) */
+    external fun configSetTlsServerName(cfg: Long, name: String): Int
+
     /** mqvpn_config_set_auth_key(cfg, key) */
     external fun configSetAuthKey(cfg: Long, key: String): Int
 
@@ -63,6 +66,28 @@ object NativeBridge {
 
     /** mqvpn_config_set_killswitch_hint(cfg, enable) */
     external fun configSetKillswitchHint(cfg: Long, enable: Boolean): Int
+
+    /** mqvpn_config_set_reorder_enabled(cfg, mode: 0=OFF, 1=ON) */
+    external fun configSetReorderEnabled(cfg: Long, mode: Int): Int
+
+    /** mqvpn_config_add_reorder_rule(cfg, proto, port, profile) */
+    external fun configAddReorderRule(cfg: Long, proto: Int, port: Int, profile: Int): Int
+
+    /** mqvpn_config_set_hybrid_enabled(cfg, enable) */
+    external fun configSetHybridEnabled(cfg: Long, enable: Boolean): Int
+
+    /** mqvpn_config_set_hybrid_tcp_mode(cfg, mode: 0=STREAM, 1=RAW, 2=AUTO) */
+    external fun configSetHybridTcpMode(cfg: Long, mode: Int): Int
+
+    /** mqvpn_config_set_hybrid_limits(cfg, tcpMaxFlows, tcpIdleTimeoutSec) */
+    external fun configSetHybridLimits(cfg: Long, tcpMaxFlows: Int, tcpIdleTimeoutSec: Int): Int
+
+    /**
+     * mqvpn_client_get_reorder_stats(client) → LongArray:
+     * [deliveredCount, gapCount, gapFilledCount, gapTimeoutCount,
+     *  ackDemoteCount, p50Ms, p99Ms]
+     */
+    external fun getReorderStats(client: Long): LongArray?
 
     // ---- Client lifecycle ----
 
@@ -133,7 +158,10 @@ object NativeBridge {
 
     /**
      * mqvpn_client_get_stats(client) → LongArray:
-     * [bytesTx, bytesRx, pktsTx, pktsRx, rttUs, connUptimeMs]
+     * [bytesTx, bytesRx, dgramSent, dgramRecv, dgramLost, dgramAcked, srttMs,
+     *  pktsLaneTcp, pktsLaneDgram, pktsLaneRaw, tcpFlowsActive, tcpFlowsTotal,
+     *  tcpFlowsRejected, pktsLaneTcpDropped, rawMarkersActive]
+     * Lane counters (indices 7+) stay 0 unless the hybrid classifier is active.
      */
     external fun getStats(client: Long): LongArray?
 

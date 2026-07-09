@@ -13,6 +13,7 @@ import android.util.Log
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnState
 import com.mqvpn.sdk.core.model.PathInfo
+import com.mqvpn.sdk.core.model.ReorderStats
 import com.mqvpn.sdk.core.model.VpnStats
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -35,6 +36,9 @@ class MqvpnManager(private val context: Context) {
     private val _paths = MutableStateFlow<List<PathInfo>>(emptyList())
     val paths: StateFlow<List<PathInfo>> = _paths.asStateFlow()
 
+    private val _reorderStats = MutableStateFlow(ReorderStats())
+    val reorderStats: StateFlow<ReorderStats> = _reorderStats.asStateFlow()
+
     private var boundService: MqvpnVpnService? = null
     private var serviceConnection: ServiceConnection? = null
 
@@ -50,6 +54,14 @@ class MqvpnManager(private val context: Context) {
      */
     fun connect(config: MqvpnConfig, serviceClass: Class<out MqvpnVpnService>) {
         _vpnState.value = MqvpnState.Connecting
+
+        // Drop any binding left by attachIfRunning() before re-binding.
+        serviceConnection?.let { conn ->
+            try { context.unbindService(conn) } catch (_: Exception) {}
+        }
+        serviceConnection = null
+        boundService?.manager = null
+        boundService = null
 
         val intent = Intent(context, serviceClass).apply {
             putExtra(EXTRA_CONFIG_JSON, config.toJson())
@@ -70,8 +82,7 @@ class MqvpnManager(private val context: Context) {
                 boundService?.manager = null
                 boundService = null
                 _vpnState.value = MqvpnState.Disconnected
-                _stats.value = VpnStats()
-                _paths.value = emptyList()
+                resetMetrics()
             }
         }
         serviceConnection = conn
@@ -79,6 +90,41 @@ class MqvpnManager(private val context: Context) {
             context.bindService(intent, conn, Context.BIND_AUTO_CREATE)
         } catch (e: Exception) {
             Log.w(TAG, "bindService failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Attach to an already-running VpnService without starting one —
+     * e.g. after the service was auto-started at boot and the UI opens
+     * later. No-op if nothing is bound yet but the service isn't running
+     * (the binding stays dormant; without BIND_AUTO_CREATE it does not
+     * create the service).
+     */
+    fun attachIfRunning(serviceClass: Class<out MqvpnVpnService>) {
+        if (serviceConnection != null) return
+
+        val conn = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                val binder = service as? MqvpnVpnService.LocalBinder ?: return
+                val svc = binder.getService()
+                boundService = svc
+                svc.manager = this@MqvpnManager
+                _vpnState.value = svc.lastState
+            }
+
+            override fun onServiceDisconnected(name: ComponentName?) {
+                boundService?.manager = null
+                boundService = null
+                _vpnState.value = MqvpnState.Disconnected
+                resetMetrics()
+            }
+        }
+        serviceConnection = conn
+        try {
+            context.bindService(Intent(context, serviceClass), conn, 0)
+        } catch (e: Exception) {
+            Log.w(TAG, "attachIfRunning bindService failed: ${e.message}")
+            serviceConnection = null
         }
     }
 
@@ -107,6 +153,16 @@ class MqvpnManager(private val context: Context) {
     /** Update paths (called from VpnService). */
     internal fun updatePaths(p: List<PathInfo>) {
         _paths.value = p
+    }
+
+    /** Update reorder stats (called from VpnService). */
+    internal fun updateReorderStats(s: ReorderStats) { _reorderStats.value = s }
+
+    /** Reset all metric flows to zero (called on service disconnect). */
+    internal fun resetMetrics() {
+        _stats.value = VpnStats()
+        _paths.value = emptyList()
+        _reorderStats.value = ReorderStats()
     }
 
     fun destroy() {

@@ -3,9 +3,13 @@
 
 package com.mqvpn.sdk.core
 
+import android.util.Log
+import com.mqvpn.sdk.core.internal.ReorderPlan
 import com.mqvpn.sdk.core.internal.TunnelCallbacks
+import com.mqvpn.sdk.core.internal.planReorder
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.PathInfo
+import com.mqvpn.sdk.core.model.ReorderStats
 import com.mqvpn.sdk.core.model.VpnStats
 import com.mqvpn.sdk.native_.NativeBridge
 
@@ -17,6 +21,7 @@ import com.mqvpn.sdk.native_.NativeBridge
 class MqvpnTunnel internal constructor(
     private val clientHandle: Long,
     private val cfgHandle: Long,
+    private val reorderEnabled: Boolean = false,
 ) {
     // --- Lifecycle ---
 
@@ -58,9 +63,16 @@ class MqvpnTunnel internal constructor(
 
     fun getState(): Int = NativeBridge.getState(clientHandle)
 
+    fun getReorderStats(): ReorderStats {
+        if (!reorderEnabled) return ReorderStats()
+        val a = NativeBridge.getReorderStats(clientHandle) ?: return ReorderStats()
+        if (a.size < REORDER_STATS_FIELDS) return ReorderStats()
+        return ReorderStats(a[0], a[1], a[2], a[3], a[4], a[5], a[6])
+    }
+
     fun getStats(): VpnStats {
         val arr = NativeBridge.getStats(clientHandle) ?: return VpnStats()
-        return VpnStats(
+        val base = VpnStats(
             bytesTx = arr[0],
             bytesRx = arr[1],
             dgramSent = arr[2],
@@ -68,6 +80,18 @@ class MqvpnTunnel internal constructor(
             dgramLost = arr[4],
             dgramAcked = arr[5],
             srttMs = arr[6].toInt(),
+        )
+        // Lane counters: absent from pre-hybrid native builds — keep zeros.
+        if (arr.size < STATS_FIELDS) return base
+        return base.copy(
+            pktsLaneTcp = arr[7],
+            pktsLaneDgram = arr[8],
+            pktsLaneRaw = arr[9],
+            tcpFlowsActive = arr[10],
+            tcpFlowsTotal = arr[11],
+            tcpFlowsRejected = arr[12],
+            pktsLaneTcpDropped = arr[13],
+            rawMarkersActive = arr[14],
         )
     }
 
@@ -111,11 +135,40 @@ class MqvpnTunnel internal constructor(
     }
 
     companion object {
+        private const val TAG = "MqvpnTunnel"
+        private const val REORDER_STATS_FIELDS = 7
+        private const val STATS_FIELDS = 15
         const val ERR_AGAIN = -9
+
+        private fun applyHybrid(cfg: Long, config: MqvpnConfig) {
+            if (!config.hybridEnabled) return
+            var rc = NativeBridge.configSetHybridEnabled(cfg, true)
+            if (rc != 0) {
+                Log.w(TAG, "configSetHybridEnabled failed (rc=$rc) — hybrid stays off")
+                return
+            }
+            rc = NativeBridge.configSetHybridTcpMode(cfg, config.hybridTcpMode.native)
+            if (rc != 0) Log.w(TAG, "configSetHybridTcpMode failed (rc=$rc)")
+            rc = NativeBridge.configSetHybridLimits(
+                cfg, config.hybridTcpMaxFlows, config.hybridTcpIdleTimeoutSec,
+            )
+            if (rc != 0) Log.w(TAG, "configSetHybridLimits failed (rc=$rc)")
+        }
+
+        private fun applyReorder(cfg: Long, plan: ReorderPlan) {
+            plan.warnings.forEach { Log.w(TAG, it) }
+            if (!plan.enabled) return
+            NativeBridge.configSetReorderEnabled(cfg, 1)
+            plan.rules.forEach { r ->
+                val rc = NativeBridge.configAddReorderRule(cfg, r.proto, r.port, r.profile)
+                if (rc != 0) Log.w(TAG, "configAddReorderRule failed for port ${r.port} (rc=$rc)")
+            }
+        }
 
         internal fun create(config: MqvpnConfig, callbacks: TunnelCallbacks): MqvpnTunnel {
             val cfg = NativeBridge.configNew()
             NativeBridge.configSetServer(cfg, config.serverAddress, config.serverPort)
+            config.tlsServerName?.let { NativeBridge.configSetTlsServerName(cfg, it) }
             NativeBridge.configSetAuthKey(cfg, config.authKey)
             NativeBridge.configSetInsecure(cfg, config.insecure)
             NativeBridge.configSetScheduler(cfg, config.scheduler.native)
@@ -124,10 +177,12 @@ class MqvpnTunnel internal constructor(
             NativeBridge.configSetReconnect(cfg, config.reconnect, config.reconnectIntervalSec)
             NativeBridge.configSetKillswitchHint(cfg, config.killSwitch)
             NativeBridge.configSetAndroidClock(cfg)
-
+            val plan = planReorder(config)
+            applyReorder(cfg, plan)
+            applyHybrid(cfg, config)
             val handle = NativeBridge.clientNew(cfg, callbacks)
             check(handle != 0L) { "mqvpn_client_new failed" }
-            return MqvpnTunnel(handle, cfg)
+            return MqvpnTunnel(handle, cfg, plan.enabled)
         }
     }
 }

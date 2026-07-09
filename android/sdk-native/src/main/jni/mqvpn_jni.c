@@ -27,6 +27,8 @@
 #include <android/log.h>
 
 #include "libmqvpn.h"
+#include "mqvpn_internal.h"
+#include "reorder.h"
 
 #define LOG_TAG   "mqvpn_jni"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -312,6 +314,19 @@ JNI_FN(configSetServer)(JNIEnv *env, jobject thiz, jlong cfg, jstring host, jint
     return rc;
 }
 
+/* configSetTlsServerName(cfg, name) → int */
+JNIEXPORT jint JNICALL
+JNI_FN(configSetTlsServerName)(JNIEnv *env, jobject thiz, jlong cfg, jstring name)
+{
+    (void)thiz;
+    const char *n = (*env)->GetStringUTFChars(env, name, NULL);
+    if (!n) return MQVPN_ERR_NO_MEMORY;
+
+    int rc = mqvpn_config_set_tls_server_name((mqvpn_config_t *)(intptr_t)cfg, n);
+    (*env)->ReleaseStringUTFChars(env, name, n);
+    return rc;
+}
+
 /* configSetAuthKey(cfg, key) → int */
 JNIEXPORT jint JNICALL
 JNI_FN(configSetAuthKey)(JNIEnv *env, jobject thiz, jlong cfg, jstring key)
@@ -415,6 +430,62 @@ JNI_FN(configSetKillswitchHint)(JNIEnv *env, jobject thiz, jlong cfg, jboolean e
     (void)thiz;
     return mqvpn_config_set_killswitch_hint((mqvpn_config_t *)(intptr_t)cfg,
                                             enable ? 1 : 0);
+}
+
+/* configSetReorderEnabled(cfg, mode) → int */
+JNIEXPORT jint JNICALL
+JNI_FN(configSetReorderEnabled)(JNIEnv *env, jobject thiz, jlong cfg, jint mode)
+{
+    (void)env;
+    (void)thiz;
+    return mqvpn_config_set_reorder_enabled((mqvpn_config_t *)(intptr_t)cfg,
+                                            (mqvpn_reorder_mode_t)mode);
+}
+
+/* configAddReorderRule(cfg, proto, port, profile) → int */
+JNIEXPORT jint JNICALL
+JNI_FN(configAddReorderRule)(JNIEnv *env, jobject thiz, jlong cfg, jint proto, jint port,
+                             jint profile)
+{
+    (void)env;
+    (void)thiz;
+    if (proto < 0 || proto > 255) return -1;
+    if (port < 1 || port > 65535) return -1;
+    return mqvpn_config_add_reorder_rule((mqvpn_config_t *)(intptr_t)cfg, (uint8_t)proto,
+                                         (uint16_t)port,
+                                         (mqvpn_reorder_profile_t)profile);
+}
+
+/* configSetHybridEnabled(cfg, enable) → int */
+JNIEXPORT jint JNICALL
+JNI_FN(configSetHybridEnabled)(JNIEnv *env, jobject thiz, jlong cfg, jboolean enable)
+{
+    (void)env;
+    (void)thiz;
+    return mqvpn_config_set_hybrid_enabled((mqvpn_config_t *)(intptr_t)cfg,
+                                           enable ? 1 : 0);
+}
+
+/* configSetHybridTcpMode(cfg, mode) → int — 0=stream 1=raw 2=auto */
+JNIEXPORT jint JNICALL
+JNI_FN(configSetHybridTcpMode)(JNIEnv *env, jobject thiz, jlong cfg, jint mode)
+{
+    (void)env;
+    (void)thiz;
+    return mqvpn_config_set_hybrid_tcp_mode((mqvpn_config_t *)(intptr_t)cfg, mode);
+}
+
+/* configSetHybridLimits(cfg, tcpMaxFlows, tcpIdleTimeoutSec) → int */
+JNIEXPORT jint JNICALL
+JNI_FN(configSetHybridLimits)(JNIEnv *env, jobject thiz, jlong cfg, jint tcpMaxFlows,
+                              jint tcpIdleTimeoutSec)
+{
+    (void)env;
+    (void)thiz;
+    if (tcpMaxFlows <= 0 || tcpIdleTimeoutSec <= 0) return MQVPN_ERR_INVALID_ARG;
+    return mqvpn_config_set_hybrid_limits((mqvpn_config_t *)(intptr_t)cfg,
+                                          (uint32_t)tcpMaxFlows,
+                                          (uint32_t)tcpIdleTimeoutSec);
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -728,7 +799,10 @@ JNI_FN(getState)(JNIEnv *env, jobject thiz, jlong client)
 
 /*
  * getStats(client) → LongArray:
- * [bytesTx, bytesRx, dgramSent, dgramRecv, dgramLost, dgramAcked, srttMs]
+ * [bytesTx, bytesRx, dgramSent, dgramRecv, dgramLost, dgramAcked, srttMs,
+ *  pktsLaneTcp, pktsLaneDgram, pktsLaneRaw, tcpFlowsActive, tcpFlowsTotal,
+ *  tcpFlowsRejected, pktsLaneTcpDropped, rawMarkersActive]
+ * Lane counters (indices 7+) stay 0 unless the hybrid classifier is active.
  */
 JNIEXPORT jlongArray JNICALL
 JNI_FN(getStats)(JNIEnv *env, jobject thiz, jlong client)
@@ -741,14 +815,26 @@ JNI_FN(getStats)(JNIEnv *env, jobject thiz, jlong client)
     int rc = mqvpn_client_get_stats((const mqvpn_client_t *)(intptr_t)client, &stats);
     if (rc != MQVPN_OK) return NULL;
 
-    jlong values[7] = {
-        (jlong)stats.bytes_tx,   (jlong)stats.bytes_rx,   (jlong)stats.dgram_sent,
-        (jlong)stats.dgram_recv, (jlong)stats.dgram_lost, (jlong)stats.dgram_acked,
+    jlong values[15] = {
+        (jlong)stats.bytes_tx,
+        (jlong)stats.bytes_rx,
+        (jlong)stats.dgram_sent,
+        (jlong)stats.dgram_recv,
+        (jlong)stats.dgram_lost,
+        (jlong)stats.dgram_acked,
         (jlong)stats.srtt_ms,
+        (jlong)stats.pkts_lane_tcp,
+        (jlong)stats.pkts_lane_dgram,
+        (jlong)stats.pkts_lane_raw,
+        (jlong)stats.tcp_flows_active,
+        (jlong)stats.tcp_flows_total,
+        (jlong)stats.tcp_flows_rejected,
+        (jlong)stats.pkts_lane_tcp_dropped,
+        (jlong)stats.raw_markers_active,
     };
 
-    jlongArray arr = (*env)->NewLongArray(env, 7);
-    if (arr) (*env)->SetLongArrayRegion(env, arr, 0, 7, values);
+    jlongArray arr = (*env)->NewLongArray(env, 15);
+    if (arr) (*env)->SetLongArrayRegion(env, arr, 0, 15, values);
     return arr;
 }
 
@@ -839,6 +925,34 @@ JNI_FN(getInterest)(JNIEnv *env, jobject thiz, jlong client)
 
     jintArray arr = (*env)->NewIntArray(env, 3);
     if (arr) (*env)->SetIntArrayRegion(env, arr, 0, 3, values);
+    return arr;
+}
+
+/*
+ * getReorderStats(client) → LongArray:
+ * [deliveredCount, gapCount, gapFilledCount, gapTimeoutCount,
+ *  ackDemoteCount, p50Ms, p99Ms]
+ */
+JNIEXPORT jlongArray JNICALL
+JNI_FN(getReorderStats)(JNIEnv *env, jobject thiz, jlong client)
+{
+    (void)thiz;
+    mqvpn_reorder_stats_t st;
+    if (mqvpn_client_get_reorder_stats((const mqvpn_client_t *)(intptr_t)client, &st) !=
+        0)
+        return NULL;
+
+    double p50 = mqvpn_reorder_latency_buffered_percentile(&st, 0.50);
+    double p99 = mqvpn_reorder_latency_buffered_percentile(&st, 0.99);
+
+    jlong values[7] = {
+        (jlong)st.delivered_count,  (jlong)st.gap_count,
+        (jlong)st.gap_filled_count, (jlong)st.gap_timeout_count,
+        (jlong)st.ack_demote_count, (jlong)(p50 + 0.5),
+        (jlong)(p99 + 0.5),
+    };
+    jlongArray arr = (*env)->NewLongArray(env, 7);
+    if (arr) (*env)->SetLongArrayRegion(env, arr, 0, 7, values);
     return arr;
 }
 

@@ -72,6 +72,7 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
                 if (t != null) {
                     manager?.updateStats(t.getStats())
                     manager?.updatePaths(t.getPaths())
+                    manager?.updateReorderStats(t.getReorderStats())
                 }
                 result
             },
@@ -143,7 +144,7 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
      * Stop VPN tunnel. Called by [MqvpnManager.disconnect].
      * Do NOT call from onDestroy — cleanup runs automatically.
      */
-    internal fun stopTunnel() {
+    fun stopTunnel() {
         executor.enqueue { cleanup() }
     }
 
@@ -243,9 +244,14 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
      * Emit state to both Manager (StateFlow → UI) and app callback.
      */
     private fun emitState(newState: MqvpnState) {
+        lastState = newState
         manager?.updateState(newState)
         onVpnStateChanged(newState)
     }
+
+    /** Last emitted state — lets a late-binding [MqvpnManager] catch up. */
+    internal var lastState: MqvpnState = MqvpnState.Disconnected
+        private set
 
     // --- Abstract methods (app implements) ---
 

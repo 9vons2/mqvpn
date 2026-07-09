@@ -14,8 +14,9 @@
 
 #include <stddef.h> /* size_t */
 
-#include "libmqvpn.h" /* for MQVPN_MAX_PATHS, MQVPN_MAX_USERS */
-#include "reorder.h"  /* for embedded mqvpn_reorder_config_t (§16.1 INI) */
+#include "libmqvpn.h"          /* for MQVPN_MAX_PATHS, MQVPN_MAX_USERS */
+#include "reorder.h"           /* for embedded mqvpn_reorder_config_t (§16.1 INI) */
+#include "hybrid/classifier.h" /* for embedded mqvpn_hybrid_config_t ([Hybrid]) */
 
 #define MQVPN_CONFIG_MAX_PATHS 8
 #define MQVPN_CONFIG_MAX_DNS   4
@@ -33,7 +34,7 @@ typedef struct mqvpn_file_config_s {
     /* [Interface] — server */
     char listen[280]; /* "bind:port" */
     char subnet[32];
-    char subnet6[64]; /* IPv6 tunnel subnet CIDR (e.g. "2001:db8:1::/112") */
+    char subnet6[64]; /* IPv6 tunnel subnet CIDR (e.g. "fd00:abcd::/112") */
 
     /* [Interface] — client */
     char dns_servers[MQVPN_CONFIG_MAX_DNS][64];
@@ -41,6 +42,7 @@ typedef struct mqvpn_file_config_s {
 
     /* [Server] — client */
     char server_addr[280]; /* "host:port" */
+    char tls_server_name[256];
     int insecure;
 
     /* [Auth] — client */
@@ -80,6 +82,10 @@ typedef struct mqvpn_file_config_s {
     /* [Reorder] / repeated [ReorderRule] — flow-aware reorder shim (§16.1).
      * Seeded with mqvpn_reorder_config_default() in mqvpn_config_defaults(). */
     mqvpn_reorder_config_t reorder;
+
+    /* [Hybrid] — hybrid-mode ingress classifier policy (H1).
+     * Seeded with mqvpn_hybrid_config_default() in mqvpn_config_defaults(). */
+    mqvpn_hybrid_config_t hybrid;
 
     /* Inferred mode: 1=server, 0=client */
     int is_server;

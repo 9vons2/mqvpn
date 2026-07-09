@@ -11,7 +11,8 @@
 #define MQVPN_INTERNAL_H
 
 #include "libmqvpn.h"
-#include "reorder.h" /* mqvpn_reorder_config_t embedded in the builder config */
+#include "reorder.h"           /* mqvpn_reorder_config_t embedded in the builder config */
+#include "hybrid/classifier.h" /* mqvpn_hybrid_config_t embedded in the builder config */
 #include <stdbool.h>
 
 /* ─── Constants ─── */
@@ -30,6 +31,7 @@
 
 struct mqvpn_config_s {
     char server_host[256];
+    char tls_server_name[256];
     int server_port;
     char auth_key[256];
     char user_names[MQVPN_MAX_USERS][64];
@@ -69,6 +71,11 @@ struct mqvpn_config_s {
      * mqvpn_reorder_config_default() in mqvpn_config_new(); the library
      * consumer reads cfg->reorder. */
     mqvpn_reorder_config_t reorder;
+
+    /* Hybrid-mode classifier policy (H1). Seeded with
+     * mqvpn_hybrid_config_default() in mqvpn_config_new(); the library
+     * consumer reads cfg->hybrid. */
+    mqvpn_hybrid_config_t hybrid;
 };
 
 /* ─── State transition validation (M0-5) ─── */
@@ -82,6 +89,13 @@ int mqvpn_state_transition_valid(mqvpn_client_state_t from, mqvpn_client_state_t
  * the platform layers so every surface honors reorder config identically. The
  * internal-only eval_force_no_demotion knob is intentionally NOT bridged. */
 void mqvpn_config_apply_reorder(mqvpn_config_t *cfg, const mqvpn_reorder_config_t *src);
+
+/* ─── Hybrid config bridge (H1) ─── */
+
+/* Translate a parsed/built hybrid config (e.g. from INI [Hybrid] via
+ * mqvpn_file_config_t) into `cfg`. Shared by the platform layers so every
+ * surface honors hybrid config identically. */
+void mqvpn_config_apply_hybrid(mqvpn_config_t *cfg, const mqvpn_hybrid_config_t *src);
 
 /* ─── Scheduler precondition predicate ─── */
 
@@ -193,6 +207,8 @@ MQVPN_INTERNAL int mqvpn_server_get_all_fec_stats(const mqvpn_server_t *s,
  * breakdown): the e2e/exporter only needs the engine-fired evidence
  * (gap_count > 0), and per-conn detail is not required at this layer. */
 MQVPN_INTERNAL int mqvpn_server_get_reorder_stats(const mqvpn_server_t *s,
+                                                  mqvpn_reorder_stats_t *out);
+MQVPN_INTERNAL int mqvpn_client_get_reorder_stats(const mqvpn_client_t *c,
                                                   mqvpn_reorder_stats_t *out);
 
 #endif /* MQVPN_INTERNAL_H */
