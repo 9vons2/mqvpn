@@ -3,6 +3,7 @@
 
 package com.mqvpn.app
 
+import com.mqvpn.app.net.ProviderDirectory
 import com.mqvpn.app.service.MyVpnService
 import com.mqvpn.app.ui.MqvpnViewModel
 import com.mqvpn.sdk.core.MqvpnManager
@@ -47,12 +48,17 @@ class MqvpnViewModelTest {
         every { it.reorderStats } returns reorderStatsFlow
     }
 
+    private val mockProviders = mockk<ProviderDirectory>(relaxed = true).also {
+        every { it.labels } returns MutableStateFlow(emptyMap())
+        every { it.customNames } returns MutableStateFlow(emptyMap())
+    }
+
     private lateinit var viewModel: MqvpnViewModel
 
     @Before
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
-        viewModel = MqvpnViewModel(mockManager)
+        viewModel = MqvpnViewModel(mockManager, mockProviders)
     }
 
     @After

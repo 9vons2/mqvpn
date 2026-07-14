@@ -54,6 +54,7 @@ fun ConnectScreen(
     val stats by viewModel.stats.collectAsStateWithLifecycle()
     val paths by viewModel.paths.collectAsStateWithLifecycle()
     val reorderStats by viewModel.reorderStats.collectAsStateWithLifecycle()
+    val throughput by viewModel.throughput.collectAsStateWithLifecycle()
 
     var serverAddress by rememberSaveable { mutableStateOf("160.251.143.149") }
     var serverPort by rememberSaveable { mutableStateOf("443") }
@@ -320,10 +321,13 @@ fun ConnectScreen(
 
                 if (paths.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(12.dp))
-                    Text("Paths", style = MaterialTheme.typography.titleSmall)
-                    BandwidthChart(paths)
+                    Text("Providers", style = MaterialTheme.typography.titleSmall)
                     Spacer(modifier = Modifier.height(4.dp))
-                    paths.forEach { path -> PathCard(path) }
+                    ThroughputSection(throughput)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    throughput.paths.forEach { path ->
+                        PathCard(path) { name -> viewModel.renameProvider(path.key, name) }
+                    }
                 }
 
                 if (reorderStats.delivered > 0 || reorderStats.gapCount > 0) {
@@ -399,13 +403,4 @@ private fun buildConfig(
         hybridEnabled = hybridEnabled,
         hybridTcpMode = hybridTcpMode,
     )
-}
-
-private fun formatBytes(bytes: Long): String {
-    return when {
-        bytes >= 1_000_000_000 -> "%.1f GB".format(bytes / 1_000_000_000.0)
-        bytes >= 1_000_000 -> "%.1f MB".format(bytes / 1_000_000.0)
-        bytes >= 1_000 -> "%.1f KB".format(bytes / 1_000.0)
-        else -> "$bytes B"
-    }
 }
