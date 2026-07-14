@@ -79,6 +79,11 @@ dependencies {
     implementation("com.google.dagger:hilt-android:2.60.1")
     ksp("com.google.dagger:hilt-android-compiler:2.60.1")
     implementation("androidx.hilt:hilt-navigation-compose:1.4.0")
+    // Dagger's generated service components reference @CanIgnoreReturnValue
+    compileOnly("com.google.errorprone:error_prone_annotations:2.36.0")
+
+    // QR code generation (config export)
+    implementation("com.google.zxing:core:3.5.3")
 
     // Test
     testImplementation("junit:junit:4.13.2")

@@ -22,12 +22,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.mqvpn.app.R
 
 // Categorical series colors (colorblind-safe fixed slot order; light/dark
 // variants tuned per surface). Slot follows the provider, never its rank.
@@ -66,12 +68,15 @@ fun ThroughputSection(t: ThroughputUi) {
         Column(modifier = Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    "Live throughput",
+                    stringResource(R.string.tp_title),
                     style = MaterialTheme.typography.titleSmall,
                     modifier = Modifier.weight(1f),
                 )
                 Text(
-                    "↓ ${formatBps(t.aggregateDownBps)}   ↑ ${formatBps(t.aggregateUpBps)}",
+                    stringResource(
+                        R.string.tp_rates,
+                        formatBps(t.aggregateDownBps), formatBps(t.aggregateUpBps),
+                    ),
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary,
@@ -79,9 +84,9 @@ fun ThroughputSection(t: ThroughputUi) {
             }
 
             Spacer(modifier = Modifier.height(8.dp))
-            RatePanel("Download", t) { it.downBps }
+            RatePanel(stringResource(R.string.tp_download), t) { it.downBps }
             Spacer(modifier = Modifier.height(8.dp))
-            RatePanel("Upload", t) { it.upBps }
+            RatePanel(stringResource(R.string.tp_upload), t) { it.upBps }
 
             Spacer(modifier = Modifier.height(8.dp))
             t.paths.forEach { p ->
@@ -102,7 +107,7 @@ fun ThroughputSection(t: ThroughputUi) {
                         modifier = Modifier.weight(1f),
                     )
                     Text(
-                        "↓ ${formatBps(p.downBps)}  ↑ ${formatBps(p.upBps)}",
+                        stringResource(R.string.tp_rates, formatBps(p.downBps), formatBps(p.upBps)),
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }
@@ -119,13 +124,16 @@ fun ThroughputSection(t: ThroughputUi) {
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    "All providers",
+                    stringResource(R.string.tp_all_providers),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f),
                 )
                 Text(
-                    "↓ ${formatBps(t.aggregateDownBps)}  ↑ ${formatBps(t.aggregateUpBps)}",
+                    stringResource(
+                        R.string.tp_rates,
+                        formatBps(t.aggregateDownBps), formatBps(t.aggregateUpBps),
+                    ),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -163,7 +171,7 @@ private fun RatePanel(
             modifier = Modifier.weight(1f),
         )
         Text(
-            "peak ${formatBps(peak)}",
+            stringResource(R.string.tp_peak, formatBps(peak)),
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )

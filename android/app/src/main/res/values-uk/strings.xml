@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">mqvpn</string>
+    <string name="notification_channel_name">VPN-служба mqvpn</string>
+
+    <!-- Екран підключення: поля -->
+    <string name="server_address">Адреса сервера</string>
+    <string name="server_port">Порт</string>
+    <string name="auth_key">Ключ автентифікації</string>
+    <string name="sni_label">Домен маскування (SNI, необов\'язково)</string>
+    <string name="sni_desc">Ім\'я домену, що надсилається у TLS-рукостисканні. Трафік mqvpn і так виглядає як звичайний HTTP/3 (QUIC на UDP 443) для провайдера, але рукостискання містить це ім\'я у відкритому вигляді. Впишіть правдоподібний домен (напр. www.cloudflare.com), щоб пасивний спостерігач бачив саме його, а не адресу вашого сервера. Увага: це НЕ приховує IP-адресу сервера — провайдер завжди бачить IP призначення. Щоб сховати справжній IP сервера, поставте його за CDN/зворотний проксі. Порожнє = використати адресу сервера.</string>
+    <string name="insecure_skip_tls">Небезпечно (без перевірки TLS)</string>
+    <string name="kill_switch">Kill Switch (блокування без VPN)</string>
+    <string name="autostart_on_boot">Автозапуск після перезавантаження</string>
+    <string name="reorder_buffer">Буфер перевпорядкування</string>
+    <string name="reorder_profile">Профіль перевпорядкування</string>
+    <string name="reorder_ports_hint">Порти (через кому, напр. 443,8443)</string>
+    <string name="hybrid_mode">Гібридний режим (TCP-смуга)</string>
+    <string name="hybrid_tcp_mode">Режим TCP</string>
+
+    <!-- Екран підключення: кнопка -->
+    <string name="btn_connect">Підключити</string>
+    <string name="btn_disconnect">Відключити</string>
+    <string name="btn_connecting">Підключення…</string>
+    <string name="btn_reconnecting">Перепідключення…</string>
+
+    <!-- Екран підключення: стан -->
+    <string name="status_connected">Підключено</string>
+    <string name="status_ip">IP: %1$s/%2$d</string>
+    <string name="status_ipv6">IPv6: %1$s/%2$d</string>
+    <string name="status_mtu">MTU: %1$d</string>
+    <string name="status_rtt">RTT: %1$d мс</string>
+    <string name="status_tx_rx">Надіслано: %1$s | Отримано: %2$s</string>
+    <string name="status_dgram">Дейтаграми: %1$d надісл., %2$d отрим., %3$d втрач.</string>
+    <string name="paths_title">Шляхи</string>
+    <string name="reconnecting_in">Перепідключення через %1$d с…</string>
+    <string name="error_prefix">Помилка: %1$s</string>
+
+    <!-- Картка статистики перевпорядкування -->
+    <string name="reorder_stats_title">Буфер перевпорядкування</string>
+    <string name="reorder_delivered_gaps">Доставлено: %1$d | Розриви: %2$d (заповнено %3$s)</string>
+    <string name="reorder_timeout_ack">Тайм-аут: %1$d | Пониження ACK: %2$d</string>
+    <string name="reorder_latency">Затримка буфера: p50=%1$d мс p99=%2$d мс</string>
+
+    <!-- Картка гібридних смуг -->
+    <string name="hybrid_stats_title">Гібридні смуги</string>
+    <string name="hybrid_lane_counts">TCP: %1$d | Дейтаграми: %2$d | Raw: %3$d</string>
+    <string name="hybrid_flows">TCP-потоки: %1$d активних, %2$d всього, %3$d відхилено</string>
+    <string name="hybrid_dropped">Відкинуто: %1$d | RAW-маркери: %2$d</string>
+
+    <!-- Описи налаштувань (підказки) -->
+    <string name="insecure_desc">Пропускає перевірку TLS-сертифіката при підключенні. Використовуйте лише з власним сервером без валідного сертифіката — у публічній мережі це відкриває можливість атаки «людина посередині».</string>
+    <string name="kill_switch_desc">Блокує весь трафік поза тунелем, включно з IPv6, щоб нічого не витікало у відкриту мережу при розриві VPN. Вимкніть, якщо застосунки мають працювати й без VPN.</string>
+    <string name="autostart_desc">Запускає VPN з останніми налаштуваннями після перезавантаження телефона. Потрібен наданий дозвіл VPN (підключіться раз вручну). На деяких телефонах (Xiaomi/MIUI, Oppo тощо) треба також дозволити «Автозапуск» у системних налаштуваннях застосунку, а для надійної роботи у фоні — вимкнути оптимізацію батареї.</string>
+    <string name="reorder_desc">Буферизує UDP-пакети, що приходять не по черзі, коли трафік розділено між кількома шляхами, і віддає їх у правильному порядку. Допомагає відеодзвінкам та іграм на кількох каналах. CELLULAR BOND (буфер 1024 пакети) — для двох мобільних каналів; FIBER LTE (2048) — для швидкого каналу в парі з LTE. Нижче вкажіть UDP-порти для перевпорядкування.</string>
+    <string name="hybrid_desc">Термінує TCP-з\'єднання на телефоні й передає їх через QUIC-стрім, тож навіть одне завантаження використовує всі шляхи одночасно (приблизно сума обох каналів замість одного). На сервері має бути [Hybrid] Enabled=1. AUTO вирішує для кожного з\'єднання окремо (рекомендовано), STREAM — завжди через TCP-смугу, RAW — вимкнено.</string>
+
+    <!-- Профілі серверів -->
+    <string name="profile_label">Профіль</string>
+    <string name="profile_save">Зберегти профіль</string>
+    <string name="profile_delete">Видалити</string>
+
+    <!-- Split tunneling -->
+    <string name="split_label">Split tunneling</string>
+    <string name="split_desc">Обрані застосунки повністю оминають VPN і працюють напряму через мережу — корисно для банківських застосунків, які блокують VPN. Набуває чинності з наступним підключенням.</string>
+    <string name="split_choose">Застосунки: %1$d</string>
+    <string name="split_dialog_title">Виключити застосунки з VPN</string>
+    <string name="split_dialog_hint">Позначені застосунки з\'єднуватимуться поза тунелем.</string>
+    <string name="split_search_hint">Пошук застосунків</string>
+
+    <!-- Довірені Wi-Fi -->
+    <string name="trusted_label">Довірені Wi-Fi мережі</string>
+    <string name="trusted_desc">У цих Wi-Fi мережах VPN стає на паузу: при підключенні до мережі зі списку тунель зупиняється, а щойно ви її покидаєте (на мобільну мережу чи інший Wi-Fi) — підключається автоматично. Автозапуск після перезавантаження в довіреній мережі теж чекає на паузі й відновлюється пізніше. Корисно, коли домашній роутер сам агрегує канали (наприклад, OpenMPTCProuter на той самий сервер). Для читання імені Wi-Fi потрібен дозвіл геолокації та ввімкнена локація. НЕ сумісно із системним «Постійний VPN» / «Блокувати з\'єднання без VPN» — вимкніть їх і користуйтеся автозапуском та Kill Switch самого застосунку.</string>
+    <string name="trusted_hint">SSID через кому (напр. HomeWiFi, Office)</string>
+    <string name="trusted_grant_location">Надати дозвіл локації (потрібен для імені Wi-Fi)</string>
+
+    <!-- Експорт / імпорт конфігу -->
+    <string name="export_button">QR-експорт</string>
+    <string name="import_button">Імпорт</string>
+    <string name="export_dialog_title">QR-код конфігурації</string>
+    <string name="export_dialog_hint">Відскануйте камерою іншого телефона, скопіюйте текст і вставте його там в «Імпорт». Код містить ваш ключ автентифікації — не показуйте стороннім.</string>
+    <string name="export_copy">Копіювати</string>
+    <string name="import_dialog_title">Імпорт конфігурації</string>
+    <string name="import_dialog_hint">Вставте JSON конфігурації (зі сканування QR або «Копіювати»).</string>
+    <string name="import_confirm">Імпортувати</string>
+    <string name="import_error">Неправильна конфігурація</string>
+    <string name="dialog_ok">OK</string>
+    <string name="dialog_cancel">Скасувати</string>
+
+    <!-- Батарея / робота у фоні -->
+    <string name="battery_title">Робота у фоні</string>
+    <string name="battery_text">Система може вбивати VPN у фоні або блокувати автозапуск після перезавантаження. Виключіть mqvpn з оптимізації батареї; на деяких телефонах також увімкніть «Автозапуск» для застосунку в системних налаштуваннях.</string>
+    <string name="battery_button">Вимкнути оптимізацію батареї</string>
+
+    <!-- Сповіщення -->
+    <string name="notif_action_disconnect">Відключити</string>
+    <string name="notif_connecting">Підключення…</string>
+    <string name="notif_connected">Підключено: %1$s</string>
+    <string name="notif_reconnecting">Перепідключення…</string>
+    <string name="notif_reconnecting_in">Перепідключення через %1$d с…</string>
+    <string name="notif_error">Помилка: %1$s</string>
+    <string name="notif_trusted_lockdown">Виявлено довірену Wi-Fi мережу, але системний «Постійний VPN» блокує авто-відключення. Вимкніть «Постійний VPN» для mqvpn у Налаштування → Мережа → VPN.</string>
+    <string name="notif_paused_trusted">Пауза: довірена мережа «%1$s» — підключуся автоматично, щойно ви її покинете</string>
+
+    <!-- Швидкість по провайдерах -->
+    <string name="tp_title">Швидкість наживо</string>
+    <string name="tp_download">Завантаження</string>
+    <string name="tp_upload">Вивантаження</string>
+    <string name="tp_peak">пік %1$s</string>
+    <string name="tp_all_providers">Усі провайдери</string>
+    <string name="tp_rates">↓ %1$s  ↑ %2$s</string>
+    <string name="tp_path_details">RTT %1$d мс · всього ↓ %2$s ↑ %3$s · %4$s</string>
+    <string name="tp_rename_title">Перейменувати провайдера</string>
+    <string name="tp_rename_desc">Показується для цієї мережі всюди в застосунку. Залиште порожнім, щоб повернути автоматичну назву.</string>
+    <string name="tp_rename_hint">Назва (напр. Старлінк)</string>
+    <string name="tp_rename_save">Зберегти</string>
+    <string name="tp_status_pending">Очікує</string>
+    <string name="tp_status_active">Активний</string>
+    <string name="tp_status_degraded">Деградує</string>
+    <string name="tp_status_standby">Резерв</string>
+    <string name="tp_status_closed">Закритий</string>
+    <string name="tp_status_unknown">Невідомо</string>
+</resources>

@@ -873,6 +873,14 @@ jobs:
             android/sdk-network/build/reports/tests/
           retention-days: 7
 
+      # Debug-signed APK — installable directly on a device (sideload).
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: mqvpn-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 14
+
   lint-lifecycle-writes:
     name: Lint - lifecycle field writes (spec §3.3)
     runs-on: ubuntu-latest

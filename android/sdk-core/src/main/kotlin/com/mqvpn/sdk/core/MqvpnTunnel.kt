@@ -72,7 +72,7 @@ class MqvpnTunnel internal constructor(
 
     fun getStats(): VpnStats {
         val arr = NativeBridge.getStats(clientHandle) ?: return VpnStats()
-        return VpnStats(
+        val base = VpnStats(
             bytesTx = arr[0],
             bytesRx = arr[1],
             dgramSent = arr[2],
@@ -80,6 +80,18 @@ class MqvpnTunnel internal constructor(
             dgramLost = arr[4],
             dgramAcked = arr[5],
             srttMs = arr[6].toInt(),
+        )
+        // Lane counters: absent from pre-hybrid native builds — keep zeros.
+        if (arr.size < STATS_FIELDS) return base
+        return base.copy(
+            pktsLaneTcp = arr[7],
+            pktsLaneDgram = arr[8],
+            pktsLaneRaw = arr[9],
+            tcpFlowsActive = arr[10],
+            tcpFlowsTotal = arr[11],
+            tcpFlowsRejected = arr[12],
+            pktsLaneTcpDropped = arr[13],
+            rawMarkersActive = arr[14],
         )
     }
 
@@ -125,7 +137,23 @@ class MqvpnTunnel internal constructor(
     companion object {
         private const val TAG = "MqvpnTunnel"
         private const val REORDER_STATS_FIELDS = 7
+        private const val STATS_FIELDS = 15
         const val ERR_AGAIN = -9
+
+        private fun applyHybrid(cfg: Long, config: MqvpnConfig) {
+            if (!config.hybridEnabled) return
+            var rc = NativeBridge.configSetHybridEnabled(cfg, true)
+            if (rc != 0) {
+                Log.w(TAG, "configSetHybridEnabled failed (rc=$rc) — hybrid stays off")
+                return
+            }
+            rc = NativeBridge.configSetHybridTcpMode(cfg, config.hybridTcpMode.native)
+            if (rc != 0) Log.w(TAG, "configSetHybridTcpMode failed (rc=$rc)")
+            rc = NativeBridge.configSetHybridLimits(
+                cfg, config.hybridTcpMaxFlows, config.hybridTcpIdleTimeoutSec,
+            )
+            if (rc != 0) Log.w(TAG, "configSetHybridLimits failed (rc=$rc)")
+        }
 
         private fun applyReorder(cfg: Long, plan: ReorderPlan) {
             plan.warnings.forEach { Log.w(TAG, it) }
@@ -153,6 +181,7 @@ class MqvpnTunnel internal constructor(
             NativeBridge.configSetAndroidClock(cfg)
             val plan = planReorder(config)
             applyReorder(cfg, plan)
+            applyHybrid(cfg, config)
             val handle = NativeBridge.clientNew(cfg, callbacks)
             check(handle != 0L) { "mqvpn_client_new failed" }
             return MqvpnTunnel(handle, cfg, plan.enabled)

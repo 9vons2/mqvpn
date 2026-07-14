@@ -28,6 +28,10 @@ data class MqvpnConfig(
     val reorderPorts: List<Int> = emptyList(),
     val hybridEnabled: Boolean = false,
     val hybridTcpMode: HybridTcpMode = HybridTcpMode.AUTO,
+    val hybridTcpMaxFlows: Int = 256,
+    val hybridTcpIdleTimeoutSec: Int = 300,
+    /** Package names routed OUTSIDE the tunnel (split tunneling). */
+    val excludedApps: List<String> = emptyList(),
 ) : Parcelable {
 
     @Serializable

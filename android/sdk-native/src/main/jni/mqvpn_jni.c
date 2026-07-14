@@ -475,6 +475,19 @@ JNI_FN(configSetHybridTcpMode)(JNIEnv *env, jobject thiz, jlong cfg, jint mode)
     return mqvpn_config_set_hybrid_tcp_mode((mqvpn_config_t *)(intptr_t)cfg, (int)mode);
 }
 
+/* configSetHybridLimits(cfg, tcpMaxFlows, tcpIdleTimeoutSec) → int */
+JNIEXPORT jint JNICALL
+JNI_FN(configSetHybridLimits)(JNIEnv *env, jobject thiz, jlong cfg, jint tcpMaxFlows,
+                              jint tcpIdleTimeoutSec)
+{
+    (void)env;
+    (void)thiz;
+    if (tcpMaxFlows <= 0 || tcpIdleTimeoutSec <= 0) return MQVPN_ERR_INVALID_ARG;
+    return mqvpn_config_set_hybrid_limits((mqvpn_config_t *)(intptr_t)cfg,
+                                          (uint32_t)tcpMaxFlows,
+                                          (uint32_t)tcpIdleTimeoutSec);
+}
+
 /* ════════════════════════════════════════════════════════════════════════════
  *  Client lifecycle
  * ════════════════════════════════════════════════════════════════════════════ */
@@ -786,7 +799,10 @@ JNI_FN(getState)(JNIEnv *env, jobject thiz, jlong client)
 
 /*
  * getStats(client) → LongArray:
- * [bytesTx, bytesRx, dgramSent, dgramRecv, dgramLost, dgramAcked, srttMs]
+ * [bytesTx, bytesRx, dgramSent, dgramRecv, dgramLost, dgramAcked, srttMs,
+ *  pktsLaneTcp, pktsLaneDgram, pktsLaneRaw, tcpFlowsActive, tcpFlowsTotal,
+ *  tcpFlowsRejected, pktsLaneTcpDropped, rawMarkersActive]
+ * Lane counters (indices 7+) stay 0 unless the hybrid classifier is active.
  */
 JNIEXPORT jlongArray JNICALL
 JNI_FN(getStats)(JNIEnv *env, jobject thiz, jlong client)
@@ -799,14 +815,26 @@ JNI_FN(getStats)(JNIEnv *env, jobject thiz, jlong client)
     int rc = mqvpn_client_get_stats((const mqvpn_client_t *)(intptr_t)client, &stats);
     if (rc != MQVPN_OK) return NULL;
 
-    jlong values[7] = {
-        (jlong)stats.bytes_tx,   (jlong)stats.bytes_rx,   (jlong)stats.dgram_sent,
-        (jlong)stats.dgram_recv, (jlong)stats.dgram_lost, (jlong)stats.dgram_acked,
+    jlong values[15] = {
+        (jlong)stats.bytes_tx,
+        (jlong)stats.bytes_rx,
+        (jlong)stats.dgram_sent,
+        (jlong)stats.dgram_recv,
+        (jlong)stats.dgram_lost,
+        (jlong)stats.dgram_acked,
         (jlong)stats.srtt_ms,
+        (jlong)stats.pkts_lane_tcp,
+        (jlong)stats.pkts_lane_dgram,
+        (jlong)stats.pkts_lane_raw,
+        (jlong)stats.tcp_flows_active,
+        (jlong)stats.tcp_flows_total,
+        (jlong)stats.tcp_flows_rejected,
+        (jlong)stats.pkts_lane_tcp_dropped,
+        (jlong)stats.raw_markers_active,
     };
 
-    jlongArray arr = (*env)->NewLongArray(env, 7);
-    if (arr) (*env)->SetLongArrayRegion(env, arr, 0, 7, values);
+    jlongArray arr = (*env)->NewLongArray(env, 15);
+    if (arr) (*env)->SetLongArrayRegion(env, arr, 0, 15, values);
     return arr;
 }
 

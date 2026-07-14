@@ -3,7 +3,13 @@
 
 package com.mqvpn.app.ui
 
+import android.Manifest
 import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
@@ -16,10 +22,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
@@ -27,6 +37,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -35,14 +46,19 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.mqvpn.app.R
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnState
 import com.mqvpn.sdk.core.model.ReorderStats
+import com.mqvpn.sdk.core.model.VpnStats
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -56,38 +72,75 @@ fun ConnectScreen(
     val reorderStats by viewModel.reorderStats.collectAsStateWithLifecycle()
     val throughput by viewModel.throughput.collectAsStateWithLifecycle()
 
-    var serverAddress by rememberSaveable { mutableStateOf("160.251.143.149") }
-    var serverPort by rememberSaveable { mutableStateOf("443") }
-    var authKey by rememberSaveable { mutableStateOf("tiiUC0/Fx51w5XuxAnpOgdRZb19SLqglwFdhxbbsbnM=") }
-    var insecure by rememberSaveable { mutableStateOf(true) }
-    var killSwitch by rememberSaveable { mutableStateOf(false) }
-    var reorderEnabled by rememberSaveable { mutableStateOf(false) }
+    // Initial field values: last saved config, falling back to defaults.
+    val saved = remember { viewModel.savedConfig }
+    var serverAddress by rememberSaveable {
+        mutableStateOf(saved?.serverAddress ?: "160.251.143.149")
+    }
+    var serverPort by rememberSaveable {
+        mutableStateOf((saved?.serverPort ?: 443).toString())
+    }
+    var authKey by rememberSaveable {
+        mutableStateOf(saved?.authKey ?: "tiiUC0/Fx51w5XuxAnpOgdRZb19SLqglwFdhxbbsbnM=")
+    }
+    var tlsServerName by rememberSaveable { mutableStateOf(saved?.tlsServerName ?: "") }
+    var insecure by rememberSaveable { mutableStateOf(saved?.insecure ?: true) }
+    var killSwitch by rememberSaveable { mutableStateOf(saved?.killSwitch ?: false) }
+    var autoStart by rememberSaveable { mutableStateOf(viewModel.autoStartEnabled) }
+    var reorderEnabled by rememberSaveable { mutableStateOf(saved?.reorderEnabled ?: false) }
     var reorderProfileName by rememberSaveable {
-        mutableStateOf(MqvpnConfig.ReorderProfile.CELLULAR_BOND.name)
+        mutableStateOf((saved?.reorderProfile ?: MqvpnConfig.ReorderProfile.CELLULAR_BOND).name)
     }
     val reorderProfile = MqvpnConfig.ReorderProfile.entries.firstOrNull {
         it.name == reorderProfileName
     } ?: MqvpnConfig.ReorderProfile.CELLULAR_BOND
-    var reorderPorts by rememberSaveable { mutableStateOf("") }
-    var hybridEnabled by rememberSaveable { mutableStateOf(false) }
+    var reorderPorts by rememberSaveable {
+        mutableStateOf(saved?.reorderPorts?.joinToString(",") ?: "")
+    }
+    var hybridEnabled by rememberSaveable { mutableStateOf(saved?.hybridEnabled ?: false) }
     var hybridTcpModeName by rememberSaveable {
-        mutableStateOf(MqvpnConfig.HybridTcpMode.AUTO.name)
+        mutableStateOf((saved?.hybridTcpMode ?: MqvpnConfig.HybridTcpMode.AUTO).name)
     }
     val hybridTcpMode = MqvpnConfig.HybridTcpMode.entries.firstOrNull {
         it.name == hybridTcpModeName
     } ?: MqvpnConfig.HybridTcpMode.AUTO
+    var excludedApps by rememberSaveable {
+        mutableStateOf(ArrayList(saved?.excludedApps ?: emptyList()))
+    }
+
+    // Loads a config (profile switch / import) into every input field.
+    val applyConfig: (MqvpnConfig) -> Unit = { c ->
+        serverAddress = c.serverAddress
+        serverPort = c.serverPort.toString()
+        authKey = c.authKey
+        tlsServerName = c.tlsServerName ?: ""
+        insecure = c.insecure
+        killSwitch = c.killSwitch
+        reorderEnabled = c.reorderEnabled
+        reorderProfileName = c.reorderProfile.name
+        reorderPorts = c.reorderPorts.joinToString(",")
+        hybridEnabled = c.hybridEnabled
+        hybridTcpModeName = c.hybridTcpMode.name
+        excludedApps = ArrayList(c.excludedApps)
+    }
+
+    var showSplitDialog by remember { mutableStateOf(false) }
+    var showExportDialog by remember { mutableStateOf(false) }
+    var showImportDialog by remember { mutableStateOf(false) }
+
+    val currentConfig = {
+        buildConfig(
+            serverAddress, serverPort, authKey, tlsServerName, insecure, killSwitch,
+            reorderEnabled, reorderProfile, reorderPorts,
+            hybridEnabled, hybridTcpMode, excludedApps,
+        )
+    }
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
-            viewModel.connect(
-                buildConfig(
-                    serverAddress, serverPort, authKey, insecure, killSwitch,
-                    reorderEnabled, reorderProfile, reorderPorts,
-                    hybridEnabled, hybridTcpMode,
-                )
-            )
+            viewModel.connect(currentConfig())
         }
     }
 
@@ -102,10 +155,74 @@ fun ConnectScreen(
 
         // Server config inputs
         val isDisconnected = state is MqvpnState.Disconnected || state is MqvpnState.Error
+
+        // Server profiles: pick one to load it into the fields below;
+        // "save" stores the current fields under the typed name.
+        val profiles by viewModel.profiles.collectAsStateWithLifecycle()
+        var profileName by rememberSaveable {
+            mutableStateOf(viewModel.activeProfileName ?: "")
+        }
+        var profilesExpanded by remember { mutableStateOf(false) }
+        ExposedDropdownMenuBox(
+            expanded = profilesExpanded && profiles.isNotEmpty(),
+            onExpandedChange = { profilesExpanded = it },
+        ) {
+            OutlinedTextField(
+                value = profileName,
+                onValueChange = { profileName = it },
+                label = { Text(stringResource(R.string.profile_label)) },
+                trailingIcon = {
+                    if (profiles.isNotEmpty()) {
+                        ExposedDropdownMenuDefaults.TrailingIcon(expanded = profilesExpanded)
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryEditable),
+                singleLine = true,
+            )
+            ExposedDropdownMenu(
+                expanded = profilesExpanded && profiles.isNotEmpty(),
+                onDismissRequest = { profilesExpanded = false },
+            ) {
+                profiles.forEach { profile ->
+                    DropdownMenuItem(
+                        text = { Text(profile.name) },
+                        onClick = {
+                            profileName = profile.name
+                            viewModel.selectProfile(profile.name)?.let(applyConfig)
+                            profilesExpanded = false
+                        },
+                    )
+                }
+            }
+        }
+        Row(modifier = Modifier.fillMaxWidth()) {
+            TextButton(
+                onClick = {
+                    if (profileName.isNotBlank()) {
+                        viewModel.saveProfile(profileName.trim(), currentConfig())
+                    }
+                },
+            ) { Text(stringResource(R.string.profile_save)) }
+            TextButton(
+                onClick = { viewModel.deleteProfile(profileName.trim()) },
+                enabled = profiles.any { it.name == profileName.trim() },
+            ) { Text(stringResource(R.string.profile_delete)) }
+            Spacer(modifier = Modifier.weight(1f))
+            TextButton(onClick = { showExportDialog = true }) {
+                Text(stringResource(R.string.export_button))
+            }
+            TextButton(
+                onClick = { showImportDialog = true },
+                enabled = isDisconnected,
+            ) { Text(stringResource(R.string.import_button)) }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
         OutlinedTextField(
             value = serverAddress,
             onValueChange = { serverAddress = it },
-            label = { Text("Server Address") },
+            label = { Text(stringResource(R.string.server_address)) },
             modifier = Modifier.fillMaxWidth(),
             enabled = isDisconnected,
             singleLine = true,
@@ -114,7 +231,7 @@ fun ConnectScreen(
         OutlinedTextField(
             value = serverPort,
             onValueChange = { serverPort = it },
-            label = { Text("Port") },
+            label = { Text(stringResource(R.string.server_port)) },
             modifier = Modifier.fillMaxWidth(),
             enabled = isDisconnected,
             singleLine = true,
@@ -124,42 +241,116 @@ fun ConnectScreen(
         OutlinedTextField(
             value = authKey,
             onValueChange = { authKey = it },
-            label = { Text("Auth Key") },
+            label = { Text(stringResource(R.string.auth_key)) },
             modifier = Modifier.fillMaxWidth(),
             enabled = isDisconnected,
             singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
         )
         Spacer(modifier = Modifier.height(8.dp))
-
-        Row(
+        var sniInfo by remember { mutableStateOf(false) }
+        OutlinedTextField(
+            value = tlsServerName,
+            onValueChange = { tlsServerName = it },
+            label = { Text(stringResource(R.string.sni_label)) },
             modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("Insecure (skip TLS verify)", modifier = Modifier.weight(1f))
-            Switch(checked = insecure, onCheckedChange = { insecure = it }, enabled = isDisconnected)
+            enabled = isDisconnected,
+            singleLine = true,
+            trailingIcon = {
+                IconButton(onClick = { sniInfo = !sniInfo }) {
+                    Icon(
+                        Icons.Outlined.Info,
+                        contentDescription = stringResource(R.string.sni_label),
+                        tint = MaterialTheme.colorScheme.outline,
+                    )
+                }
+            },
+        )
+        if (sniInfo) {
+            Text(
+                stringResource(R.string.sni_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp, bottom = 4.dp),
+            )
         }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
+        Spacer(modifier = Modifier.height(8.dp))
+
+        SettingSwitchRow(
+            label = stringResource(R.string.insecure_skip_tls),
+            description = stringResource(R.string.insecure_desc),
+            checked = insecure,
+            onCheckedChange = { insecure = it },
+            enabled = isDisconnected,
+        )
+        SettingSwitchRow(
+            label = stringResource(R.string.kill_switch),
+            description = stringResource(R.string.kill_switch_desc),
+            checked = killSwitch,
+            onCheckedChange = { killSwitch = it },
+            enabled = isDisconnected,
+        )
+        SettingSwitchRow(
+            label = stringResource(R.string.autostart_on_boot),
+            description = stringResource(R.string.autostart_desc),
+            checked = autoStart,
+            onCheckedChange = {
+                autoStart = it
+                viewModel.autoStartEnabled = it
+            },
+        )
+
+        // Battery-optimization hint: OEM power managers kill background
+        // VPNs and silently block boot auto-start — surface the fix inline.
+        val context = LocalContext.current
+        val powerManager = remember { context.getSystemService(PowerManager::class.java) }
+        var ignoringBatteryOpt by remember {
+            mutableStateOf(
+                powerManager?.isIgnoringBatteryOptimizations(context.packageName) ?: true
+            )
+        }
+        val batteryLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
         ) {
-            Text("Kill Switch", modifier = Modifier.weight(1f))
-            Switch(checked = killSwitch, onCheckedChange = { killSwitch = it }, enabled = isDisconnected)
+            ignoringBatteryOpt =
+                powerManager?.isIgnoringBatteryOptimizations(context.packageName) ?: true
+        }
+        if (autoStart && !ignoringBatteryOpt) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(stringResource(R.string.battery_title), style = MaterialTheme.typography.titleSmall)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        stringResource(R.string.battery_text),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                        onClick = {
+                            batteryLauncher.launch(
+                                Intent(
+                                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                    Uri.parse("package:${context.packageName}"),
+                                )
+                            )
+                        },
+                    ) {
+                        Text(stringResource(R.string.battery_button))
+                    }
+                }
+            }
         }
         Spacer(modifier = Modifier.height(8.dp))
 
         // Reorder buffer settings
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("Reorder Buffer", modifier = Modifier.weight(1f))
-            Switch(
-                checked = reorderEnabled,
-                onCheckedChange = { reorderEnabled = it },
-                enabled = isDisconnected,
-            )
-        }
+        SettingSwitchRow(
+            label = stringResource(R.string.reorder_buffer),
+            description = stringResource(R.string.reorder_desc),
+            checked = reorderEnabled,
+            onCheckedChange = { reorderEnabled = it },
+            enabled = isDisconnected,
+        )
         if (reorderEnabled) {
             Spacer(modifier = Modifier.height(8.dp))
             var profileExpanded by remember { mutableStateOf(false) }
@@ -170,7 +361,7 @@ fun ConnectScreen(
                 OutlinedTextField(
                     value = reorderProfile.name.replace("_", " "),
                     onValueChange = {},
-                    label = { Text("Reorder Profile") },
+                    label = { Text(stringResource(R.string.reorder_profile)) },
                     readOnly = true,
                     trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = profileExpanded) },
                     modifier = Modifier
@@ -197,7 +388,7 @@ fun ConnectScreen(
             OutlinedTextField(
                 value = reorderPorts,
                 onValueChange = { reorderPorts = it },
-                label = { Text("Reorder Ports (comma-separated, e.g. 443,8443)") },
+                label = { Text(stringResource(R.string.reorder_ports_hint)) },
                 modifier = Modifier.fillMaxWidth(),
                 enabled = isDisconnected,
                 singleLine = true,
@@ -205,50 +396,133 @@ fun ConnectScreen(
         }
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Hybrid TCP lane settings
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text("Hybrid TCP Lane", modifier = Modifier.weight(1f))
-            Switch(
-                checked = hybridEnabled,
-                onCheckedChange = { hybridEnabled = it },
-                enabled = isDisconnected,
-            )
-        }
+        // Hybrid mode (TCP lane) settings
+        SettingSwitchRow(
+            label = stringResource(R.string.hybrid_mode),
+            description = stringResource(R.string.hybrid_desc),
+            checked = hybridEnabled,
+            onCheckedChange = { hybridEnabled = it },
+            enabled = isDisconnected,
+        )
         if (hybridEnabled) {
             Spacer(modifier = Modifier.height(8.dp))
-            var hybridModeExpanded by remember { mutableStateOf(false) }
+            var tcpModeExpanded by remember { mutableStateOf(false) }
             ExposedDropdownMenuBox(
-                expanded = hybridModeExpanded,
-                onExpandedChange = { if (isDisconnected) hybridModeExpanded = it },
+                expanded = tcpModeExpanded,
+                onExpandedChange = { if (isDisconnected) tcpModeExpanded = it },
             ) {
                 OutlinedTextField(
                     value = hybridTcpMode.name,
                     onValueChange = {},
-                    label = { Text("Hybrid TCP Mode") },
+                    label = { Text(stringResource(R.string.hybrid_tcp_mode)) },
                     readOnly = true,
-                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = hybridModeExpanded) },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = tcpModeExpanded) },
                     modifier = Modifier
                         .fillMaxWidth()
                         .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable),
                     enabled = isDisconnected,
                 )
                 ExposedDropdownMenu(
-                    expanded = hybridModeExpanded,
-                    onDismissRequest = { hybridModeExpanded = false },
+                    expanded = tcpModeExpanded,
+                    onDismissRequest = { tcpModeExpanded = false },
                 ) {
                     MqvpnConfig.HybridTcpMode.entries.forEach { mode ->
                         DropdownMenuItem(
                             text = { Text(mode.name) },
                             onClick = {
                                 hybridTcpModeName = mode.name
-                                hybridModeExpanded = false
+                                tcpModeExpanded = false
                             },
                         )
                     }
                 }
+            }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // Split tunneling: picked apps bypass the tunnel
+        var splitInfo by remember { mutableStateOf(false) }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(stringResource(R.string.split_label), modifier = Modifier.weight(1f))
+            IconButton(onClick = { splitInfo = !splitInfo }) {
+                Icon(
+                    Icons.Outlined.Info,
+                    contentDescription = stringResource(R.string.split_label),
+                    tint = MaterialTheme.colorScheme.outline,
+                )
+            }
+            TextButton(
+                onClick = { showSplitDialog = true },
+                enabled = isDisconnected,
+            ) {
+                Text(stringResource(R.string.split_choose, excludedApps.size))
+            }
+        }
+        if (splitInfo) {
+            Text(
+                stringResource(R.string.split_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+        }
+
+        // Trusted Wi-Fi: VPN auto-stops when joining a listed network
+        var trustedInfo by remember { mutableStateOf(false) }
+        var trustedCsv by rememberSaveable {
+            mutableStateOf(viewModel.trustedSsids.joinToString(", "))
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(stringResource(R.string.trusted_label), modifier = Modifier.weight(1f))
+            IconButton(onClick = { trustedInfo = !trustedInfo }) {
+                Icon(
+                    Icons.Outlined.Info,
+                    contentDescription = stringResource(R.string.trusted_label),
+                    tint = MaterialTheme.colorScheme.outline,
+                )
+            }
+        }
+        if (trustedInfo) {
+            Text(
+                stringResource(R.string.trusted_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 8.dp),
+            )
+        }
+        OutlinedTextField(
+            value = trustedCsv,
+            onValueChange = { value ->
+                trustedCsv = value
+                viewModel.trustedSsids = value.split(",")
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+            },
+            label = { Text(stringResource(R.string.trusted_hint)) },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+        )
+        var hasLocation by remember {
+            mutableStateOf(
+                ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.ACCESS_FINE_LOCATION,
+                ) == PackageManager.PERMISSION_GRANTED
+            )
+        }
+        val locationLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted -> hasLocation = granted }
+        if (trustedCsv.isNotBlank() && !hasLocation) {
+            TextButton(
+                onClick = { locationLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION) },
+            ) {
+                Text(stringResource(R.string.trusted_grant_location))
             }
         }
         Spacer(modifier = Modifier.height(16.dp))
@@ -266,13 +540,7 @@ fun ConnectScreen(
                         if (prepareIntent != null) {
                             vpnPermissionLauncher.launch(prepareIntent)
                         } else {
-                            viewModel.connect(
-                                buildConfig(
-                                    serverAddress, serverPort, authKey, insecure, killSwitch,
-                                    reorderEnabled, reorderProfile, reorderPorts,
-                                    hybridEnabled, hybridTcpMode,
-                                )
-                            )
+                            viewModel.connect(currentConfig())
                         }
                     }
 
@@ -284,10 +552,10 @@ fun ConnectScreen(
         ) {
             Text(
                 when (state) {
-                    is MqvpnState.Connected -> "Disconnect"
-                    is MqvpnState.Connecting -> "Connecting..."
-                    is MqvpnState.Reconnecting -> "Reconnecting..."
-                    else -> "Connect"
+                    is MqvpnState.Connected -> stringResource(R.string.btn_disconnect)
+                    is MqvpnState.Connecting -> stringResource(R.string.btn_connecting)
+                    is MqvpnState.Reconnecting -> stringResource(R.string.btn_reconnecting)
+                    else -> stringResource(R.string.btn_connect)
                 }
             )
         }
@@ -300,20 +568,33 @@ fun ConnectScreen(
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(12.dp)) {
                         Text(
-                            "Connected",
+                            stringResource(R.string.status_connected),
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.primary,
                         )
-                        Text("IP: ${s.tunnelInfo.assignedIp}/${s.tunnelInfo.prefix}")
-                        if (s.tunnelInfo.hasV6 && s.tunnelInfo.assignedIp6 != null) {
-                            Text("IPv6: ${s.tunnelInfo.assignedIp6}/${s.tunnelInfo.prefix6}")
-                        }
-                        Text("MTU: ${s.tunnelInfo.mtu}")
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text("RTT: ${stats.srttMs}ms")
-                        Text("TX: ${formatBytes(stats.bytesTx)} | RX: ${formatBytes(stats.bytesRx)}")
                         Text(
-                            "Dgram: ${stats.dgramSent} sent, ${stats.dgramRecv} recv, ${stats.dgramLost} lost",
+                            stringResource(
+                                R.string.status_ip, s.tunnelInfo.assignedIp, s.tunnelInfo.prefix,
+                            )
+                        )
+                        val ip6 = s.tunnelInfo.assignedIp6
+                        if (s.tunnelInfo.hasV6 && ip6 != null) {
+                            Text(stringResource(R.string.status_ipv6, ip6, s.tunnelInfo.prefix6))
+                        }
+                        Text(stringResource(R.string.status_mtu, s.tunnelInfo.mtu))
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(stringResource(R.string.status_rtt, stats.srttMs))
+                        Text(
+                            stringResource(
+                                R.string.status_tx_rx,
+                                formatBytes(stats.bytesTx), formatBytes(stats.bytesRx),
+                            )
+                        )
+                        Text(
+                            stringResource(
+                                R.string.status_dgram,
+                                stats.dgramSent, stats.dgramRecv, stats.dgramLost,
+                            ),
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
@@ -321,7 +602,7 @@ fun ConnectScreen(
 
                 if (paths.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(12.dp))
-                    Text("Providers", style = MaterialTheme.typography.titleSmall)
+                    Text(stringResource(R.string.paths_title), style = MaterialTheme.typography.titleSmall)
                     Spacer(modifier = Modifier.height(4.dp))
                     ThroughputSection(throughput)
                     Spacer(modifier = Modifier.height(4.dp))
@@ -334,18 +615,23 @@ fun ConnectScreen(
                     Spacer(modifier = Modifier.height(12.dp))
                     ReorderStatsCard(reorderStats)
                 }
+
+                if (stats.pktsLaneTcp + stats.pktsLaneDgram + stats.pktsLaneRaw > 0) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    HybridLaneStatsCard(stats)
+                }
             }
 
             is MqvpnState.Reconnecting -> {
                 Text(
-                    "Reconnecting in ${s.info.delaySec}s...",
+                    stringResource(R.string.reconnecting_in, s.info.delaySec),
                     color = MaterialTheme.colorScheme.tertiary,
                 )
             }
 
             is MqvpnState.Error -> {
                 Text(
-                    "Error: ${s.error.message}",
+                    stringResource(R.string.error_prefix, s.error.message),
                     color = MaterialTheme.colorScheme.error,
                 )
             }
@@ -353,26 +639,121 @@ fun ConnectScreen(
             else -> {}
         }
     }
+
+    if (showSplitDialog) {
+        SplitTunnelingDialog(
+            excluded = excludedApps.toSet(),
+            onDismiss = { showSplitDialog = false },
+            onConfirm = { selection ->
+                excludedApps = ArrayList(selection.sorted())
+                showSplitDialog = false
+            },
+        )
+    }
+    if (showExportDialog) {
+        ExportConfigDialog(
+            configJson = currentConfig().toJson(),
+            onDismiss = { showExportDialog = false },
+        )
+    }
+    if (showImportDialog) {
+        ImportConfigDialog(
+            onDismiss = { showImportDialog = false },
+            onImport = { config ->
+                applyConfig(config)
+                showImportDialog = false
+            },
+        )
+    }
+}
+
+/**
+ * Switch row with an ⓘ toggle that expands a detailed description below —
+ * the settings are dense enough that labels alone stop being memorable.
+ */
+@Composable
+private fun SettingSwitchRow(
+    label: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true,
+) {
+    var showInfo by remember { mutableStateOf(false) }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, modifier = Modifier.weight(1f))
+        IconButton(onClick = { showInfo = !showInfo }) {
+            Icon(
+                Icons.Outlined.Info,
+                contentDescription = label,
+                tint = MaterialTheme.colorScheme.outline,
+            )
+        }
+        Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
+    }
+    if (showInfo) {
+        Text(
+            description,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(bottom = 8.dp),
+        )
+    }
 }
 
 @Composable
 private fun ReorderStatsCard(rs: ReorderStats) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(12.dp)) {
-            Text("Reorder Buffer", style = MaterialTheme.typography.titleSmall)
+            Text(stringResource(R.string.reorder_stats_title), style = MaterialTheme.typography.titleSmall)
             Spacer(modifier = Modifier.height(4.dp))
             val fillRate = if (rs.gapCount > 0) {
                 "%.1f%%".format(rs.gapFilled * 100.0 / rs.gapCount)
             } else "—"
-            Text("Delivered: ${rs.delivered} | Gaps: ${rs.gapCount} (filled $fillRate)")
+            Text(stringResource(R.string.reorder_delivered_gaps, rs.delivered, rs.gapCount, fillRate))
             Text(
-                "Timeout: ${rs.gapTimeout} | ACK demote: ${rs.ackDemote}",
+                stringResource(R.string.reorder_timeout_ack, rs.gapTimeout, rs.ackDemote),
                 style = MaterialTheme.typography.bodySmall,
             )
             Text(
-                "Buffered latency: p50=${rs.bufferedP50Ms}ms p99=${rs.bufferedP99Ms}ms",
+                stringResource(R.string.reorder_latency, rs.bufferedP50Ms, rs.bufferedP99Ms),
                 style = MaterialTheme.typography.bodySmall,
             )
+        }
+    }
+}
+
+@Composable
+private fun HybridLaneStatsCard(stats: VpnStats) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(stringResource(R.string.hybrid_stats_title), style = MaterialTheme.typography.titleSmall)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                stringResource(
+                    R.string.hybrid_lane_counts,
+                    stats.pktsLaneTcp, stats.pktsLaneDgram, stats.pktsLaneRaw,
+                )
+            )
+            Text(
+                stringResource(
+                    R.string.hybrid_flows,
+                    stats.tcpFlowsActive, stats.tcpFlowsTotal, stats.tcpFlowsRejected,
+                ),
+                style = MaterialTheme.typography.bodySmall,
+            )
+            if (stats.pktsLaneTcpDropped > 0 || stats.rawMarkersActive > 0) {
+                Text(
+                    stringResource(
+                        R.string.hybrid_dropped,
+                        stats.pktsLaneTcpDropped, stats.rawMarkersActive,
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
         }
     }
 }
@@ -381,6 +762,7 @@ private fun buildConfig(
     address: String,
     port: String,
     key: String,
+    tlsServerName: String,
     insecure: Boolean,
     killSwitch: Boolean,
     reorderEnabled: Boolean,
@@ -388,11 +770,13 @@ private fun buildConfig(
     reorderPorts: String,
     hybridEnabled: Boolean,
     hybridTcpMode: MqvpnConfig.HybridTcpMode,
+    excludedApps: List<String>,
 ): MqvpnConfig {
     return MqvpnConfig(
         serverAddress = address.trim(),
         serverPort = port.trim().toIntOrNull() ?: 443,
         authKey = key.trim(),
+        tlsServerName = tlsServerName.trim().ifEmpty { null },
         insecure = insecure,
         killSwitch = killSwitch,
         reorderEnabled = reorderEnabled,
@@ -402,5 +786,6 @@ private fun buildConfig(
             .filter { it in 1..65535 },
         hybridEnabled = hybridEnabled,
         hybridTcpMode = hybridTcpMode,
+        excludedApps = excludedApps,
     )
 }

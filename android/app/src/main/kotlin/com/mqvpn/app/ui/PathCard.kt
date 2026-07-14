@@ -32,15 +32,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.mqvpn.app.R
 
-private val PATH_STATUS_NAMES = mapOf(
-    0 to "Pending",
-    1 to "Active",
-    2 to "Degraded",
-    3 to "Standby",
-    4 to "Closed",
+private val PATH_STATUS_RES = mapOf(
+    0 to R.string.tp_status_pending,
+    1 to R.string.tp_status_active,
+    2 to R.string.tp_status_degraded,
+    3 to R.string.tp_status_standby,
+    4 to R.string.tp_status_closed,
 )
 
 /**
@@ -55,7 +57,7 @@ fun PathCard(path: PathThroughput, onRename: (String?) -> Unit) {
             path.key.startsWith("ccmni") -> Icons.Default.SignalCellularAlt
         else -> Icons.Default.Cable
     }
-    val statusName = PATH_STATUS_NAMES[path.status] ?: "Unknown"
+    val statusName = stringResource(PATH_STATUS_RES[path.status] ?: R.string.tp_status_unknown)
     var showRename by remember { mutableStateOf(false) }
 
     Card(
@@ -83,13 +85,18 @@ fun PathCard(path: PathThroughput, onRename: (String?) -> Unit) {
                     Text("${path.label} — $statusName")
                 }
                 Text(
-                    "↓ ${formatBps(path.downBps)}   ↑ ${formatBps(path.upBps)}",
+                    stringResource(
+                        R.string.tp_rates,
+                        formatBps(path.downBps), formatBps(path.upBps),
+                    ),
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.Medium,
                 )
                 Text(
-                    "RTT ${path.srttMs} ms · total ↓ ${formatBytes(path.totalRx)} " +
-                        "↑ ${formatBytes(path.totalTx)} · ${path.key}",
+                    stringResource(
+                        R.string.tp_path_details,
+                        path.srttMs, formatBytes(path.totalRx), formatBytes(path.totalTx), path.key,
+                    ),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -101,12 +108,11 @@ fun PathCard(path: PathThroughput, onRename: (String?) -> Unit) {
         var name by remember(path.label) { mutableStateOf(path.label) }
         AlertDialog(
             onDismissRequest = { showRename = false },
-            title = { Text("Rename provider") },
+            title = { Text(stringResource(R.string.tp_rename_title)) },
             text = {
                 Column {
                     Text(
-                        "Shown for this network everywhere in the app. " +
-                            "Leave empty to restore the automatic name.",
+                        stringResource(R.string.tp_rename_desc),
                         style = MaterialTheme.typography.bodySmall,
                     )
                     Spacer(modifier = Modifier.padding(4.dp))
@@ -114,7 +120,7 @@ fun PathCard(path: PathThroughput, onRename: (String?) -> Unit) {
                         value = name,
                         onValueChange = { name = it },
                         singleLine = true,
-                        label = { Text("Name (e.g. Starlink)") },
+                        label = { Text(stringResource(R.string.tp_rename_hint)) },
                     )
                 }
             },
@@ -122,10 +128,12 @@ fun PathCard(path: PathThroughput, onRename: (String?) -> Unit) {
                 TextButton(onClick = {
                     onRename(name.trim().ifEmpty { null })
                     showRename = false
-                }) { Text("Save") }
+                }) { Text(stringResource(R.string.tp_rename_save)) }
             },
             dismissButton = {
-                TextButton(onClick = { showRename = false }) { Text("Cancel") }
+                TextButton(onClick = { showRename = false }) {
+                    Text(stringResource(R.string.dialog_cancel))
+                }
             },
         )
     }

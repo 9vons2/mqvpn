@@ -79,6 +79,10 @@ object NativeBridge {
     /** mqvpn_config_set_hybrid_tcp_mode(cfg, mode: 0=STREAM, 1=RAW, 2=AUTO) */
     external fun configSetHybridTcpMode(cfg: Long, mode: Int): Int
 
+    /** mqvpn_config_set_hybrid_limits(cfg, tcpMaxFlows, tcpIdleTimeoutSec) */
+    external fun configSetHybridLimits(cfg: Long, tcpMaxFlows: Int, tcpIdleTimeoutSec: Int): Int
+
+
     /**
      * mqvpn_client_get_reorder_stats(client) → LongArray:
      * [deliveredCount, gapCount, gapFilledCount, gapTimeoutCount,
@@ -155,7 +159,10 @@ object NativeBridge {
 
     /**
      * mqvpn_client_get_stats(client) → LongArray:
-     * [bytesTx, bytesRx, pktsTx, pktsRx, rttUs, connUptimeMs]
+     * [bytesTx, bytesRx, dgramSent, dgramRecv, dgramLost, dgramAcked, srttMs,
+     *  pktsLaneTcp, pktsLaneDgram, pktsLaneRaw, tcpFlowsActive, tcpFlowsTotal,
+     *  tcpFlowsRejected, pktsLaneTcpDropped, rawMarkersActive]
+     * Lane counters (indices 7+) stay 0 unless the hybrid classifier is active.
      */
     external fun getStats(client: Long): LongArray?
 
