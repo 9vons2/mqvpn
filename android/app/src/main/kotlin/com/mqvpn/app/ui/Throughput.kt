@@ -46,7 +46,8 @@ class SpeedTracker(private val maxSamples: Int = MAX_SAMPLES) {
 
     private data class Prev(val handle: Long, val tx: Long, val rx: Long)
 
-    private var lastAtMs = 0L
+    // Long.MIN_VALUE = "no previous sample yet"; 0 is a legitimate timestamp.
+    private var lastAtMs = Long.MIN_VALUE
     private val prev = HashMap<String, Prev>()
     private val slots = HashMap<String, Int>()
     private var nextSlot = 0
@@ -58,7 +59,7 @@ class SpeedTracker(private val maxSamples: Int = MAX_SAMPLES) {
         customNames: Map<String, String>,
         nowMs: Long,
     ): ThroughputUi {
-        val dtSec = if (lastAtMs == 0L) 0.0 else (nowMs - lastAtMs) / 1000.0
+        val dtSec = if (lastAtMs == Long.MIN_VALUE) 0.0 else (nowMs - lastAtMs) / 1000.0
         lastAtMs = nowMs
 
         val out = ArrayList<PathThroughput>(paths.size)
@@ -101,7 +102,7 @@ class SpeedTracker(private val maxSamples: Int = MAX_SAMPLES) {
     }
 
     fun reset() {
-        lastAtMs = 0L
+        lastAtMs = Long.MIN_VALUE
         prev.clear()
         history.clear()
         // keep slots: a reconnected provider keeps its color
