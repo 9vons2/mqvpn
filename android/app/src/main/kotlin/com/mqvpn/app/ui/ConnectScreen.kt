@@ -95,7 +95,8 @@ fun ConnectScreen(
         it.name == reorderProfileName
     } ?: MqvpnConfig.ReorderProfile.CELLULAR_BOND
     var reorderPorts by rememberSaveable {
-        mutableStateOf(saved?.reorderPorts?.joinToString(",") ?: "")
+        // Persisted value wins; fall back to upstream's 443 default (PR #222).
+        mutableStateOf(saved?.reorderPorts?.joinToString(",") ?: "443")
     }
     var hybridEnabled by rememberSaveable { mutableStateOf(saved?.hybridEnabled ?: false) }
     var hybridTcpModeName by rememberSaveable {
@@ -389,6 +390,7 @@ fun ConnectScreen(
                 value = reorderPorts,
                 onValueChange = { reorderPorts = it },
                 label = { Text(stringResource(R.string.reorder_ports_hint)) },
+                supportingText = { Text(stringResource(R.string.reorder_ports_empty_hint)) },
                 modifier = Modifier.fillMaxWidth(),
                 enabled = isDisconnected,
                 singleLine = true,

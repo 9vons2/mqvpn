@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(mqvpn VERSION 0.11.1 LANGUAGES C)
+project(mqvpn VERSION 0.12.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -211,6 +211,14 @@ set(LWIP_CORE_SOURCES
     ${LWIP_ROOT}/src/core/ipv4/ip4_addr.c
     ${LWIP_ROOT}/src/core/ipv4/ip4_frag.c
     ${LWIP_ROOT}/src/core/ipv4/icmp.c
+    # Chunk 4: dual-stack (LWIP_IPV6=1 in lwipopts.h). MLD/dhcp6/autoconf are
+    # OFF (lwipopts.h), so mld6.c/dhcp6.c are NOT needed — set pinned by the
+    # linker (undefined-symbol errors), not added speculatively.
+    ${LWIP_ROOT}/src/core/ipv6/ip6.c
+    ${LWIP_ROOT}/src/core/ipv6/ip6_addr.c
+    ${LWIP_ROOT}/src/core/ipv6/ip6_frag.c
+    ${LWIP_ROOT}/src/core/ipv6/icmp6.c
+    ${LWIP_ROOT}/src/core/ipv6/nd6.c
 )
 
 add_library(lwip_core STATIC ${LWIP_CORE_SOURCES})
@@ -677,7 +685,11 @@ if(BUILD_TESTING)
     add_executable(test_reorder_config tests/test_reorder_config.c src/mqvpn_config.c src/config.c src/log.c)
     add_executable(test_classifier tests/test_classifier.c src/hybrid/classifier.c)
     add_executable(test_icmp tests/test_icmp.c src/icmp.c)
-    set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_status test_path_state_machine test_control_response_bound test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_classifier test_icmp)
+    # test_reorder_gate exercises src/reorder_gate.h (shared STAMP/RAW/DROP_MTU
+    # gate + PTB token bucket, extracted from mqvpn_client.c/mqvpn_server.c) —
+    # links reorder_tx.c (for the peek it wraps) + icmp.c (for the PTB send).
+    add_executable(test_reorder_gate tests/test_reorder_gate.c src/reorder_tx.c src/icmp.c src/log.c)
+    set(MQVPN_UNIT_TESTS test_config test_auth test_session test_dns test_route_check test_flow_sched test_status test_path_state_machine test_control_response_bound test_reorder_common test_reorder_tx test_reorder_rx test_reorder_config test_classifier test_icmp test_reorder_gate)
 
     # test_tcp_lane #include's BOTH src/hybrid/tcp_lane.c AND
     # src/hybrid/tcp_lane_uplink.c (Task 12 split the uplink relay out of
@@ -795,12 +807,47 @@ if(BUILD_TESTING)
     set_target_properties(test_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_test(NAME test_server COMMAND test_server)
 
+    # Pre-accept type-confusion DoS regression: drives a raw xquic client with
+    # a bogus ALPN at the server to prove an unauthenticated pre-handshake
+    # crash cannot recur (xquic-dependent — needs XQUIC_INCLUDE_DIR).
+    add_executable(test_server_preaccept_dos tests/test_server_preaccept_dos.c)
+    target_link_libraries(test_server_preaccept_dos mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} dl m stdc++)
+    target_include_directories(test_server_preaccept_dos PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR})
+    target_compile_definitions(test_server_preaccept_dos PRIVATE
+        TEST_CERT_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.crt"
+        TEST_KEY_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.key"
+    )
+    set_target_properties(test_server_preaccept_dos PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_test(NAME test_server_preaccept_dos COMMAND test_server_preaccept_dos)
+    # Passing run finishes in <100ms; a reintroduced type confusion SEGVs and,
+    # under ASan's signal handler, can hang instead of exiting — cap it so a
+    # regression fails fast rather than stalling the suite for ctest's default.
+    set_tests_properties(test_server_preaccept_dos PROPERTIES TIMEOUT 60)
+
     # Scheduler dispatch test (xquic-dependent — needs XQUIC_INCLUDE_DIR)
     add_executable(test_scheduler tests/test_scheduler.c)
     target_link_libraries(test_scheduler mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} dl m stdc++)
     target_include_directories(test_scheduler PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR})
     set_target_properties(test_scheduler PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_test(NAME test_scheduler COMMAND test_scheduler)
+
+    # xquic ABI pin — compile-time only. The one TU allowed to reach into
+    # xquic's private src/transport headers, so it can pin the numeric
+    # values libmqvpn hardcodes against the real private enum (see
+    # tests/test_xquic_abi_pin.c). No xquic link: the _Static_asserts need
+    # only declarations. The extra include dirs are the xquic source root
+    # (private "src/..."-style includes) and the public header dir.
+    add_executable(test_xquic_abi_pin tests/test_xquic_abi_pin.c)
+    target_include_directories(test_xquic_abi_pin PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/third_party/xquic ${XQUIC_INCLUDE_DIR})
+    # Pulling in xquic's private transport headers drags internal macros that
+    # are not warning-clean under mqvpn's strict/-Werror flags (e.g.
+    # xqc_str.h -Wunused-value). This TU has no logic of its own — the
+    # _Static_asserts are the whole test — so silence warnings for it only.
+    target_compile_options(test_xquic_abi_pin PRIVATE -w)
+    set_target_properties(test_xquic_abi_pin PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_test(NAME test_xquic_abi_pin COMMAND test_xquic_abi_pin)
 
     add_executable(test_conn_settings tests/test_conn_settings.c)
     target_link_libraries(test_conn_settings mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} dl m stdc++)
@@ -825,6 +872,11 @@ if(BUILD_TESTING)
     # CLI argv overflow shell test (runs the built mqvpn binary)
     add_test(NAME test_cli_path_argv
         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/test_cli_path_argv.sh $<TARGET_FILE:mqvpn>)
+
+    # Guard: every tests/test_*.c using bare assert() must #undef NDEBUG,
+    # since CI also runs ctest on a Release (-DNDEBUG) build.
+    add_test(NAME test_ndebug_guard
+        COMMAND bash ${CMAKE_SOURCE_DIR}/tests/check_ndebug_guard.sh ${CMAKE_SOURCE_DIR}/tests)
 endif()
 
 # ---------- Install ----------

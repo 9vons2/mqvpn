@@ -15,6 +15,7 @@
     <string name="reorder_buffer">Reorder Buffer</string>
     <string name="reorder_profile">Reorder Profile</string>
     <string name="reorder_ports_hint">Reorder Ports (comma-separated, e.g. 443,8443)</string>
+    <string name="reorder_ports_empty_hint">Empty = reorder all UDP flows</string>
     <string name="hybrid_mode">Hybrid Mode (TCP lane)</string>
     <string name="hybrid_tcp_mode">TCP Mode</string>
 

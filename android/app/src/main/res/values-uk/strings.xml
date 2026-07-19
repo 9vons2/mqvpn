@@ -15,6 +15,7 @@
     <string name="reorder_buffer">Буфер перевпорядкування</string>
     <string name="reorder_profile">Профіль перевпорядкування</string>
     <string name="reorder_ports_hint">Порти (через кому, напр. 443,8443)</string>
+    <string name="reorder_ports_empty_hint">Порожнє = впорядковувати всі UDP-потоки</string>
     <string name="hybrid_mode">Гібридний режим (TCP-смуга)</string>
     <string name="hybrid_tcp_mode">Режим TCP</string>
 
