@@ -619,34 +619,56 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      # Ephemeral release keystore: generated fresh per CI run, so each
-      # release is signed with a different key. Acceptable for the sample
-      # APK (clearly labelled as demo); upgrades require uninstall+reinstall.
-      # If we later switch to a stable keystore, replace this step with one
-      # that decodes a base64 secret into release.jks instead.
-      - name: Generate ephemeral release keystore
+      # Release signing key. Prefers a STABLE keystore stored as repo secrets
+      # (base64), so every release shares one signing identity and installs
+      # over the previous build without uninstall (preserving saved profiles
+      # and settings). Falls back to an ephemeral per-run key when the secret
+      # is absent, so the build never breaks before the secret is configured.
+      #
+      # To enable stable signing, add these repo secrets (Settings → Secrets
+      # → Actions):
+      #   MQVPN_RELEASE_KEYSTORE_B64       base64 of the release.jks
+      #   MQVPN_RELEASE_KEYSTORE_PASSWORD  store password
+      #   MQVPN_RELEASE_KEY_ALIAS          key alias
+      #   MQVPN_RELEASE_KEY_PASSWORD       key password (same as store for PKCS12)
+      - name: Prepare release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.MQVPN_RELEASE_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.MQVPN_RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.MQVPN_RELEASE_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.MQVPN_RELEASE_KEY_PASSWORD }}
         run: |
           KEYSTORE="$RUNNER_TEMP/release.jks"
-          # Single password for both store and key entry. JDK 9+ defaults
-          # keytool to PKCS12, which silently ignores a distinct -keypass
-          # during -genkeypair and encrypts the key with the storePassword
-          # — a separate keyPass would later trip BadPaddingException at
-          # APK-signing time. Using one password matches PKCS12 conventions.
-          PASS=$(openssl rand -base64 24)
-          keytool -genkeypair -v \
-            -keystore "$KEYSTORE" \
-            -storepass "$PASS" \
-            -keypass "$PASS" \
-            -alias mqvpn-release \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=mqvpn sample, O=mqvpn, C=JP" >/dev/null
-          # Mask password in workflow logs; value is written only to the
-          # per-job env file ($GITHUB_ENV) which is scoped to this run.
-          echo "::add-mask::$PASS"
-          echo "MQVPN_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
-          echo "MQVPN_KEYSTORE_PASSWORD=$PASS" >> "$GITHUB_ENV"
-          echo "MQVPN_KEY_ALIAS=mqvpn-release" >> "$GITHUB_ENV"
-          echo "MQVPN_KEY_PASSWORD=$PASS" >> "$GITHUB_ENV"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "Using stable release keystore from repo secrets"
+            echo "$KEYSTORE_B64" | base64 -d > "$KEYSTORE"
+            echo "::add-mask::$KS_PASS"
+            echo "::add-mask::$KEY_PASS"
+            echo "MQVPN_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
+            echo "MQVPN_KEYSTORE_PASSWORD=$KS_PASS" >> "$GITHUB_ENV"
+            echo "MQVPN_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "MQVPN_KEY_PASSWORD=$KEY_PASS" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No MQVPN_RELEASE_KEYSTORE_B64 secret — generating an ephemeral key; this APK will require uninstall+reinstall to upgrade."
+            # Single password for both store and key entry. JDK 9+ defaults
+            # keytool to PKCS12, which silently ignores a distinct -keypass
+            # during -genkeypair and encrypts the key with the storePassword
+            # — a separate keyPass would later trip BadPaddingException at
+            # APK-signing time. Using one password matches PKCS12 conventions.
+            PASS=$(openssl rand -base64 24)
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE" \
+              -storepass "$PASS" \
+              -keypass "$PASS" \
+              -alias mqvpn-release \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=mqvpn sample, O=mqvpn, C=JP" >/dev/null
+            echo "::add-mask::$PASS"
+            echo "MQVPN_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
+            echo "MQVPN_KEYSTORE_PASSWORD=$PASS" >> "$GITHUB_ENV"
+            echo "MQVPN_KEY_ALIAS=mqvpn-release" >> "$GITHUB_ENV"
+            echo "MQVPN_KEY_PASSWORD=$PASS" >> "$GITHUB_ENV"
+          fi
 
       # Stage license texts as assets/ before APK build. Android Gradle Plugin
       # auto-includes src/main/assets/ in the produced APK. Required by

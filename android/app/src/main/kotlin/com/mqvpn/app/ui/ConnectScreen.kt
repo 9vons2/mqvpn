@@ -12,20 +12,29 @@ import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.InputChip
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -34,6 +43,7 @@ import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -55,12 +65,13 @@ import androidx.core.content.ContextCompat
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.mqvpn.app.R
+import com.mqvpn.app.service.MyVpnService
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnState
 import com.mqvpn.sdk.core.model.ReorderStats
 import com.mqvpn.sdk.core.model.VpnStats
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun ConnectScreen(
     modifier: Modifier = Modifier,
@@ -71,6 +82,7 @@ fun ConnectScreen(
     val paths by viewModel.paths.collectAsStateWithLifecycle()
     val reorderStats by viewModel.reorderStats.collectAsStateWithLifecycle()
     val throughput by viewModel.throughput.collectAsStateWithLifecycle()
+    val pausedSsid by viewModel.trustedPausedSsid.collectAsStateWithLifecycle()
 
     // Initial field values: last saved config, falling back to defaults.
     val saved = remember { viewModel.savedConfig }
@@ -472,10 +484,13 @@ fun ConnectScreen(
             )
         }
 
-        // Trusted Wi-Fi: VPN auto-stops when joining a listed network
+        // Trusted Wi-Fi: VPN auto-pauses when joining a listed network
         var trustedInfo by remember { mutableStateOf(false) }
-        var trustedCsv by rememberSaveable {
-            mutableStateOf(viewModel.trustedSsids.joinToString(", "))
+        var trusted by remember { mutableStateOf(viewModel.trustedSsids) }
+        fun setTrusted(list: List<String>) {
+            val cleaned = list.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+            trusted = cleaned
+            viewModel.trustedSsids = cleaned
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -498,18 +513,6 @@ fun ConnectScreen(
                 modifier = Modifier.padding(bottom = 8.dp),
             )
         }
-        OutlinedTextField(
-            value = trustedCsv,
-            onValueChange = { value ->
-                trustedCsv = value
-                viewModel.trustedSsids = value.split(",")
-                    .map { it.trim() }
-                    .filter { it.isNotEmpty() }
-            },
-            label = { Text(stringResource(R.string.trusted_hint)) },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-        )
         var hasLocation by remember {
             mutableStateOf(
                 ContextCompat.checkSelfPermission(
@@ -520,7 +523,59 @@ fun ConnectScreen(
         val locationLauncher = rememberLauncherForActivityResult(
             ActivityResultContracts.RequestPermission()
         ) { granted -> hasLocation = granted }
-        if (trustedCsv.isNotBlank() && !hasLocation) {
+
+        // Current trusted networks — tap a chip to remove it.
+        if (trusted.isNotEmpty()) {
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                trusted.forEach { ssid ->
+                    InputChip(
+                        selected = false,
+                        onClick = { setTrusted(trusted - ssid) },
+                        label = { Text(ssid) },
+                        trailingIcon = {
+                            Icon(
+                                Icons.Default.Close,
+                                contentDescription = stringResource(R.string.trusted_remove),
+                                modifier = Modifier.size(16.dp),
+                            )
+                        },
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+        }
+
+        // One-tap add of the Wi-Fi you're on right now (needs location).
+        val currentSsid = if (hasLocation) MyVpnService.currentWifiSsid(context) else null
+        if (currentSsid != null && currentSsid !in trusted) {
+            AssistChip(
+                onClick = { setTrusted(trusted + currentSsid) },
+                label = { Text(stringResource(R.string.trusted_add_current, currentSsid)) },
+                leadingIcon = {
+                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                },
+            )
+        }
+
+        // Manual add — for a network you're not currently connected to.
+        var manualSsid by rememberSaveable { mutableStateOf("") }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = manualSsid,
+                onValueChange = { manualSsid = it },
+                label = { Text(stringResource(R.string.trusted_add_manual)) },
+                singleLine = true,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(
+                onClick = { setTrusted(trusted + manualSsid); manualSsid = "" },
+                enabled = manualSsid.isNotBlank(),
+            ) { Text(stringResource(R.string.trusted_add)) }
+        }
+        if (trusted.isNotEmpty() && !hasLocation) {
             TextButton(
                 onClick = { locationLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION) },
             ) {
@@ -529,37 +584,68 @@ fun ConnectScreen(
         }
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Connect/Disconnect button
-        Button(
-            onClick = {
-                when (state) {
-                    is MqvpnState.Connected,
-                    is MqvpnState.Reconnecting -> viewModel.disconnect()
+        // Paused on a trusted network: distinct controls instead of the
+        // plain Connect button (the tunnel is down but the service is alive).
+        val paused = pausedSsid
+        if (paused != null) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Text(
+                        stringResource(R.string.paused_title),
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.tertiary,
+                    )
+                    Text(
+                        stringResource(R.string.paused_text, paused),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            Row(modifier = Modifier.fillMaxWidth()) {
+                Button(
+                    onClick = { context.startService(MyVpnService.resumeIntent(context)) },
+                    modifier = Modifier.weight(1f),
+                ) { Text(stringResource(R.string.btn_resume_now)) }
+                Spacer(modifier = Modifier.width(8.dp))
+                OutlinedButton(
+                    onClick = { context.startService(MyVpnService.disconnectIntent(context)) },
+                    modifier = Modifier.weight(1f),
+                ) { Text(stringResource(R.string.btn_disconnect)) }
+            }
+        } else {
+            // Connect/Disconnect button
+            Button(
+                onClick = {
+                    when (state) {
+                        is MqvpnState.Connected,
+                        is MqvpnState.Reconnecting -> viewModel.disconnect()
 
-                    is MqvpnState.Disconnected,
-                    is MqvpnState.Error -> {
-                        val prepareIntent = viewModel.prepareVpn()
-                        if (prepareIntent != null) {
-                            vpnPermissionLauncher.launch(prepareIntent)
-                        } else {
-                            viewModel.connect(currentConfig())
+                        is MqvpnState.Disconnected,
+                        is MqvpnState.Error -> {
+                            val prepareIntent = viewModel.prepareVpn()
+                            if (prepareIntent != null) {
+                                vpnPermissionLauncher.launch(prepareIntent)
+                            } else {
+                                viewModel.connect(currentConfig())
+                            }
                         }
-                    }
 
-                    else -> {}
-                }
-            },
-            modifier = Modifier.fillMaxWidth(),
-            enabled = state !is MqvpnState.Connecting,
-        ) {
-            Text(
-                when (state) {
-                    is MqvpnState.Connected -> stringResource(R.string.btn_disconnect)
-                    is MqvpnState.Connecting -> stringResource(R.string.btn_connecting)
-                    is MqvpnState.Reconnecting -> stringResource(R.string.btn_reconnecting)
-                    else -> stringResource(R.string.btn_connect)
-                }
-            )
+                        else -> {}
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = state !is MqvpnState.Connecting,
+            ) {
+                Text(
+                    when (state) {
+                        is MqvpnState.Connected -> stringResource(R.string.btn_disconnect)
+                        is MqvpnState.Connecting -> stringResource(R.string.btn_connecting)
+                        is MqvpnState.Reconnecting -> stringResource(R.string.btn_reconnecting)
+                        else -> stringResource(R.string.btn_connect)
+                    }
+                )
+            }
         }
 
         Spacer(modifier = Modifier.height(16.dp))

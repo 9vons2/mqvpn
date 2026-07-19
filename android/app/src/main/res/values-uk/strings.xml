@@ -74,6 +74,15 @@
     <string name="trusted_desc">У цих Wi-Fi мережах VPN стає на паузу: при підключенні до мережі зі списку тунель зупиняється, а щойно ви її покидаєте (на мобільну мережу чи інший Wi-Fi) — підключається автоматично. Автозапуск після перезавантаження в довіреній мережі теж чекає на паузі й відновлюється пізніше. Корисно, коли домашній роутер сам агрегує канали (наприклад, OpenMPTCProuter на той самий сервер). Для читання імені Wi-Fi потрібен дозвіл геолокації та ввімкнена локація. НЕ сумісно із системним «Постійний VPN» / «Блокувати з\'єднання без VPN» — вимкніть їх і користуйтеся автозапуском та Kill Switch самого застосунку.</string>
     <string name="trusted_hint">SSID через кому (напр. HomeWiFi, Office)</string>
     <string name="trusted_grant_location">Надати дозвіл локації (потрібен для імені Wi-Fi)</string>
+    <string name="trusted_remove">Видалити</string>
+    <string name="trusted_add_current">Додати поточну: %1$s</string>
+    <string name="trusted_add_manual">Додати мережу за назвою</string>
+    <string name="trusted_add">Додати</string>
+
+    <!-- Стан паузи на довіреній Wi-Fi -->
+    <string name="paused_title">Пауза на довіреній Wi-Fi</string>
+    <string name="paused_text">Призупинено на «%1$s». Підключуся автоматично, щойно ви її покинете — або відновіть зараз.</string>
+    <string name="btn_resume_now">Відновити зараз</string>
 
     <!-- Експорт / імпорт конфігу -->
     <string name="export_button">QR-експорт</string>

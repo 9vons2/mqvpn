@@ -74,6 +74,15 @@
     <string name="trusted_desc">On these Wi-Fi networks the VPN pauses itself: joining a listed network parks the tunnel, and it reconnects automatically as soon as you leave (to cellular or another Wi-Fi). Boot auto-start on a trusted network also parks and resumes later. Useful when the home router already bonds links itself (e.g. OpenMPTCProuter to the same server). Reading the Wi-Fi name requires the location permission and location services enabled. NOT compatible with the system "Always-on VPN" / "Block connections without VPN" setting — turn that off and use the app\'s own auto-start and Kill Switch instead.</string>
     <string name="trusted_hint">SSIDs, comma-separated (e.g. HomeWiFi, Office)</string>
     <string name="trusted_grant_location">Allow location access (needed to read the Wi-Fi name)</string>
+    <string name="trusted_remove">Remove</string>
+    <string name="trusted_add_current">Add current: %1$s</string>
+    <string name="trusted_add_manual">Add network by name</string>
+    <string name="trusted_add">Add</string>
+
+    <!-- Trusted-Wi-Fi pause state -->
+    <string name="paused_title">Paused on trusted Wi-Fi</string>
+    <string name="paused_text">Parked on \"%1$s\". Reconnects automatically when you leave it — or resume now.</string>
+    <string name="btn_resume_now">Resume now</string>
 
     <!-- Config export / import -->
     <string name="export_button">QR export</string>

@@ -15,6 +15,7 @@ import com.mqvpn.sdk.core.internal.UdpReaderPool
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnError
 import com.mqvpn.sdk.core.model.MqvpnState
+import com.mqvpn.sdk.core.model.PathInfo
 import com.mqvpn.sdk.core.model.ReconnectInfo
 import com.mqvpn.sdk.core.model.TunnelInfo
 import com.mqvpn.sdk.network.NetworkMonitor
@@ -71,8 +72,10 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
                 // Poll stats/paths and push to MqvpnManager on each tick
                 if (t != null) {
                     manager?.updateStats(t.getStats())
-                    manager?.updatePaths(t.getPaths())
+                    val paths = t.getPaths()
+                    manager?.updatePaths(paths)
                     manager?.updateReorderStats(t.getReorderStats())
+                    onPathsPolled(paths)
                 }
                 result
             },
@@ -273,6 +276,9 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
 
     open fun onLog(level: Int, message: String) {}
     open fun onReconnectScheduled(delaySec: Int) {}
+
+    /** Per-tick snapshot of live paths — subclasses may surface throughput. */
+    open fun onPathsPolled(paths: List<PathInfo>) {}
 
     // --- Helpers ---
 

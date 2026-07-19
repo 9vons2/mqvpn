@@ -10,6 +10,7 @@ import com.mqvpn.app.data.Profile
 import com.mqvpn.app.data.SettingsRepository
 import com.mqvpn.app.net.ProviderDirectory
 import com.mqvpn.app.service.MyVpnService
+import com.mqvpn.app.service.TrustedPauseState
 import com.mqvpn.sdk.core.MqvpnManager
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnState
@@ -86,6 +87,9 @@ class MqvpnViewModel @Inject constructor(
 
     val reorderStats: StateFlow<ReorderStats> = manager.reorderStats
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ReorderStats())
+
+    /** Non-null (the trusted SSID) while the tunnel is paused on it. */
+    val trustedPausedSsid: StateFlow<String?> = TrustedPauseState.pausedSsid
 
     private val tracker = SpeedTracker()
 
