@@ -145,7 +145,7 @@ typedef enum {
  *
  *   PENDING   → add_path_fd() called, awaiting activation
  *   ACTIVE    → xquic path created (validation async)
- *   DEGRADED  → transport failed, library timer retries with backoff (5s→60s, max 6)
+ *   DEGRADED  → transport failed, library timer retries with backoff (1s→15s, max 30)
  *   CLOSED    → retries exhausted (platform can still call reactivate_path if
  * platform_attached==1) OR explicitly removed via remove_path() (platform_attached==0, no
  * recovery)
