@@ -15,6 +15,9 @@
 
 #include "libmqvpn.h"
 #include "mqvpn_internal.h"
+/* PATH_RECREATE_DELAY_US — the recovery-wake assertions below derive their
+ * expected deadline from it instead of hardcoding the backoff in ms. */
+#include "path_state_machine.h"
 
 /* ── Test infrastructure ── */
 
@@ -2303,7 +2306,7 @@ TEST(get_interest_recovery_create_wait_future_clamps_wake)
     mqvpn_path_handle_t h = mqvpn_client_add_path_fd(c, 42, NULL);
     ASSERT_NE(h, (mqvpn_path_handle_t)-1);
 
-    /* PENDING -> CREATE_WAIT, arming recreate_after_us = base + 5s. */
+    /* PENDING -> CREATE_WAIT, arming recreate_after_us = base + first backoff. */
     ASSERT_EQ(mqvpn_client_apply_path_activation_failure(c, h, g_recovery_fake_now_us),
               0);
     ASSERT_EQ(mqvpn_client_test_force_established(c), 0);
@@ -2313,10 +2316,11 @@ TEST(get_interest_recovery_create_wait_future_clamps_wake)
     i.struct_size = sizeof(i);
     ASSERT_EQ(mqvpn_client_get_interest(c, &i), MQVPN_OK);
 
+    const int first_backoff_ms = (int)(PATH_RECREATE_DELAY_US / 1000);
     ASSERT_EQ(i.next_timer_ms > 0, 1);
-    ASSERT_EQ(i.next_timer_ms <= 5000, 1);
-    /* Exact: clamped to the 5s deadline, not the 30s xquic wake. */
-    ASSERT_EQ(i.next_timer_ms, 5000);
+    ASSERT_EQ(i.next_timer_ms <= first_backoff_ms, 1);
+    /* Exact: clamped to the retry deadline, not the 30s xquic wake. */
+    ASSERT_EQ(i.next_timer_ms, first_backoff_ms);
 
     mqvpn_client_destroy(c);
 }

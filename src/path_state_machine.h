@@ -191,7 +191,13 @@ MQVPN_INTERNAL int path_is_real_transition(mqvpn_path_status_t old,
 #define PATH_RECREATE_DELAY_US     (1ULL * 1000000)  /* 1 sec initial  (was 5)  */
 #define PATH_RECREATE_MAX_DELAY_US (15ULL * 1000000) /* 15 sec ceiling (was 60) */
 #define PATH_RECREATE_MAX_RETRIES  30                /* ~7 min persistent (was 6) */
-#define PATH_STABLE_THRESHOLD_US   (10ULL * 1000000) /* 10 sec to confirm stable (was 30) */
+/* Left at upstream's 30s: the stability window only governs how fast the retry
+ * budget is forgiven, and a 30-failure budget already defangs the exhaustion
+ * case. Lowering it would also invalidate the get_interest stability tests,
+ * which seed their offsets relative to this exact window. Full immunity to
+ * abandonment is handled above the library, by re-activating paths whose
+ * interface the platform still reports as present. */
+#define PATH_STABLE_THRESHOLD_US (30ULL * 1000000) /* 30 sec to confirm stable */
 
 /* PR4 - Relocated from mqvpn_client.c (originally static). path_on_event()
  * body and the residual callsites that still emit explicit reason tags
