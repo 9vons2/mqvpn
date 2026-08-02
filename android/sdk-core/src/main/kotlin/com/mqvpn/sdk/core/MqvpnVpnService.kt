@@ -144,10 +144,14 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
     }
 
     /**
-     * Stop VPN tunnel. Called by [MqvpnManager.disconnect].
+     * Stop VPN tunnel. Called by [MqvpnManager.disconnect], and by service
+     * subclasses that tear the tunnel down on their own — a notification
+     * Disconnect action, or parking on a trusted Wi-Fi. `internal` would
+     * cover the manager but not those subclasses, which live in the app
+     * module, so this stays public.
      * Do NOT call from onDestroy — cleanup runs automatically.
      */
-    internal fun stopTunnel() {
+    fun stopTunnel() {
         executor.enqueue { cleanup() }
     }
 

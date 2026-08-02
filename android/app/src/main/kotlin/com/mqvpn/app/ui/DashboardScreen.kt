@@ -308,11 +308,5 @@ private fun ReorderStatsCard(rs: ReorderStats) {
     }
 }
 
-private fun formatBytes(bytes: Long): String {
-    return when {
-        bytes >= 1_000_000_000 -> "%.1f GB".format(bytes / 1_000_000_000.0)
-        bytes >= 1_000_000 -> "%.1f MB".format(bytes / 1_000_000.0)
-        bytes >= 1_000 -> "%.1f KB".format(bytes / 1_000.0)
-        else -> "$bytes B"
-    }
-}
+// formatBytes lives in Throughput.kt: ProviderCard needs it too, so the
+// file-private copy that used to sit here would only shadow it.
