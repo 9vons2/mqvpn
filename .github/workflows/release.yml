@@ -625,6 +625,7 @@ jobs:
       - name: Detect release keystore secret
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          FORK_KEYSTORE_B64: ${{ secrets.MQVPN_RELEASE_KEYSTORE_B64 }}
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* && "$GITHUB_REPOSITORY" == mp0rta/mqvpn ]]; then
             if [ -z "$KEYSTORE_B64" ]; then
@@ -637,12 +638,25 @@ jobs:
               exit 1
             fi
             echo "HAVE_KEYSTORE=true" >> "$GITHUB_ENV"
+            echo "HAVE_FORK_KEYSTORE=false" >> "$GITHUB_ENV"
+          elif [ -n "$FORK_KEYSTORE_B64" ]; then
+            # This fork ships its own builds to its own devices. Without a
+            # stable key every APK gets a fresh identity and Android refuses
+            # the in-place update, so each build would mean uninstall (losing
+            # the saved config) + reinstall. The certificate is deliberately
+            # NOT pinned to UPLOAD_CERT_SHA256: that fingerprint is the
+            # canonical mqvpn upload cert, which a fork does not and must not
+            # hold. Unset secret still falls through to the ephemeral key.
+            echo "HAVE_KEYSTORE=false" >> "$GITHUB_ENV"
+            echo "HAVE_FORK_KEYSTORE=true" >> "$GITHUB_ENV"
+            echo "Fork build — signing with the stable keystore from repo secrets"
           else
             # Assign explicitly rather than leaving it unset: earlier steps run
             # repo scripts that could have appended HAVE_KEYSTORE=true to
             # $GITHUB_ENV, and the last assignment wins.
             echo "HAVE_KEYSTORE=false" >> "$GITHUB_ENV"
-            echo "Not an official tag build — signing with an ephemeral key"
+            echo "HAVE_FORK_KEYSTORE=false" >> "$GITHUB_ENV"
+            echo "::warning::No release keystore secret — signing with an ephemeral key; this APK cannot be installed over a previous build."
           fi
 
       - name: Set up release keystore
@@ -681,8 +695,41 @@ jobs:
           echo "MQVPN_KEY_ALIAS=mqvpn-upload" >> "$GITHUB_ENV"
           echo "MQVPN_KEY_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
 
+      # Fork stable signing. To enable, add these repo secrets
+      # (Settings → Secrets and variables → Actions):
+      #   MQVPN_RELEASE_KEYSTORE_B64       base64 of release.jks
+      #   MQVPN_RELEASE_KEYSTORE_PASSWORD  store password
+      #   MQVPN_RELEASE_KEY_ALIAS          key alias
+      #   MQVPN_RELEASE_KEY_PASSWORD       key password (same as store for PKCS12)
+      - name: Set up fork release keystore
+        if: env.HAVE_FORK_KEYSTORE == 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.MQVPN_RELEASE_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.MQVPN_RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.MQVPN_RELEASE_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.MQVPN_RELEASE_KEY_PASSWORD }}
+        run: |
+          KEYSTORE="$RUNNER_TEMP/release.jks"
+          # $GITHUB_ENV is NAME=value lines, so a newline in a password would
+          # truncate the value and fail obscurely at signing time instead.
+          case "$KS_PASS$KEY_PASS" in
+            *[$'\n\r']*) echo "::error::keystore passwords must not contain newlines"; exit 1 ;;
+          esac
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$KEYSTORE"
+          echo "::add-mask::$KS_PASS"
+          echo "::add-mask::$KEY_PASS"
+          # Fail here rather than after a 20-minute build if the alias or the
+          # password is wrong.
+          keytool -list -keystore "$KEYSTORE" -storepass "$KS_PASS" \
+              -alias "$KEY_ALIAS" 2>/dev/null | grep -q PrivateKeyEntry \
+            || { echo "::error::keystore alias $KEY_ALIAS missing or not a PrivateKeyEntry"; exit 1; }
+          echo "MQVPN_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
+          echo "MQVPN_KEYSTORE_PASSWORD=$KS_PASS" >> "$GITHUB_ENV"
+          echo "MQVPN_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "MQVPN_KEY_PASSWORD=$KEY_PASS" >> "$GITHUB_ENV"
+
       - name: Generate ephemeral release keystore
-        if: env.HAVE_KEYSTORE != 'true'
+        if: env.HAVE_KEYSTORE != 'true' && env.HAVE_FORK_KEYSTORE != 'true'
         run: |
           KEYSTORE="$RUNNER_TEMP/release.jks"
           # Single password for both store and key entry. JDK 9+ defaults
