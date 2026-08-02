@@ -5,6 +5,7 @@ package com.mqvpn.app
 
 import com.mqvpn.app.data.DemoSettings
 import com.mqvpn.app.data.SettingsRepository
+import com.mqvpn.app.net.ProviderDirectory
 import com.mqvpn.app.service.MyVpnService
 import com.mqvpn.app.ui.LogEvent
 import com.mqvpn.app.ui.MqvpnViewModel
@@ -61,6 +62,11 @@ class MqvpnViewModelTest {
         every { it.settings } returns MutableStateFlow(testSettings)
     }
 
+    private val mockProviders = mockk<ProviderDirectory>(relaxed = true).also {
+        every { it.labels } returns MutableStateFlow(emptyMap())
+        every { it.customNames } returns MutableStateFlow(emptyMap())
+    }
+
     private val fixedClock: () -> Long = { 42L }
 
     private var fakeNanos = 0L
@@ -71,7 +77,7 @@ class MqvpnViewModelTest {
     @Before
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
-        viewModel = MqvpnViewModel(mockManager, mockRepository, fixedClock, fakeNanoClock)
+        viewModel = MqvpnViewModel(mockManager, mockRepository, mockProviders, fixedClock, fakeNanoClock)
     }
 
     @After
@@ -224,7 +230,7 @@ class MqvpnViewModelTest {
         val slowRepository = mockk<SettingsRepository>(relaxed = true).also {
             every { it.settings } returns signal
         }
-        val slowViewModel = MqvpnViewModel(mockManager, slowRepository, fixedClock, fakeNanoClock)
+        val slowViewModel = MqvpnViewModel(mockManager, slowRepository, mockProviders, fixedClock, fakeNanoClock)
 
         slowViewModel.connectWithSavedSettings()
         slowViewModel.connectWithSavedSettings()
@@ -246,7 +252,7 @@ class MqvpnViewModelTest {
         val failingRepository = mockk<SettingsRepository>(relaxed = true).also {
             every { it.settings } returns flow { throw IllegalStateException("boom") }
         }
-        val failingViewModel = MqvpnViewModel(mockManager, failingRepository, fixedClock, fakeNanoClock)
+        val failingViewModel = MqvpnViewModel(mockManager, failingRepository, mockProviders, fixedClock, fakeNanoClock)
 
         failingViewModel.connectWithSavedSettings()
         advanceUntilIdle()

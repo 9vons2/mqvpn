@@ -7,7 +7,9 @@ import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.mqvpn.app.data.SettingsRepository
+import com.mqvpn.app.net.ProviderDirectory
 import com.mqvpn.app.service.MyVpnService
+import com.mqvpn.app.service.TrustedPauseState
 import com.mqvpn.sdk.core.MqvpnManager
 import com.mqvpn.sdk.core.model.MqvpnState
 import com.mqvpn.sdk.core.model.PathInfo
@@ -30,6 +32,7 @@ import javax.inject.Inject
 class MqvpnViewModel(
     private val manager: MqvpnManager,
     private val repository: SettingsRepository,
+    private val providers: ProviderDirectory,
     private val clock: () -> Long,
     private val nanoClock: () -> Long,
 ) : ViewModel() {
@@ -45,8 +48,11 @@ class MqvpnViewModel(
     // unaffected; tests use the primary constructor directly with fixed
     // clocks. See G6: injectable-clock is a pre-approved exception, not a
     // test-only production flag.
-    @Inject constructor(manager: MqvpnManager, repository: SettingsRepository) :
-        this(manager, repository, System::currentTimeMillis, System::nanoTime)
+    @Inject constructor(
+        manager: MqvpnManager,
+        repository: SettingsRepository,
+        providers: ProviderDirectory,
+    ) : this(manager, repository, providers, System::currentTimeMillis, System::nanoTime)
 
     private val eventLog = EventLog()
 
@@ -65,6 +71,18 @@ class MqvpnViewModel(
 
     private val _bandwidthHistory = MutableStateFlow(BandwidthHistoryState())
     val bandwidthHistory: StateFlow<BandwidthHistoryState> = _bandwidthHistory.asStateFlow()
+
+    // Per-provider view of the same tick: BandwidthHistory folds tx+rx into a
+    // single figure, while this splits download from upload and resolves each
+    // path to a carrier/SSID name. Fed from the ticker below rather than a
+    // second coroutine.
+    private val speedTracker = SpeedTracker()
+
+    private val _throughput = MutableStateFlow(ThroughputUi())
+    val throughput: StateFlow<ThroughputUi> = _throughput.asStateFlow()
+
+    /** Non-null (the trusted SSID) while the tunnel is parked on it. */
+    val trustedPausedSsid: StateFlow<String?> = TrustedPauseState.pausedSsid
 
     val vpnState: StateFlow<MqvpnState> = manager.vpnState
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), MqvpnState.Disconnected)
@@ -86,6 +104,7 @@ class MqvpnViewModel(
                 when (it) {
                     is MqvpnState.Connected, is MqvpnState.Reconnecting -> {
                         if (tickerJob?.isActive != true) {
+                            providers.start()
                             tickerJob = viewModelScope.launch { bandwidthTickerLoop() }
                         }
                     }
@@ -94,6 +113,9 @@ class MqvpnViewModel(
                         tickerJob = null
                         bandwidth.clear()
                         _bandwidthHistory.value = BandwidthHistoryState()
+                        providers.stop()
+                        speedTracker.reset()
+                        _throughput.value = ThroughputUi()
                     }
                     is MqvpnState.Connecting -> {
                         // mid-session handshake re-emits Connecting: pause ticks, keep history
@@ -119,9 +141,22 @@ class MqvpnViewModel(
     private suspend fun bandwidthTickerLoop() {
         while (true) {
             delay(1_000)
-            val samples = bandwidth.onTick(latestPaths, nanoClock())
+            val now = nanoClock()
+            val samples = bandwidth.onTick(latestPaths, now)
             _bandwidthHistory.value = BandwidthHistoryState(samples, bandwidth.ifaceSlots())
+            _throughput.value = speedTracker.update(
+                latestPaths,
+                providers.labels.value,
+                providers.customNames.value,
+                now / 1_000_000,
+            )
         }
+    }
+
+    /** Persist a custom display name for the provider behind [pathKey]. */
+    fun renameProvider(pathKey: String, name: String?) {
+        val auto = providers.labels.value[pathKey] ?: SpeedTracker.fallbackLabel(pathKey)
+        providers.rename(auto, name)
     }
 
     fun connectWithSavedSettings() {
@@ -149,6 +184,7 @@ class MqvpnViewModel(
     fun prepareVpn(): Intent? = manager.prepareVpn()
 
     override fun onCleared() {
+        providers.stop()
         manager.destroy()
     }
 }

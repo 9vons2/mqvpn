@@ -64,6 +64,7 @@ fun DashboardScreen(
     val connectError by viewModel.connectError.collectAsStateWithLifecycle()
     val events by viewModel.events.collectAsStateWithLifecycle()
     val bandwidthHistory by viewModel.bandwidthHistory.collectAsStateWithLifecycle()
+    val throughput by viewModel.throughput.collectAsStateWithLifecycle()
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -160,7 +161,7 @@ fun DashboardScreen(
                         }
                     }
 
-                    PathsSection(paths, bandwidthHistory)
+                    PathsSection(paths, bandwidthHistory, throughput, viewModel::renameProvider)
 
                     if (reorderStats.delivered > 0 || reorderStats.gapCount > 0) {
                         Spacer(modifier = Modifier.height(12.dp))
@@ -174,7 +175,7 @@ fun DashboardScreen(
                         color = MaterialTheme.colorScheme.tertiary,
                     )
                     // history is kept across reconnects so the failover dip stays visible
-                    PathsSection(paths, bandwidthHistory)
+                    PathsSection(paths, bandwidthHistory, throughput, viewModel::renameProvider)
                 }
 
                 is MqvpnState.Error -> {
@@ -201,13 +202,28 @@ fun DashboardScreen(
 }
 
 @Composable
-private fun PathsSection(paths: List<PathInfo>, bandwidthHistory: BandwidthHistoryState) {
+private fun PathsSection(
+    paths: List<PathInfo>,
+    bandwidthHistory: BandwidthHistoryState,
+    throughput: ThroughputUi,
+    onRenameProvider: (String, String?) -> Unit,
+) {
     if (paths.isEmpty() && bandwidthHistory.samples.isEmpty()) return
     Spacer(modifier = Modifier.height(12.dp))
-    Text("Paths", style = MaterialTheme.typography.titleSmall)
-    BandwidthChart(bandwidthHistory)
+    Text("Providers", style = MaterialTheme.typography.titleSmall)
     Spacer(modifier = Modifier.height(4.dp))
-    paths.forEach { path -> PathCard(path) }
+    // Split download/upload with resolved provider names, in place of the
+    // combined tx+rx BandwidthChart.
+    ThroughputSection(throughput)
+    Spacer(modifier = Modifier.height(4.dp))
+    if (throughput.paths.isEmpty()) {
+        // First tick after connect has no rates yet — keep the raw rows visible.
+        paths.forEach { path -> PathCard(path) }
+    } else {
+        throughput.paths.forEach { p ->
+            ProviderCard(p) { name -> onRenameProvider(p.key, name) }
+        }
+    }
 }
 
 @Composable
