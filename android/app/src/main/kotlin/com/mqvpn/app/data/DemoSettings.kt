@@ -23,6 +23,12 @@ data class DemoSettings(
     val reorderPorts: String = "443",
     val hybridEnabled: Boolean = false,
     val hybridTcpMode: String = MqvpnConfig.HybridTcpMode.AUTO.name,
+    /** Start the tunnel after device boot (needs a saved config + VPN consent). */
+    val autoStart: Boolean = false,
+    /** Wi-Fi SSIDs on which the tunnel parks itself, comma-separated. */
+    val trustedSsids: String = "",
+    /** Package names routed outside the tunnel (split tunneling), comma-separated. */
+    val excludedApps: String = "",
 ) {
     fun reorderProfileEnum(): MqvpnConfig.ReorderProfile =
         MqvpnConfig.ReorderProfile.entries.firstOrNull { it.name == reorderProfile }
@@ -38,6 +44,12 @@ data class DemoSettings(
             .filter { it in 1..65535 }
 
     fun distinctValidPortCount(): Int = parsedReorderPorts().distinct().size
+
+    /** Trusted SSIDs as a clean list (trimmed, blanks dropped, deduplicated). */
+    fun parsedTrustedSsids(): List<String> = splitCsv(trustedSsids)
+
+    /** Excluded packages as a clean list (trimmed, blanks dropped, deduplicated). */
+    fun parsedExcludedApps(): List<String> = splitCsv(excludedApps)
 
     /** Tokens that are non-blank after trimming but don't parse as a valid 1..65535 port. */
     fun invalidPortTokens(): List<String> =
@@ -57,6 +69,7 @@ data class DemoSettings(
         reorderPorts = parsedReorderPorts(),
         hybridEnabled = hybridEnabled,
         hybridTcpMode = hybridTcpModeEnum(),
+        excludedApps = parsedExcludedApps(),
     )
 
     fun hostValid(): Boolean = serverAddress.trim().isNotBlank()
@@ -68,6 +81,10 @@ data class DemoSettings(
     fun isValid(): Boolean = hostValid() && portValid() && reorderPortsValid()
 
     companion object {
+        /** Shared CSV parse for the free-text list fields. */
+        private fun splitCsv(raw: String): List<String> =
+            raw.split(",").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+
         /**
          * Upper bound on distinct reorder ports the platform layer honors.
          * Mirrors `MQVPN_REORDER_MAX_RULES` in

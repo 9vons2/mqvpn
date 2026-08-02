@@ -72,6 +72,9 @@ class SettingsRepositoryTest {
             reorderPorts = "443,8443",
             hybridEnabled = true,
             hybridTcpMode = "RAW",
+            autoStart = true,
+            trustedSsids = "HomeWiFi, Office",
+            excludedApps = "com.bank.app,ua.gov.diia",
         )
 
         repo.save(nonDefault)
@@ -125,6 +128,9 @@ class SettingsRepositoryTest {
             reorderPorts = "443,8443",
             hybridEnabled = true,
             hybridTcpMode = "RAW",
+            autoStart = true,
+            trustedSsids = "HomeWiFi, Office",
+            excludedApps = "com.bank.app,ua.gov.diia",
         )
 
         repo.save(nonDefault)

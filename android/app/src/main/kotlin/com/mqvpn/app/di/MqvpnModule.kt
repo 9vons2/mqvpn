@@ -27,13 +27,27 @@ object MqvpnModule {
         return MqvpnManager(context)
     }
 
+    /**
+     * Settings store, backed by Device Protected Storage.
+     *
+     * BootReceiver reads the saved config during Direct Boot — after
+     * LOCKED_BOOT_COMPLETED but before the user unlocks — and
+     * credential-encrypted storage is unreadable at that point. Keeping the
+     * store in DE storage is what lets boot auto-start work on a device that
+     * rebooted unattended.
+     *
+     * Trade-off: DE storage is not encrypted with the user credential. The
+     * auth key already sits in plaintext on the device either way, so this
+     * moves no secret across a meaningful boundary.
+     */
     @Provides
     @Singleton
     fun provideDataStore(@ApplicationContext context: Context): DataStore<Preferences> {
+        val deContext = context.createDeviceProtectedStorageContext()
         return PreferenceDataStoreFactory.create(
             corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
         ) {
-            context.preferencesDataStoreFile("demo_settings")
+            deContext.preferencesDataStoreFile("demo_settings")
         }
     }
 }

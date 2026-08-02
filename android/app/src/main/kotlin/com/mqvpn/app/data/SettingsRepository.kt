@@ -41,6 +41,9 @@ class SettingsRepository @Inject constructor(
         val REORDER_PORTS = stringPreferencesKey("reorder_ports")
         val HYBRID_ENABLED = booleanPreferencesKey("hybrid_enabled")
         val HYBRID_TCP_MODE = stringPreferencesKey("hybrid_tcp_mode")
+        val AUTO_START = booleanPreferencesKey("auto_start")
+        val TRUSTED_SSIDS = stringPreferencesKey("trusted_ssids")
+        val EXCLUDED_APPS = stringPreferencesKey("excluded_apps")
     }
 
     val settings: Flow<DemoSettings> = dataStore.data
@@ -59,6 +62,9 @@ class SettingsRepository @Inject constructor(
                 reorderPorts = prefs[Keys.REORDER_PORTS] ?: defaults.reorderPorts,
                 hybridEnabled = prefs[Keys.HYBRID_ENABLED] ?: defaults.hybridEnabled,
                 hybridTcpMode = prefs[Keys.HYBRID_TCP_MODE] ?: defaults.hybridTcpMode,
+                autoStart = prefs[Keys.AUTO_START] ?: defaults.autoStart,
+                trustedSsids = prefs[Keys.TRUSTED_SSIDS] ?: defaults.trustedSsids,
+                excludedApps = prefs[Keys.EXCLUDED_APPS] ?: defaults.excludedApps,
             )
         }
 
@@ -75,6 +81,9 @@ class SettingsRepository @Inject constructor(
             prefs[Keys.REORDER_PORTS] = newSettings.reorderPorts
             prefs[Keys.HYBRID_ENABLED] = newSettings.hybridEnabled
             prefs[Keys.HYBRID_TCP_MODE] = newSettings.hybridTcpMode
+            prefs[Keys.AUTO_START] = newSettings.autoStart
+            prefs[Keys.TRUSTED_SSIDS] = newSettings.trustedSsids
+            prefs[Keys.EXCLUDED_APPS] = newSettings.excludedApps
         }
     }
 }
