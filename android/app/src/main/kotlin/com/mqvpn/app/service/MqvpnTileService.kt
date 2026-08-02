@@ -20,6 +20,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 /**
@@ -32,7 +34,9 @@ class MqvpnTileService : TileService() {
 
     @Inject lateinit var manager: MqvpnManager
 
-    @Inject lateinit var settings: SettingsRepository
+    @Inject lateinit var repository: SettingsRepository
+
+    private val tileScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     private var scope: CoroutineScope? = null
     private var stateJob: Job? = null
@@ -63,12 +67,28 @@ class MqvpnTileService : TileService() {
             -> startService(MyVpnService.disconnectIntent(this))
 
             else -> {
-                val config = settings.loadConfig()
-                if (config == null || VpnService.prepare(this) != null) {
-                    openApp() // nothing saved yet, or permission revoked
-                } else {
-                    startForegroundService(MyVpnService.startIntent(this, config))
-                    manager.attachIfRunning(MyVpnService::class.java)
+                if (VpnService.prepare(this) != null) {
+                    openApp() // permission revoked — needs the consent dialog
+                    return
+                }
+                // Settings live in DataStore (suspending), so resolve the saved
+                // config off the click thread and start once it is known good.
+                tileScope.launch {
+                    val saved = try {
+                        repository.settings.first()
+                    } catch (_: Exception) {
+                        null
+                    }
+                    withContext(Dispatchers.Main) {
+                        if (saved == null || !saved.isValid()) {
+                            openApp() // nothing usable saved yet
+                        } else {
+                            startForegroundService(
+                                MyVpnService.startIntent(this@MqvpnTileService, saved.toMqvpnConfig())
+                            )
+                            manager.attachIfRunning(MyVpnService::class.java)
+                        }
+                    }
                 }
             }
         }
@@ -98,5 +118,10 @@ class MqvpnTileService : TileService() {
             else -> Tile.STATE_INACTIVE
         }
         tile.updateTile()
+    }
+
+    override fun onDestroy() {
+        tileScope.cancel()
+        super.onDestroy()
     }
 }

@@ -15,6 +15,7 @@ import com.mqvpn.sdk.core.internal.UdpReaderPool
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnError
 import com.mqvpn.sdk.core.model.MqvpnState
+import com.mqvpn.sdk.core.model.PathInfo
 import com.mqvpn.sdk.core.model.ReconnectInfo
 import com.mqvpn.sdk.core.model.TunnelInfo
 import com.mqvpn.sdk.network.NetworkMonitor
@@ -71,7 +72,9 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
                 // Poll stats/paths and push to MqvpnManager on each tick
                 if (t != null) {
                     manager?.updateStats(t.getStats())
-                    manager?.updatePaths(t.getPaths())
+                    val polledPaths = t.getPaths()
+                    manager?.updatePaths(polledPaths)
+                    onPathsPolled(polledPaths)
                     manager?.updateReorderStats(t.getReorderStats())
                 }
                 result
@@ -244,9 +247,19 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
      * Emit state to both Manager (StateFlow → UI) and app callback.
      */
     private fun emitState(newState: MqvpnState) {
+        lastState = newState
         manager?.updateState(newState)
         onVpnStateChanged(newState)
     }
+
+    /**
+     * Last state this service emitted. A manager binding to an already-running
+     * service (started at boot or from the QS tile) reads it to adopt the live
+     * state instead of showing Disconnected.
+     */
+    @Volatile
+    var lastState: MqvpnState = MqvpnState.Disconnected
+        private set
 
     // --- Abstract methods (app implements) ---
 
@@ -268,6 +281,9 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
 
     open fun onLog(level: Int, message: String) {}
     open fun onReconnectScheduled(delaySec: Int) {}
+
+    /** Per-tick snapshot of live paths — subclasses may surface throughput. */
+    open fun onPathsPolled(paths: List<PathInfo>) {}
 
     // --- Helpers ---
 

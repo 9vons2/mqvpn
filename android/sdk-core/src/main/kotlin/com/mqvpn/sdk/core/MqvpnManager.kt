@@ -85,6 +85,40 @@ class MqvpnManager(private val context: Context) {
         }
     }
 
+    /**
+     * Bind to a service that is already running — started at boot or from the
+     * Quick Settings tile — so the UI adopts the live tunnel state instead of
+     * showing Disconnected. No-op when a binding already exists, and the
+     * binding is deliberately not BIND_AUTO_CREATE: this must observe an
+     * existing service, never spawn one.
+     */
+    fun attachIfRunning(serviceClass: Class<out MqvpnVpnService>) {
+        if (serviceConnection != null) return
+
+        val conn = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                val binder = service as? MqvpnVpnService.LocalBinder ?: return
+                val svc = binder.getService()
+                boundService = svc
+                svc.manager = this@MqvpnManager
+                _vpnState.value = svc.lastState
+            }
+
+            override fun onServiceDisconnected(name: ComponentName?) {
+                boundService?.manager = null
+                boundService = null
+                _vpnState.value = MqvpnState.Disconnected
+                resetMetrics()
+            }
+        }
+        serviceConnection = conn
+        try {
+            context.bindService(Intent(context, serviceClass), conn, 0)
+        } catch (e: Exception) {
+            Log.w(TAG, "attachIfRunning bindService failed: ${e.message}")
+        }
+    }
+
     /** Disconnect the VPN. */
     fun disconnect() {
         boundService?.stopTunnel()

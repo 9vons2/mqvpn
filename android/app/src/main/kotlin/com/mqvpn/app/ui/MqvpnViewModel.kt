@@ -97,6 +97,10 @@ class MqvpnViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), ReorderStats())
 
     init {
+        // Adopt a service already running from boot auto-start or the QS tile,
+        // so the UI does not open showing Disconnected over a live tunnel.
+        manager.attachIfRunning(MyVpnService::class.java)
+
         viewModelScope.launch {
             manager.vpnState.collect {
                 eventLog.ingestState(it, clock())
