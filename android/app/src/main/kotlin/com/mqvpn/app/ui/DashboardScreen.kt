@@ -3,6 +3,8 @@
 
 package com.mqvpn.app.ui
 
+import androidx.compose.ui.platform.LocalContext
+import com.mqvpn.app.service.MyVpnService
 import android.app.Activity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -65,6 +67,7 @@ fun DashboardScreen(
     val events by viewModel.events.collectAsStateWithLifecycle()
     val bandwidthHistory by viewModel.bandwidthHistory.collectAsStateWithLifecycle()
     val throughput by viewModel.throughput.collectAsStateWithLifecycle()
+    val pausedSsid by viewModel.trustedPausedSsid.collectAsStateWithLifecycle()
 
     val vpnPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -132,6 +135,31 @@ fun DashboardScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
+            }
+
+            // Parked on a trusted network: the tunnel is down but the service
+            // is alive, so a plain "Connect" button would misrepresent it.
+            val paused = pausedSsid
+            if (paused != null) {
+                val ctx = LocalContext.current
+                Spacer(modifier = Modifier.height(8.dp))
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text(
+                            "Paused on trusted Wi-Fi",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.tertiary,
+                        )
+                        Text(
+                            "Parked on \"$paused\". Resumes automatically when you leave it.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Button(
+                            onClick = { ctx.startService(MyVpnService.resumeIntent(ctx)) },
+                        ) { Text("Resume now") }
+                    }
+                }
             }
 
             Spacer(modifier = Modifier.height(16.dp))

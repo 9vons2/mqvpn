@@ -2,4 +2,19 @@
 <resources>
     <string name="app_name">mqvpn</string>
     <string name="notification_channel_name">mqvpn VPN</string>
+
+
+    <!-- Split tunneling / config transfer (fork features) -->
+    <string name="dialog_cancel">Cancel</string>
+    <string name="dialog_ok">OK</string>
+    <string name="export_copy">Copy</string>
+    <string name="export_dialog_hint">Scan with the other phone\'s camera, copy the text and paste it into Import there. The code contains your auth key — don\'t show it around.</string>
+    <string name="export_dialog_title">Config QR code</string>
+    <string name="import_confirm">Import</string>
+    <string name="import_dialog_hint">Paste the config JSON (from a QR scan or Copy).</string>
+    <string name="import_dialog_title">Import config</string>
+    <string name="import_error">Invalid config</string>
+    <string name="split_dialog_hint">Checked apps will connect outside the tunnel.</string>
+    <string name="split_dialog_title">Exclude apps from VPN</string>
+    <string name="split_search_hint">Search apps</string>
 </resources>

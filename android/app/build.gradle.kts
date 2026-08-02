@@ -92,6 +92,9 @@ dependencies {
     // DataStore
     implementation("androidx.datastore:datastore-preferences:1.2.1")
 
+    // QR code generation (config export)
+    implementation("com.google.zxing:core:3.5.3")
+
     // Test
     testImplementation("junit:junit:4.13.2")
     testImplementation("io.mockk:mockk:1.14.11")

@@ -3,6 +3,10 @@
 
 package com.mqvpn.app.ui
 
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.width
+import androidx.compose.ui.platform.LocalContext
+import com.mqvpn.app.service.MyVpnService
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -82,6 +86,12 @@ fun SettingsScreen(
     }
     var reorderPorts by rememberSaveable { mutableStateOf("") }
     var hybridEnabled by rememberSaveable { mutableStateOf(false) }
+    var autoStart by rememberSaveable { mutableStateOf(false) }
+    var trustedSsids by rememberSaveable { mutableStateOf("") }
+    var excludedApps by rememberSaveable { mutableStateOf("") }
+    var showSplitDialog by rememberSaveable { mutableStateOf(false) }
+    var showExportDialog by rememberSaveable { mutableStateOf(false) }
+    var showImportDialog by rememberSaveable { mutableStateOf(false) }
     var hybridTcpModeName by rememberSaveable {
         mutableStateOf(MqvpnConfig.HybridTcpMode.AUTO.name)
     }
@@ -101,6 +111,9 @@ fun SettingsScreen(
         reorderPorts = current.reorderPorts
         hybridEnabled = current.hybridEnabled
         hybridTcpModeName = current.hybridTcpMode
+        autoStart = current.autoStart
+        trustedSsids = current.trustedSsids
+        excludedApps = current.excludedApps
         seeded = true
     }
 
@@ -116,6 +129,9 @@ fun SettingsScreen(
         reorderPorts = reorderPorts,
         hybridEnabled = hybridEnabled,
         hybridTcpMode = hybridTcpModeName,
+        autoStart = autoStart,
+        trustedSsids = trustedSsids,
+        excludedApps = excludedApps,
     )
 
     val fieldsEnabled = isEditable && !isSaving
@@ -331,6 +347,77 @@ fun SettingsScreen(
                 style = MaterialTheme.typography.bodySmall,
             )
 
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text("Startup", style = MaterialTheme.typography.titleSmall)
+            Spacer(modifier = Modifier.height(8.dp))
+            LabeledSwitchRow(
+                label = "Start after boot",
+                checked = autoStart,
+                onCheckedChange = { autoStart = it },
+                enabled = fieldsEnabled,
+            )
+            Text(
+                "Needs a saved config and VPN permission already granted.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text("Trusted Wi-Fi", style = MaterialTheme.typography.titleSmall)
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedTextField(
+                value = trustedSsids,
+                onValueChange = { trustedSsids = it },
+                label = { Text("SSIDs, comma-separated") },
+                supportingText = { Text("Empty = never pause") },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = fieldsEnabled,
+                singleLine = true,
+            )
+            val ctx = LocalContext.current
+            val currentSsid = MyVpnService.currentWifiSsid(ctx)
+            if (currentSsid != null && currentSsid !in trustedSsids.split(",").map { it.trim() }) {
+                TextButton(
+                    onClick = {
+                        trustedSsids =
+                            if (trustedSsids.isBlank()) currentSsid else "$trustedSsids, $currentSsid"
+                    },
+                    enabled = fieldsEnabled,
+                ) { Text("Add current: $currentSsid") }
+            }
+            Text(
+                "On these networks the tunnel parks itself and resumes when you leave. " +
+                    "Reading the Wi-Fi name needs the location permission. " +
+                    "Not compatible with the system Always-on VPN setting.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text("Split tunneling", style = MaterialTheme.typography.titleSmall)
+            Spacer(modifier = Modifier.height(8.dp))
+            val excludedList = excludedApps.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+            TextButton(onClick = { showSplitDialog = true }, enabled = fieldsEnabled) {
+                Text("Choose apps (${excludedList.size})")
+            }
+            Text(
+                "Chosen apps connect outside the tunnel.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text("Config transfer", style = MaterialTheme.typography.titleSmall)
+            Spacer(modifier = Modifier.height(8.dp))
+            Row {
+                TextButton(onClick = { showExportDialog = true }) { Text("QR export") }
+                Spacer(modifier = Modifier.width(8.dp))
+                TextButton(onClick = { showImportDialog = true }, enabled = fieldsEnabled) {
+                    Text("Import")
+                }
+            }
+
             if (saveError != null) {
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(saveError.orEmpty(), color = MaterialTheme.colorScheme.error)
@@ -338,5 +425,42 @@ fun SettingsScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
         }
+    }
+
+    if (showSplitDialog) {
+        SplitTunnelingDialog(
+            excluded = excludedApps.split(",").map { it.trim() }.filter { it.isNotEmpty() }.toSet(),
+            onDismiss = { showSplitDialog = false },
+            onConfirm = { picked ->
+                excludedApps = picked.sorted().joinToString(",")
+                showSplitDialog = false
+            },
+        )
+    }
+    if (showExportDialog) {
+        ExportConfigDialog(
+            configJson = draft.toMqvpnConfig().toJson(),
+            onDismiss = { showExportDialog = false },
+        )
+    }
+    if (showImportDialog) {
+        ImportConfigDialog(
+            onDismiss = { showImportDialog = false },
+            onImport = { cfg ->
+                serverAddress = cfg.serverAddress
+                serverPortText = cfg.serverPort.toString()
+                tlsServerName = cfg.tlsServerName ?: ""
+                authKey = cfg.authKey
+                insecure = cfg.insecure
+                killSwitch = cfg.killSwitch
+                reorderEnabled = cfg.reorderEnabled
+                reorderProfileName = cfg.reorderProfile.name
+                reorderPorts = cfg.reorderPorts.joinToString(",")
+                hybridEnabled = cfg.hybridEnabled
+                hybridTcpModeName = cfg.hybridTcpMode.name
+                excludedApps = cfg.excludedApps.joinToString(",")
+                showImportDialog = false
+            },
+        )
     }
 }
