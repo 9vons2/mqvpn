@@ -44,6 +44,36 @@ class DemoSettingsTest {
         assertEquals(MqvpnConfig.HybridTcpMode.AUTO, settings.hybridTcpModeEnum())
     }
 
+    @Test
+    fun `schedulerEnum round-trips known name`() {
+        val settings = DemoSettings(scheduler = MqvpnConfig.Scheduler.WLB_UDP_PIN.name)
+        assertEquals(MqvpnConfig.Scheduler.WLB_UDP_PIN, settings.schedulerEnum())
+    }
+
+    @Test
+    fun `schedulerEnum falls back to WLB on unknown name`() {
+        val settings = DemoSettings(scheduler = "NOT_A_REAL_SCHEDULER")
+        assertEquals(MqvpnConfig.Scheduler.WLB, settings.schedulerEnum())
+    }
+
+    /**
+     * The whole point of this app is adding two links together. The SDK's own
+     * MqvpnConfig default is MIN_RTT, which pins traffic to one path and
+     * aggregates nothing, so a default that silently drifted back to it would
+     * be a real regression, not a cosmetic one.
+     */
+    @Test
+    fun `default scheduler is WLB, not the SDK default`() {
+        assertEquals(MqvpnConfig.Scheduler.WLB, DemoSettings().schedulerEnum())
+        assertEquals(MqvpnConfig.Scheduler.WLB, DemoSettings().toMqvpnConfig().scheduler)
+    }
+
+    @Test
+    fun `toMqvpnConfig carries the chosen scheduler`() {
+        val settings = DemoSettings(scheduler = MqvpnConfig.Scheduler.MIN_RTT.name)
+        assertEquals(MqvpnConfig.Scheduler.MIN_RTT, settings.toMqvpnConfig().scheduler)
+    }
+
     // -- reorder port text parsing -------------------------------------------
 
     @Test

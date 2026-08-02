@@ -80,6 +80,9 @@ fun SettingsScreen(
     var authKey by rememberSaveable { mutableStateOf("") }
     var insecure by rememberSaveable { mutableStateOf(true) }
     var killSwitch by rememberSaveable { mutableStateOf(false) }
+    var schedulerName by rememberSaveable {
+        mutableStateOf(MqvpnConfig.Scheduler.WLB.name)
+    }
     var reorderEnabled by rememberSaveable { mutableStateOf(false) }
     var reorderProfileName by rememberSaveable {
         mutableStateOf(MqvpnConfig.ReorderProfile.CELLULAR_BOND.name)
@@ -106,6 +109,7 @@ fun SettingsScreen(
         authKey = current.authKey
         insecure = current.insecure
         killSwitch = current.killSwitch
+        schedulerName = current.scheduler
         reorderEnabled = current.reorderEnabled
         reorderProfileName = current.reorderProfile
         reorderPorts = current.reorderPorts
@@ -124,6 +128,7 @@ fun SettingsScreen(
         authKey = authKey,
         insecure = insecure,
         killSwitch = killSwitch,
+        scheduler = schedulerName,
         reorderEnabled = reorderEnabled,
         reorderProfile = reorderProfileName,
         reorderPorts = reorderPorts,
@@ -263,6 +268,23 @@ fun SettingsScreen(
                 checked = killSwitch,
                 onCheckedChange = { killSwitch = it },
                 enabled = fieldsEnabled,
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text("Multipath", style = MaterialTheme.typography.titleSmall)
+            Spacer(modifier = Modifier.height(8.dp))
+            EnumDropdownField(
+                label = "Scheduler",
+                options = MqvpnConfig.Scheduler.entries,
+                selected = draft.schedulerEnum(),
+                displayName = ::schedulerLabel,
+                onSelect = { schedulerName = it.name },
+                enabled = fieldsEnabled,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                schedulerDescription(draft.schedulerEnum()),
+                style = MaterialTheme.typography.bodySmall,
             )
             Spacer(modifier = Modifier.height(16.dp))
 
@@ -453,6 +475,7 @@ fun SettingsScreen(
                 authKey = cfg.authKey
                 insecure = cfg.insecure
                 killSwitch = cfg.killSwitch
+                schedulerName = cfg.scheduler.name
                 reorderEnabled = cfg.reorderEnabled
                 reorderProfileName = cfg.reorderProfile.name
                 reorderPorts = cfg.reorderPorts.joinToString(",")
@@ -463,4 +486,32 @@ fun SettingsScreen(
             },
         )
     }
+}
+
+/**
+ * Dropdown label. The enum names alone ("WLB", "MIN_RTT") say nothing about
+ * what the phone will actually do with two links, so each carries a plain
+ * summary of its effect on aggregate throughput.
+ */
+private fun schedulerLabel(s: MqvpnConfig.Scheduler): String = when (s) {
+    MqvpnConfig.Scheduler.WLB -> "WLB — bond all links"
+    MqvpnConfig.Scheduler.MIN_RTT -> "Min RTT — fastest link only"
+    MqvpnConfig.Scheduler.WLB_UDP_PIN -> "WLB + UDP pin"
+    MqvpnConfig.Scheduler.BACKUP_FEC -> "Backup + FEC"
+}
+
+private fun schedulerDescription(s: MqvpnConfig.Scheduler): String = when (s) {
+    MqvpnConfig.Scheduler.WLB ->
+        "Spreads traffic over every active path by weight, so their bandwidth " +
+            "adds up. The default, and what you want for bonding satellite " +
+            "with mobile."
+    MqvpnConfig.Scheduler.MIN_RTT ->
+        "Sends everything over the lowest-latency path and keeps the rest as " +
+            "warm standby. Lowest latency, but no bandwidth aggregation."
+    MqvpnConfig.Scheduler.WLB_UDP_PIN ->
+        "WLB, except each UDP flow is pinned to one path. For apps that behave " +
+            "badly when datagrams arrive out of order."
+    MqvpnConfig.Scheduler.BACKUP_FEC ->
+        "One path carries the traffic while the others add redundancy. Rides " +
+            "out a dying link, at the cost of total throughput."
 }

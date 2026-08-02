@@ -18,6 +18,13 @@ data class DemoSettings(
     val authKey: String = "",
     val insecure: Boolean = true,
     val killSwitch: Boolean = false,
+    /**
+     * Multipath packet scheduler. Defaults to WLB — this app exists to bond
+     * links, and the SDK's own default (MIN_RTT) parks everything on the
+     * lowest-latency path, so bandwidth never adds up. The CLI defaults to
+     * wlb for the same reason.
+     */
+    val scheduler: String = MqvpnConfig.Scheduler.WLB.name,
     val reorderEnabled: Boolean = false,
     val reorderProfile: String = MqvpnConfig.ReorderProfile.CELLULAR_BOND.name,
     val reorderPorts: String = "443",
@@ -30,6 +37,10 @@ data class DemoSettings(
     /** Package names routed outside the tunnel (split tunneling), comma-separated. */
     val excludedApps: String = "",
 ) {
+    fun schedulerEnum(): MqvpnConfig.Scheduler =
+        MqvpnConfig.Scheduler.entries.firstOrNull { it.name == scheduler }
+            ?: MqvpnConfig.Scheduler.WLB
+
     fun reorderProfileEnum(): MqvpnConfig.ReorderProfile =
         MqvpnConfig.ReorderProfile.entries.firstOrNull { it.name == reorderProfile }
             ?: MqvpnConfig.ReorderProfile.CELLULAR_BOND
@@ -64,6 +75,7 @@ data class DemoSettings(
         authKey = authKey.trim(),
         insecure = insecure,
         killSwitch = killSwitch,
+        scheduler = schedulerEnum(),
         reorderEnabled = reorderEnabled,
         reorderProfile = reorderProfileEnum(),
         reorderPorts = parsedReorderPorts(),

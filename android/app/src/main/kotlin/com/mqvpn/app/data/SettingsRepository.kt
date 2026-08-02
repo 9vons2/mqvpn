@@ -36,6 +36,7 @@ class SettingsRepository @Inject constructor(
         val AUTH_KEY = stringPreferencesKey("auth_key")
         val INSECURE = booleanPreferencesKey("insecure")
         val KILL_SWITCH = booleanPreferencesKey("kill_switch")
+        val SCHEDULER = stringPreferencesKey("scheduler")
         val REORDER_ENABLED = booleanPreferencesKey("reorder_enabled")
         val REORDER_PROFILE = stringPreferencesKey("reorder_profile")
         val REORDER_PORTS = stringPreferencesKey("reorder_ports")
@@ -57,6 +58,7 @@ class SettingsRepository @Inject constructor(
                 authKey = prefs[Keys.AUTH_KEY] ?: defaults.authKey,
                 insecure = prefs[Keys.INSECURE] ?: defaults.insecure,
                 killSwitch = prefs[Keys.KILL_SWITCH] ?: defaults.killSwitch,
+                scheduler = prefs[Keys.SCHEDULER] ?: defaults.scheduler,
                 reorderEnabled = prefs[Keys.REORDER_ENABLED] ?: defaults.reorderEnabled,
                 reorderProfile = prefs[Keys.REORDER_PROFILE] ?: defaults.reorderProfile,
                 reorderPorts = prefs[Keys.REORDER_PORTS] ?: defaults.reorderPorts,
@@ -76,6 +78,7 @@ class SettingsRepository @Inject constructor(
             prefs[Keys.AUTH_KEY] = newSettings.authKey
             prefs[Keys.INSECURE] = newSettings.insecure
             prefs[Keys.KILL_SWITCH] = newSettings.killSwitch
+            prefs[Keys.SCHEDULER] = newSettings.scheduler
             prefs[Keys.REORDER_ENABLED] = newSettings.reorderEnabled
             prefs[Keys.REORDER_PROFILE] = newSettings.reorderProfile
             prefs[Keys.REORDER_PORTS] = newSettings.reorderPorts
