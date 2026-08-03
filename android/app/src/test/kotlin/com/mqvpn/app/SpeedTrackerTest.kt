@@ -125,4 +125,79 @@ class SpeedTrackerTest {
         assertTrue(frame.perPath.containsKey("wifi-1"))
         assertEquals(8_000.0, frame.aggregate.downBps, 0.01)
     }
+
+    // -- liveness: "sending but nothing comes back" ---------------------------
+
+    /**
+     * The Starlink-in-motion case: the OS still reports the interface as up,
+     * libmqvpn keeps getting successful sendto() calls (so tx climbs), but not
+     * one byte comes back. srtt cannot fall here because a smoothed RTT is only
+     * recomputed on a reply, which is exactly why the UI must not trust it.
+     */
+    @Test
+    fun `tx moving with rx frozen is reported as no reply`() {
+        val t = SpeedTracker()
+        t.update(listOf(path("wifi-1", tx = 0, rx = 0)), emptyMap(), emptyMap(), 0)
+        var ui = t.update(listOf(path("wifi-1", tx = 1_000, rx = 0)), emptyMap(), emptyMap(), 1000)
+        assertEquals(1000L, ui.paths.single().noReplyMs)
+        assertTrue(!ui.paths.single().isStale) // one second is not yet a verdict
+
+        ui = t.update(listOf(path("wifi-1", tx = 5_000, rx = 0)), emptyMap(), emptyMap(), 5000)
+        assertEquals(5000L, ui.paths.single().noReplyMs)
+        assertTrue(ui.paths.single().isStale)
+    }
+
+    /** Idle tunnel: neither counter moves, which is not a fault. */
+    @Test
+    fun `both counters idle is not reported as no reply`() {
+        val t = SpeedTracker()
+        t.update(listOf(path("wifi-1", tx = 100, rx = 100)), emptyMap(), emptyMap(), 0)
+        val ui = t.update(listOf(path("wifi-1", tx = 100, rx = 100)), emptyMap(), emptyMap(), 30_000)
+        assertEquals(0L, ui.paths.single().noReplyMs)
+        assertTrue(!ui.paths.single().isStale)
+    }
+
+    @Test
+    fun `a reply clears the no-reply timer`() {
+        val t = SpeedTracker()
+        t.update(listOf(path("wifi-1", tx = 0, rx = 0)), emptyMap(), emptyMap(), 0)
+        t.update(listOf(path("wifi-1", tx = 9_000, rx = 0)), emptyMap(), emptyMap(), 9000)
+        val ui = t.update(listOf(path("wifi-1", tx = 10_000, rx = 1)), emptyMap(), emptyMap(), 10_000)
+        assertEquals(0L, ui.paths.single().noReplyMs)
+    }
+
+    /** A re-created path resets counters; the dead incarnation's silence must not carry over. */
+    @Test
+    fun `handle change restarts the silence history`() {
+        val t = SpeedTracker()
+        t.update(listOf(path("wifi-1", tx = 0, rx = 0)), emptyMap(), emptyMap(), 0)
+        t.update(listOf(path("wifi-1", tx = 8_000, rx = 0)), emptyMap(), emptyMap(), 8000)
+        val ui = t.update(
+            listOf(path("wifi-1", tx = 0, rx = 0, handle = 2L)), emptyMap(), emptyMap(), 9000,
+        )
+        assertEquals(0L, ui.paths.single().noReplyMs)
+    }
+
+    // -- share of the aggregate ----------------------------------------------
+
+    @Test
+    fun `download share splits between paths and is zero when idle`() {
+        val t = SpeedTracker()
+        val a = { rx: Long, h: Long, i: String -> path(i, tx = 0, rx = rx, handle = h) }
+        t.update(listOf(a(0, 1, "wifi-1"), a(0, 2, "cellular-2")), emptyMap(), emptyMap(), 0)
+        val ui = t.update(
+            listOf(a(3_000, 1, "wifi-1"), a(1_000, 2, "cellular-2")),
+            emptyMap(), emptyMap(), 1000,
+        )
+        val wifi = ui.paths.first { it.key == "wifi-1" }
+        val cell = ui.paths.first { it.key == "cellular-2" }
+        assertEquals(0.75f, wifi.downShare, 0.001f)
+        assertEquals(0.25f, cell.downShare, 0.001f)
+
+        val idle = t.update(
+            listOf(a(3_000, 1, "wifi-1"), a(1_000, 2, "cellular-2")),
+            emptyMap(), emptyMap(), 2000,
+        )
+        assertEquals(0f, idle.paths.first().downShare, 0.0f)
+    }
 }

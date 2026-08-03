@@ -39,6 +39,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import java.io.File
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -48,14 +49,18 @@ class MyVpnService : MqvpnVpnService() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    private val diag: DiagnosticsLog by lazy { diagnosticsLog(applicationContext) }
+
     override fun onCreate() {
         super.onCreate()
         isRunning = true
         createNotificationChannel()
+        diag.log("service created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_DISCONNECT) {
+            diag.log("disconnect requested by user")
             setPaused(null)
             stopTunnel()
             stopSelf()
@@ -141,11 +146,14 @@ class MyVpnService : MqvpnVpnService() {
     }
 
     override fun onVpnStateChanged(newState: MqvpnState) {
+        diag.log("state → ${newState::class.simpleName}")
         when (newState) {
             is MqvpnState.Connected -> {
                 connectedForNotif = true
                 lastNotifPollMs = 0L
                 notifPrev.clear()
+                diagPathStatus.clear()
+                diagSilentSince.clear()
                 updateNotification("Connected: ${newState.tunnelInfo.assignedIp}")
             }
             is MqvpnState.Reconnecting -> {
@@ -160,6 +168,7 @@ class MyVpnService : MqvpnVpnService() {
             }
             is MqvpnState.Error -> {
                 connectedForNotif = false
+                diag.log("ERROR ${newState.error.message}")
                 updateNotification("Error: ${newState.error.message}")
                 stopSelf()
             }
@@ -177,10 +186,12 @@ class MyVpnService : MqvpnVpnService() {
     }
 
     override fun onReconnectScheduled(delaySec: Int) {
+        diag.log("reconnect scheduled in ${delaySec}s")
         updateNotification("Reconnecting in ${delaySec}s...")
     }
 
     override fun onDestroy() {
+        diag.log("service destroyed")
         isRunning = false
         connectedForNotif = false
         TrustedPauseState.setPaused(null)
@@ -246,6 +257,7 @@ class MyVpnService : MqvpnVpnService() {
                             )
                         } else {
                             Log.i(TAG, "trusted Wi-Fi \"$ssid\" joined — pausing VPN")
+                            diag.log("paused on trusted Wi-Fi \"$ssid\"")
                             setPaused(ssid)
                             stopTunnel()
                             updateNotification("Paused: trusted Wi-Fi \"$ssid\"")
@@ -300,6 +312,7 @@ class MyVpnService : MqvpnVpnService() {
             return
         }
         Log.i(TAG, "left trusted Wi-Fi ($reason) — resuming VPN")
+        diag.log("resuming: $reason")
         setPaused(null)
         ssidAtStart = currentWifiSsid(applicationContext)
         updateNotification("Connecting...")
@@ -341,6 +354,7 @@ class MyVpnService : MqvpnVpnService() {
      * while actively connected — paused/reconnecting keep their text.
      */
     override fun onPathsPolled(paths: List<PathInfo>) {
+        diagnosePaths(paths)
         if (!connectedForNotif || pausedOnTrustedWifi || paths.isEmpty()) return
         val now = System.currentTimeMillis()
         val first = lastNotifPollMs == 0L
@@ -370,6 +384,76 @@ class MyVpnService : MqvpnVpnService() {
 
         val aggregate = "↓ ${formatBps(aggDown)}   ↑ ${formatBps(aggUp)}"
         updateRichNotification(aggregate, (listOf(aggregate) + lines).joinToString("\n"))
+    }
+
+    // --- Diagnostics ---
+
+    private val diagPathStatus = HashMap<String, Int>()      // iface -> last logged status
+    private val diagPrev = HashMap<String, Pair<Long, Long>>() // iface -> (tx, rx)
+    private val diagSilentSince = HashMap<String, Long>()     // iface -> first tx-without-rx tick
+    private val diagReported = HashSet<String>()              // ifaces already logged as silent
+
+    /**
+     * Records path lifecycle and, more importantly, the failure this app keeps
+     * hitting: a link the OS still calls up, where sends keep succeeding and
+     * nothing ever comes back. libmqvpn counts bytes_tx per successful
+     * sendto() and bytes_rx only per packet actually received, so "tx climbing,
+     * rx frozen" names that state precisely — and unlike srtt, which freezes at
+     * its last live measurement, it cannot lie about a dead link.
+     *
+     * Only transitions are written. This runs on every poll tick, so logging
+     * per-tick state would bury the events worth reading.
+     */
+    private fun diagnosePaths(paths: List<PathInfo>) {
+        val now = System.currentTimeMillis()
+        val seen = HashSet<String>()
+
+        for (p in paths) {
+            seen += p.iface
+            val prevStatus = diagPathStatus.put(p.iface, p.status)
+            if (prevStatus == null) {
+                diag.log("path ${p.iface} appeared (status=${p.status})")
+            } else if (prevStatus != p.status) {
+                diag.log("path ${p.iface} status $prevStatus → ${p.status}")
+            }
+
+            val prev = diagPrev.put(p.iface, p.bytesTx to p.bytesRx)
+            if (prev == null) continue
+            val txMoved = p.bytesTx > prev.first
+            val rxMoved = p.bytesRx > prev.second
+
+            when {
+                rxMoved -> {
+                    if (diagReported.remove(p.iface)) {
+                        val since = diagSilentSince[p.iface]
+                        val secs = if (since != null) (now - since) / 1000 else 0
+                        diag.log("path ${p.iface} answering again after ${secs}s of silence")
+                    }
+                    diagSilentSince.remove(p.iface)
+                }
+                txMoved -> {
+                    val since = diagSilentSince.getOrPut(p.iface) { now }
+                    val silentMs = now - since
+                    if (silentMs >= SILENT_REPORT_MS && diagReported.add(p.iface)) {
+                        diag.log(
+                            "path ${p.iface} SILENT: sending for ${silentMs / 1000}s with no " +
+                                "reply (srtt still reports ${p.srttMs} ms, status=${p.status})",
+                        )
+                    }
+                }
+                // Neither counter moved: idle, not broken. Leave the timer be —
+                // an idle gap must not clear a silence that is still running.
+            }
+        }
+
+        val gone = diagPathStatus.keys - seen
+        for (iface in gone) {
+            diag.log("path $iface gone")
+            diagPathStatus.remove(iface)
+            diagPrev.remove(iface)
+            diagSilentSince.remove(iface)
+            diagReported.remove(iface)
+        }
     }
 
     /** Best-effort custom provider names (set via the rename dialog). */
@@ -467,6 +551,22 @@ class MyVpnService : MqvpnVpnService() {
 
         // Notification speed refresh cadence (also the rate-averaging window).
         private const val NOTIF_MIN_INTERVAL_SEC = 1.0
+
+        /** Silence before a path is written to the trace as not answering. */
+        private const val SILENT_REPORT_MS = 5_000L
+
+        /**
+         * Diagnostics live in device-protected storage: the service is
+         * directBootAware and logs before the user has unlocked, where
+         * credential-encrypted storage is not readable yet.
+         */
+        fun diagnosticsLog(context: Context): DiagnosticsLog =
+            DiagnosticsLog(
+                File(
+                    context.createDeviceProtectedStorageContext().filesDir,
+                    DiagnosticsLog.FILE_NAME,
+                ),
+            )
 
         /**
          * Start intent carrying a config — used by BootReceiver and the QS

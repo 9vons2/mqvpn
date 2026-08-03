@@ -17,6 +17,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cable
 import androidx.compose.material.icons.filled.SignalCellularAlt
 import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.Icon
@@ -34,6 +35,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import kotlin.math.roundToInt
 
 /**
  * Per-provider row: live down/up rates, RTT, lifetime totals, and the chart's
@@ -76,17 +78,51 @@ fun ProviderCard(path: PathThroughput, onRename: (String?) -> Unit) {
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text("${path.label} — ${pathStatusName(path.status)}")
+                    if (path.isStale) {
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Icon(
+                            imageVector = Icons.Default.WarningAmber,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "↓ ${formatBps(path.downBps)}   ↑ ${formatBps(path.upBps)}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    // Which link is actually carrying the traffic right now —
+                    // with a weighted scheduler that is not answerable from the
+                    // rates alone without doing the arithmetic in your head.
+                    if (path.downShare > 0f) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            "${(path.downShare * 100).roundToInt()}%",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Medium,
+                            color = seriesColor(path.colorSlot),
+                        )
+                    }
                 }
                 Text(
-                    "↓ ${formatBps(path.downBps)}   ↑ ${formatBps(path.upBps)}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Medium,
-                )
-                Text(
-                    "RTT ${path.srttMs} ms · total ↓ ${formatBytes(path.totalRx)} " +
-                        "↑ ${formatBytes(path.totalTx)} · ${path.key}",
+                    // A stale RTT is worse than no RTT: it reads as a healthy
+                    // link. Say how long the silence has lasted instead.
+                    if (path.isStale) {
+                        "no reply for ${path.noReplyMs / 1000}s · total ↓ " +
+                            "${formatBytes(path.totalRx)} ↑ ${formatBytes(path.totalTx)} · ${path.key}"
+                    } else {
+                        "RTT ${path.srttMs} ms · total ↓ ${formatBytes(path.totalRx)} " +
+                            "↑ ${formatBytes(path.totalTx)} · ${path.key}"
+                    },
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (path.isStale) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
                 )
             }
         }

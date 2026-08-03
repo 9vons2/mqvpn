@@ -95,6 +95,7 @@ fun SettingsScreen(
     var showSplitDialog by rememberSaveable { mutableStateOf(false) }
     var showExportDialog by rememberSaveable { mutableStateOf(false) }
     var showImportDialog by rememberSaveable { mutableStateOf(false) }
+    var showDiagnosticsDialog by rememberSaveable { mutableStateOf(false) }
     var hybridTcpModeName by rememberSaveable {
         mutableStateOf(MqvpnConfig.HybridTcpMode.AUTO.name)
     }
@@ -440,6 +441,18 @@ fun SettingsScreen(
                 }
             }
 
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text("Diagnostics", style = MaterialTheme.typography.titleSmall)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                "Records path failures and reconnects while the tunnel runs, even " +
+                    "with the app closed. Share it after a trip that went wrong.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            TextButton(onClick = { showDiagnosticsDialog = true }) { Text("View log") }
+
             if (saveError != null) {
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(saveError.orEmpty(), color = MaterialTheme.colorScheme.error)
@@ -458,6 +471,9 @@ fun SettingsScreen(
                 showSplitDialog = false
             },
         )
+    }
+    if (showDiagnosticsDialog) {
+        DiagnosticsDialog(onDismiss = { showDiagnosticsDialog = false })
     }
     if (showExportDialog) {
         ExportConfigDialog(
