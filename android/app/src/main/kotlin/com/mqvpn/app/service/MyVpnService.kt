@@ -71,6 +71,7 @@ class MyVpnService : MqvpnVpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_DISCONNECT) {
             diag.log("disconnect requested by user")
+            userRequestedStop = true
             setPaused(null)
             stopTunnel()
             stopSelf()
@@ -115,12 +116,18 @@ class MyVpnService : MqvpnVpnService() {
                     Log.i(TAG, "started paused: on trusted Wi-Fi \"$ssid\"")
                 } else {
                     setPaused(null)
+                    clearStopRequest()
                     startTunnel(config)
                 }
                 startTrustedWifiWatcher(trusted)
             }
         }
         return START_STICKY
+    }
+
+    /** A fresh connect supersedes any earlier stop request. */
+    private fun clearStopRequest() {
+        userRequestedStop = false
     }
 
     override fun onCreateTun(info: TunnelInfo, config: MqvpnConfig): ParcelFileDescriptor {
@@ -174,9 +181,19 @@ class MyVpnService : MqvpnVpnService() {
             }
             is MqvpnState.Disconnected -> {
                 connectedForNotif = false
-                // Paused on trusted Wi-Fi: the service stays alive, watching
-                // for the network change that will resume the tunnel.
-                if (!pausedOnTrustedWifi) stopSelf()
+                // Same race as the Error branch, through the other door: the
+                // library emits Disconnected from cleanup() and may still be
+                // about to schedule a reconnect. The 08-04 09:27:57 trace shows
+                // exactly that — Error, then Disconnected, then a 27 s gap
+                // before anything reconnected, because stopSelf() fired here.
+                //
+                // Stop only when the user asked to stop. Anything else is the
+                // library's business, and it has a reconnect timer for it.
+                when {
+                    pausedOnTrustedWifi -> Unit // parked, watching for the network to change
+                    userRequestedStop -> stopSelf()
+                    else -> diag.log("disconnected without a user request — staying up")
+                }
             }
             is MqvpnState.Error -> {
                 connectedForNotif = false
@@ -251,6 +268,14 @@ class MyVpnService : MqvpnVpnService() {
 
     /** True while the tunnel is parked because we're on a trusted network. */
     private var pausedOnTrustedWifi = false
+
+    /**
+     * Set only by an explicit Disconnect. Distinguishes "the user is done"
+     * from "the transport dropped", which look identical by the time
+     * Disconnected reaches [onVpnStateChanged] — and only the first should
+     * take the service down.
+     */
+    private var userRequestedStop = false
 
     private suspend fun loadTrustedSsids(): List<String> = try {
         settingsRepo.settings.first().parsedTrustedSsids()
@@ -498,10 +523,13 @@ class MyVpnService : MqvpnVpnService() {
         for (p in paths) {
             seen += p.handle
             val prevStatus = diagPathStatus.put(p.handle, p.status)
+            // The handle is in every line: two live paths can share an iface
+            // name (a replacement created before its predecessor is reaped),
+            // and without it the trace reads as one path contradicting itself.
             if (prevStatus == null) {
-                diag.log("path ${p.iface} appeared (status=${p.status})")
+                diag.log("path ${p.iface}#${p.handle} appeared (status=${p.status})")
             } else if (prevStatus != p.status) {
-                diag.log("path ${p.iface} status $prevStatus → ${p.status}")
+                diag.log("path ${p.iface}#${p.handle} status $prevStatus → ${p.status}")
             }
 
             val prev = diagPrev.put(p.handle, p.bytesTx to p.bytesRx)
@@ -514,7 +542,7 @@ class MyVpnService : MqvpnVpnService() {
                     if (diagReported.remove(p.handle)) {
                         val since = diagSilentSince[p.handle]
                         val secs = if (since != null) (now - since) / 1000 else 0
-                        diag.log("path ${p.iface} answering again after ${secs}s of silence")
+                        diag.log("path ${p.iface}#${p.handle} answering again after ${secs}s of silence")
                     }
                     diagSilentSince.remove(p.handle)
                 }
@@ -523,7 +551,7 @@ class MyVpnService : MqvpnVpnService() {
                     val silentMs = now - since
                     if (silentMs >= SILENT_REPORT_MS && diagReported.add(p.handle)) {
                         diag.log(
-                            "path ${p.iface} SILENT: sending for ${silentMs / 1000}s with no " +
+                            "path ${p.iface}#${p.handle} SILENT: sending for ${silentMs / 1000}s with no " +
                                 "reply (srtt still reports ${p.srttMs} ms, status=${p.status})",
                         )
                     }

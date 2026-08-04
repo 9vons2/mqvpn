@@ -13,7 +13,9 @@ import androidx.core.content.getSystemService
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Monitors WiFi / Cellular / Ethernet availability via ConnectivityManager.
+ * Monitors WiFi / Cellular / Ethernet availability via ConnectivityManager,
+ * and — crucially for a bonding VPN — asks the system to keep more than one
+ * of them up at the same time.
  *
  * Uses NET_CAPABILITY_VALIDATED to filter out captive portals and
  * unvalidated networks that would cause packet loss if used as VPN paths.
@@ -27,7 +29,23 @@ class NetworkMonitor(private val context: Context) {
 
     private var callback: ConnectivityManager.NetworkCallback? = null
 
+    /**
+     * Held only to keep their transports alive; path bookkeeping stays with
+     * [callback]. One per transport, because a request naming several
+     * transports is satisfied by any one of them.
+     */
+    private val keepAlive = mutableListOf<ConnectivityManager.NetworkCallback>()
+
     fun start(listener: (NetworkEvent) -> Unit) {
+        // registerNetworkCallback only *observes*. Android keeps a single
+        // default network and tears cellular data down once Wi-Fi validates,
+        // so a passive watcher sees one path at a time and there is nothing to
+        // aggregate — no scheduler can bond a link that the OS has switched
+        // off. requestNetwork is what asks for a transport to be brought up
+        // and held alongside the default, which is the whole premise here.
+        keepTransportUp(NetworkCapabilities.TRANSPORT_CELLULAR)
+        keepTransportUp(NetworkCapabilities.TRANSPORT_WIFI)
+
         val request = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
@@ -71,7 +89,40 @@ class NetworkMonitor(private val context: Context) {
         _activeNetworks.remove(network)
     }
 
+    /**
+     * Asks the system to bring up [transport] and hold it, in addition to
+     * whatever the default network is. The callback is intentionally empty:
+     * holding the request open is the entire effect, and paths are still
+     * discovered through the observing callback so a network is never counted
+     * twice.
+     *
+     * Costs real battery and, on cellular, real data — which is the bargain a
+     * bonding VPN makes on purpose. Released in [stop] with the tunnel.
+     */
+    private fun keepTransportUp(transport: Int) {
+        val request = NetworkRequest.Builder()
+            .addTransportType(transport)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        val cb = object : ConnectivityManager.NetworkCallback() {}
+        try {
+            cm.requestNetwork(request, cb)
+            keepAlive += cb
+        } catch (e: SecurityException) {
+            // CHANGE_NETWORK_STATE missing: fall back to observing only, which
+            // still works — with one path at a time.
+            Log.w(TAG, "cannot hold transport $transport up: ${e.message}")
+        } catch (e: RuntimeException) {
+            // Too many outstanding requests, or a transport this device lacks.
+            Log.w(TAG, "requestNetwork($transport) rejected: ${e.message}")
+        }
+    }
+
     fun stop() {
+        for (cb in keepAlive) {
+            try { cm.unregisterNetworkCallback(cb) } catch (_: IllegalArgumentException) {}
+        }
+        keepAlive.clear()
         callback?.let { cm.unregisterNetworkCallback(it) }
         callback = null
         _activeNetworks.clear()
