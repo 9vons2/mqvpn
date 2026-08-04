@@ -27,6 +27,7 @@ import com.mqvpn.app.R
 import com.mqvpn.app.data.SettingsRepository
 import com.mqvpn.app.net.ProviderDirectory
 import com.mqvpn.app.ui.SpeedTracker
+import com.mqvpn.app.ui.formatBps
 import com.mqvpn.sdk.core.MqvpnVpnService
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnError
@@ -117,6 +118,14 @@ class MyVpnService : MqvpnVpnService() {
                 } else {
                     setPaused(null)
                     clearStopRequest()
+                    // Header for the run: without it a trace cannot be read
+                    // back against the settings it was produced under. No
+                    // server address or key — this log gets shared.
+                    diag.log(
+                        "starting: scheduler=${config.scheduler.name} " +
+                            "reorder=${config.reorderEnabled} hybrid=${config.hybridEnabled} " +
+                            "trustedSsids=${trusted.size} excludedApps=${config.excludedApps.size}",
+                    )
                     startTunnel(config)
                 }
                 startTrustedWifiWatcher(trusted)
@@ -491,6 +500,38 @@ class MyVpnService : MqvpnVpnService() {
             withShare, aggDown, aggUp, notifHistory.toList(), lastConfig?.scheduler?.name ?: "",
         )
         updateRichNotification(content)
+        logThroughput(withShare, aggDown, aggUp, now)
+    }
+
+    private var lastThroughputLogMs = 0L
+
+    /**
+     * Periodic throughput line — the one record that answers "is the bandwidth
+     * actually adding up", which no amount of path-lifecycle logging can.
+     *
+     * Written on a fixed interval rather than per tick (this runs ~1 Hz and
+     * would drown everything else), and only while at least one path is
+     * carrying, so a parked phone does not fill the ring with zeroes.
+     */
+    private fun logThroughput(
+        paths: List<NotifPath>,
+        aggDown: Double,
+        aggUp: Double,
+        now: Long,
+    ) {
+        if (aggDown <= 0 && aggUp <= 0) return
+        if (now - lastThroughputLogMs < THROUGHPUT_LOG_INTERVAL_MS) return
+        lastThroughputLogMs = now
+
+        val split = paths
+            .sortedByDescending { it.downBps }
+            .joinToString(" · ") { p ->
+                "${p.label} ${(p.share * 100).toInt()}% (↓${formatBps(p.downBps)})"
+            }
+        diag.log(
+            "throughput ↓${formatBps(aggDown)} ↑${formatBps(aggUp)} " +
+                "over ${paths.size} path(s): $split",
+        )
     }
 
     // --- Diagnostics ---
@@ -527,9 +568,12 @@ class MyVpnService : MqvpnVpnService() {
             // name (a replacement created before its predecessor is reaped),
             // and without it the trace reads as one path contradicting itself.
             if (prevStatus == null) {
-                diag.log("path ${p.iface}#${p.handle} appeared (status=${p.status})")
+                diag.log("path ${p.iface}#${p.handle} \"${pathLabel(p.iface)}\" appeared (status=${p.status})")
             } else if (prevStatus != p.status) {
-                diag.log("path ${p.iface}#${p.handle} status $prevStatus → ${p.status}")
+                diag.log(
+                    "path ${p.iface}#${p.handle} \"${pathLabel(p.iface)}\" " +
+                        "status $prevStatus → ${p.status}",
+                )
             }
 
             val prev = diagPrev.put(p.handle, p.bytesTx to p.bytesRx)
@@ -542,7 +586,10 @@ class MyVpnService : MqvpnVpnService() {
                     if (diagReported.remove(p.handle)) {
                         val since = diagSilentSince[p.handle]
                         val secs = if (since != null) (now - since) / 1000 else 0
-                        diag.log("path ${p.iface}#${p.handle} answering again after ${secs}s of silence")
+                        diag.log(
+                            "path ${p.iface}#${p.handle} \"${pathLabel(p.iface)}\" " +
+                                "answering again after ${secs}s of silence",
+                        )
                     }
                     diagSilentSince.remove(p.handle)
                 }
@@ -551,8 +598,9 @@ class MyVpnService : MqvpnVpnService() {
                     val silentMs = now - since
                     if (silentMs >= SILENT_REPORT_MS && diagReported.add(p.handle)) {
                         diag.log(
-                            "path ${p.iface}#${p.handle} SILENT: sending for ${silentMs / 1000}s with no " +
-                                "reply (srtt still reports ${p.srttMs} ms, status=${p.status})",
+                            "path ${p.iface}#${p.handle} \"${pathLabel(p.iface)}\" SILENT: " +
+                                "sending for ${silentMs / 1000}s with no reply " +
+                                "(srtt still reports ${p.srttMs} ms, status=${p.status})",
                         )
                     }
                 }
@@ -569,6 +617,20 @@ class MyVpnService : MqvpnVpnService() {
             diagSilentSince.remove(handle)
             diagReported.remove(handle)
         }
+    }
+
+    /**
+     * Human name for a path key, for the diagnostics trace.
+     *
+     * Without this every Wi-Fi reads as "wifi-13" and a log covering both a
+     * direct Starlink link and an OMR router's Wi-Fi is impossible to tell
+     * apart afterwards — which matters, because a tunnel running on top of a
+     * router that already bonds its own uplinks behaves nothing like a direct
+     * link.
+     */
+    private fun pathLabel(iface: String): String {
+        val auto = providers.labels.value[iface] ?: SpeedTracker.fallbackLabel(iface)
+        return customProviderNames()[auto.lowercase()] ?: auto
     }
 
     /** Best-effort custom provider names (set via the rename dialog). */
@@ -683,6 +745,12 @@ class MyVpnService : MqvpnVpnService() {
 
         /** Sparkline width — ~30 s of history at one sample per second. */
         private const val NOTIF_HISTORY = 30
+
+        /**
+         * How often the throughput summary is written. 30 s keeps a full day of
+         * driving inside the 64 KB ring while still showing how the split moves.
+         */
+        private const val THROUGHPUT_LOG_INTERVAL_MS = 30_000L
 
         /** Silence before a path is written to the trace as not answering. */
         private const val SILENT_REPORT_MS = 5_000L
