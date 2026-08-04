@@ -108,7 +108,6 @@ class MqvpnViewModel(
                 when (it) {
                     is MqvpnState.Connected, is MqvpnState.Reconnecting -> {
                         if (tickerJob?.isActive != true) {
-                            providers.start()
                             tickerJob = viewModelScope.launch { bandwidthTickerLoop() }
                         }
                     }
@@ -117,7 +116,6 @@ class MqvpnViewModel(
                         tickerJob = null
                         bandwidth.clear()
                         _bandwidthHistory.value = BandwidthHistoryState()
-                        providers.stop()
                         speedTracker.reset()
                         _throughput.value = ThroughputUi()
                     }
@@ -188,7 +186,10 @@ class MqvpnViewModel(
     fun prepareVpn(): Intent? = manager.prepareVpn()
 
     override fun onCleared() {
-        providers.stop()
+        // ProviderDirectory is deliberately NOT stopped here. MyVpnService
+        // owns it now: the notification needs carrier and SSID names for as
+        // long as the tunnel runs, and this ViewModel dies whenever the user
+        // leaves the app — which on the road is most of the time.
         manager.destroy()
     }
 }

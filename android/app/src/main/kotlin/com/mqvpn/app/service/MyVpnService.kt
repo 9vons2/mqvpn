@@ -25,8 +25,8 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.getSystemService
 import com.mqvpn.app.R
 import com.mqvpn.app.data.SettingsRepository
+import com.mqvpn.app.net.ProviderDirectory
 import com.mqvpn.app.ui.SpeedTracker
-import com.mqvpn.app.ui.formatBps
 import com.mqvpn.sdk.core.MqvpnVpnService
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnError
@@ -48,6 +48,14 @@ class MyVpnService : MqvpnVpnService() {
 
     @Inject lateinit var settingsRepo: SettingsRepository
 
+    /**
+     * Resolves "wifi-13" to "Starlink" / "Kyivstar" for the notification.
+     * The service owns its lifecycle rather than the ViewModel: names are
+     * needed for as long as the tunnel runs, and the ViewModel only exists
+     * while someone has the app open — which, on the road, is nobody.
+     */
+    @Inject lateinit var providers: ProviderDirectory
+
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     private val diag: DiagnosticsLog by lazy { diagnosticsLog(applicationContext) }
@@ -56,6 +64,7 @@ class MyVpnService : MqvpnVpnService() {
         super.onCreate()
         isRunning = true
         createNotificationChannel()
+        providers.start()
         diag.log("service created")
     }
 
@@ -153,6 +162,8 @@ class MyVpnService : MqvpnVpnService() {
                 connectedForNotif = true
                 lastNotifPollMs = 0L
                 notifPrev.clear()
+                notifSilentSince.clear()
+                notifHistory.clear()
                 diagPathStatus.clear()
                 diagSilentSince.clear()
                 updateNotification("Connected: ${newState.tunnelInfo.assignedIp}")
@@ -222,6 +233,7 @@ class MyVpnService : MqvpnVpnService() {
 
     override fun onDestroy() {
         diag.log("service destroyed")
+        providers.stop()
         isRunning = false
         connectedForNotif = false
         TrustedPauseState.setPaused(null)
@@ -376,12 +388,20 @@ class MyVpnService : MqvpnVpnService() {
 
     private var connectedForNotif = false
     private var lastNotifPollMs = 0L
-    private val notifPrev = HashMap<String, Pair<Long, Long>>() // iface -> (tx, rx)
+    // Keyed by handle for the same reason the diagnostics maps are: a closed
+    // path and its replacement can share an iface name.
+    private val notifPrev = HashMap<Long, Pair<Long, Long>>()
+    private val notifSilentSince = HashMap<Long, Long>()
+    private val notifHistory = ArrayDeque<Double>()
 
     /**
-     * Refreshes the ongoing notification with per-provider down/up rates, at
-     * most ~once a second (which also yields a clean per-second rate). Only
-     * while actively connected — paused/reconnecting keep their text.
+     * Rebuilds the ongoing notification about once a second — which is also
+     * the rate-averaging window. Only while actively connected; paused and
+     * reconnecting keep their own text.
+     *
+     * Closed paths are dropped: they carry nothing, and showing a dead entry
+     * beside its live replacement under the same provider name is worse than
+     * saying nothing. The diagnostics log is where their fate is recorded.
      */
     override fun onPathsPolled(paths: List<PathInfo>) {
         diagnosePaths(paths)
@@ -391,29 +411,61 @@ class MyVpnService : MqvpnVpnService() {
         val dt = (now - lastNotifPollMs) / 1000.0
         if (!first && dt < NOTIF_MIN_INTERVAL_SEC) return
 
+        val active = paths.filter { it.status != SpeedTracker.STATUS_CLOSED }
         val overrides = customProviderNames()
+        val autoLabels = providers.labels.value
+
         var aggDown = 0.0
         var aggUp = 0.0
-        val lines = ArrayList<String>(paths.size)
-        for (p in paths) {
-            val prev = notifPrev[p.iface]
-            if (!first && prev != null && dt > 0) {
-                val down = (p.bytesRx - prev.second).coerceAtLeast(0) * 8 / dt
-                val up = (p.bytesTx - prev.first).coerceAtLeast(0) * 8 / dt
-                aggDown += down
-                aggUp += up
-                val auto = SpeedTracker.fallbackLabel(p.iface)
-                val label = overrides[auto.lowercase()] ?: auto
-                lines += "$label   ↓ ${formatBps(down)}  ↑ ${formatBps(up)} · ${p.srttMs} ms"
-            }
-            notifPrev[p.iface] = p.bytesTx to p.bytesRx
-        }
-        notifPrev.keys.retainAll(paths.map { it.iface }.toSet())
-        lastNotifPollMs = now
-        if (first || lines.isEmpty()) return // baseline tick: no rates yet
+        val rows = ArrayList<NotifPath>(active.size)
 
-        val aggregate = "↓ ${formatBps(aggDown)}   ↑ ${formatBps(aggUp)}"
-        updateRichNotification(aggregate, (listOf(aggregate) + lines).joinToString("\n"))
+        for (p in active) {
+            val prev = notifPrev.put(p.handle, p.bytesTx to p.bytesRx)
+            if (first || prev == null || dt <= 0) continue
+
+            val down = (p.bytesRx - prev.second).coerceAtLeast(0) * 8 / dt
+            val up = (p.bytesTx - prev.first).coerceAtLeast(0) * 8 / dt
+            aggDown += down
+            aggUp += up
+
+            // Same "sending into silence" test the dashboard uses: srtt cannot
+            // fall on a dead link, so it must not be what marks one healthy.
+            if (p.bytesRx > prev.second) {
+                notifSilentSince.remove(p.handle)
+            } else if (p.bytesTx > prev.first) {
+                notifSilentSince.putIfAbsent(p.handle, now)
+            }
+            val silentSince = notifSilentSince[p.handle]
+            val noReply = if (silentSince != null && now - silentSince >= SpeedTracker.NO_REPLY_WARN_MS) {
+                now - silentSince
+            } else {
+                0L
+            }
+
+            val auto = autoLabels[p.iface] ?: SpeedTracker.fallbackLabel(p.iface)
+            rows += NotifPath(
+                label = overrides[auto.lowercase()] ?: auto,
+                downBps = down, upBps = up, srttMs = p.srttMs,
+                noReplyMs = noReply, status = p.status, share = 0f,
+            )
+        }
+        notifPrev.keys.retainAll(paths.map { it.handle }.toSet())
+        notifSilentSince.keys.retainAll(notifPrev.keys)
+        lastNotifPollMs = now
+        if (first || rows.isEmpty()) return // baseline tick: no rates yet
+
+        notifHistory.addLast(aggDown)
+        while (notifHistory.size > NOTIF_HISTORY) notifHistory.removeFirst()
+
+        val withShare = if (aggDown > 0) {
+            rows.map { it.copy(share = (it.downBps / aggDown).toFloat()) }
+        } else {
+            rows
+        }
+        val content = NotificationRender.render(
+            withShare, aggDown, aggUp, notifHistory.toList(), lastConfig?.scheduler?.name ?: "",
+        )
+        updateRichNotification(content)
     }
 
     // --- Diagnostics ---
@@ -559,10 +611,24 @@ class MyVpnService : MqvpnVpnService() {
     }
 
     /** Collapsed line = aggregate; expanded = one row per provider. */
-    private fun updateRichNotification(collapsed: String, expanded: String) {
+    /**
+     * Collapsed line = aggregate plus whichever link needs attention;
+     * expanded = a row per provider. Colorized so the lock screen answers
+     * "is the link OK" before a word is read — allowed here because this is
+     * a foreground service notification.
+     */
+    private fun updateRichNotification(content: NotifContent) {
+        val tint = when (content.health) {
+            Health.OK -> 0xFF2E7D32.toInt()
+            Health.WARN -> 0xFFEF6C00.toInt()
+            Health.BAD -> 0xFFC62828.toInt()
+        }
         val n = baseNotification()
-            .setContentText(collapsed)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(expanded))
+            .setContentText(content.collapsed)
+            .setSubText(content.subText)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(content.expanded))
+            .setColorized(true)
+            .setColor(tint)
             .build()
         getSystemService<NotificationManager>()?.notify(NOTIFICATION_ID, n)
     }
@@ -586,6 +652,9 @@ class MyVpnService : MqvpnVpnService() {
 
         // Notification speed refresh cadence (also the rate-averaging window).
         private const val NOTIF_MIN_INTERVAL_SEC = 1.0
+
+        /** Sparkline width — ~30 s of history at one sample per second. */
+        private const val NOTIF_HISTORY = 30
 
         /** Silence before a path is written to the trace as not answering. */
         private const val SILENT_REPORT_MS = 5_000L
