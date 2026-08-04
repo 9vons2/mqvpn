@@ -28,12 +28,15 @@ import com.mqvpn.app.data.SettingsRepository
 import com.mqvpn.app.net.ProviderDirectory
 import com.mqvpn.app.ui.SpeedTracker
 import com.mqvpn.app.ui.formatBps
+import com.mqvpn.app.ui.formatBytes
 import com.mqvpn.sdk.core.MqvpnVpnService
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnError
 import com.mqvpn.sdk.core.model.MqvpnState
 import com.mqvpn.sdk.core.model.PathInfo
+import com.mqvpn.sdk.core.model.ReorderStats
 import com.mqvpn.sdk.core.model.TunnelInfo
+import com.mqvpn.sdk.core.model.VpnStats
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -66,7 +69,17 @@ class MyVpnService : MqvpnVpnService() {
         isRunning = true
         createNotificationChannel()
         providers.start()
+        netTrace.start()
         diag.log("service created")
+    }
+
+    /**
+     * Android's view of the links, traced next to libmqvpn's. Started with the
+     * service rather than with the tunnel: the interesting stretches are the
+     * ones where the tunnel is down and only the OS has anything to say.
+     */
+    private val netTrace: NetworkTrace by lazy {
+        NetworkTrace(applicationContext, ::pathLabel) { diag.log(it) }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -172,7 +185,20 @@ class MyVpnService : MqvpnVpnService() {
     }
 
     override fun onVpnStateChanged(newState: MqvpnState) {
-        diag.log("state → ${newState::class.simpleName}")
+        val now = System.currentTimeMillis()
+        val name = newState::class.simpleName
+        // How long the previous state held is what turns the trace into a
+        // timeline: "Connecting for 26s then Error" and "Connecting for 2s
+        // then Connected" are the same two lines without it.
+        val held = if (stateSinceMs == 0L) null else (now - stateSinceMs) / 1000
+        diag.log(
+            "state → $name" +
+                if (held != null) " (was $lastStateName for ${held}s)" else "",
+        )
+        lastStateName = name
+        stateSinceMs = now
+        if (newState !is MqvpnState.Connected && downSinceMs == 0L) downSinceMs = now
+
         when (newState) {
             is MqvpnState.Connected -> {
                 connectedForNotif = true
@@ -182,7 +208,19 @@ class MyVpnService : MqvpnVpnService() {
                 notifHistory.clear()
                 diagPathStatus.clear()
                 diagSilentSince.clear()
-                updateNotification("Connected: ${newState.tunnelInfo.assignedIp}")
+                // The cost of the outage, in the two numbers that matter: how
+                // long the user had no tunnel, and how many tries it took.
+                // A backoff stuck at its ceiling shows up here as a small
+                // attempt count against a very large downtime.
+                val i = newState.tunnelInfo
+                val downFor = if (downSinceMs == 0L) 0 else (now - downSinceMs) / 1000
+                diag.log(
+                    "CONNECTED ${i.assignedIp}/${i.prefix} mtu=${i.mtu} v6=${i.hasV6} " +
+                        "after ${downFor}s down and $reconnectAttempts reconnect attempt(s)",
+                )
+                downSinceMs = 0L
+                reconnectAttempts = 0
+                updateNotification("Connected: ${i.assignedIp}")
             }
             is MqvpnState.Reconnecting -> {
                 connectedForNotif = false
@@ -253,12 +291,18 @@ class MyVpnService : MqvpnVpnService() {
     }
 
     override fun onReconnectScheduled(delaySec: Int) {
-        diag.log("reconnect scheduled in ${delaySec}s")
+        reconnectAttempts++
+        val downFor = if (downSinceMs == 0L) 0 else (System.currentTimeMillis() - downSinceMs) / 1000
+        diag.log(
+            "reconnect #$reconnectAttempts scheduled in ${delaySec}s " +
+                "(tunnel down ${downFor}s)",
+        )
         updateNotification("Reconnecting in ${delaySec}s...")
     }
 
     override fun onDestroy() {
         diag.log("service destroyed")
+        netTrace.stop()
         providers.stop()
         isRunning = false
         connectedForNotif = false
@@ -545,6 +589,17 @@ class MyVpnService : MqvpnVpnService() {
     private val diagPrev = HashMap<Long, Pair<Long, Long>>()
     private val diagSilentSince = HashMap<Long, Long>()
     private val diagReported = HashSet<Long>()
+    private val diagBornAt = HashMap<Long, Long>()
+    private var lastSnapshotMs = 0L
+    private var lastStatsLogMs = 0L
+    private var prevDgram: Triple<Long, Long, Long>? = null
+
+    // Outage accounting. downSinceMs is the moment the tunnel stopped being
+    // Connected; both are cleared the moment it is Connected again.
+    private var stateSinceMs = 0L
+    private var lastStateName: String? = null
+    private var downSinceMs = 0L
+    private var reconnectAttempts = 0
 
     /**
      * Records path lifecycle and, more importantly, the failure this app keeps
@@ -568,8 +623,20 @@ class MyVpnService : MqvpnVpnService() {
             // name (a replacement created before its predecessor is reaped),
             // and without it the trace reads as one path contradicting itself.
             if (prevStatus == null) {
+                diagBornAt[p.handle] = now
                 diag.log("path ${p.iface}#${p.handle} \"${pathLabel(p.iface)}\" appeared (status=${p.status})")
             } else if (prevStatus != p.status) {
+                // A path reaching CLOSED is the end of its life — record what it
+                // managed to carry, since from Android there is no way to
+                // revive it (reactivate_path is not exposed through JNI) and
+                // this is the last thing the trace will ever say about it.
+                if (p.status == SpeedTracker.STATUS_CLOSED) {
+                    val lived = diagBornAt[p.handle]?.let { (now - it) / 1000 } ?: -1
+                    diag.log(
+                        "path ${p.iface}#${p.handle} \"${pathLabel(p.iface)}\" CLOSED after " +
+                            "${lived}s alive, carried ↓${formatBytes(p.bytesRx)} ↑${formatBytes(p.bytesTx)}",
+                    )
+                }
                 diag.log(
                     "path ${p.iface}#${p.handle} \"${pathLabel(p.iface)}\" " +
                         "status $prevStatus → ${p.status}",
@@ -616,7 +683,60 @@ class MyVpnService : MqvpnVpnService() {
             diagPrev.remove(handle)
             diagSilentSince.remove(handle)
             diagReported.remove(handle)
+            diagBornAt.remove(handle)
         }
+
+        logPathSnapshot(paths, now)
+    }
+
+    /**
+     * Full roll-call of every path on a fixed interval, transitions or not.
+     *
+     * Event-only logging answers "what changed" but never "what is the state
+     * right now" — and a trace read hours later, after a stretch with no
+     * events, cannot distinguish a healthy idle tunnel from a wedged one.
+     */
+    private fun logPathSnapshot(paths: List<PathInfo>, now: Long) {
+        if (now - lastSnapshotMs < SNAPSHOT_INTERVAL_MS) return
+        lastSnapshotMs = now
+        if (paths.isEmpty()) {
+            diag.log("snapshot: no paths at all")
+            return
+        }
+        val rows = paths.joinToString(" | ") { p ->
+            val silent = diagSilentSince[p.handle]?.let { " silent=${(now - it) / 1000}s" } ?: ""
+            "${p.iface}#${p.handle} \"${pathLabel(p.iface)}\" st=${p.status} " +
+                "srtt=${p.srttMs}ms ↓${formatBytes(p.bytesRx)} ↑${formatBytes(p.bytesTx)}$silent"
+        }
+        diag.log("snapshot: $rows")
+    }
+
+    /**
+     * Tunnel-wide counters. Datagram loss is a property of the connection, not
+     * of any path, so it cannot be inferred from the per-path rows above — and
+     * a rising lost/sent ratio is the clearest early sign of a link going bad
+     * while it still technically answers.
+     */
+    override fun onStatsPolled(stats: VpnStats, reorder: ReorderStats) {
+        if (!connectedForNotif || pausedOnTrustedWifi) return
+        val now = System.currentTimeMillis()
+        if (now - lastStatsLogMs < STATS_LOG_INTERVAL_MS) return
+        lastStatsLogMs = now
+
+        val prev = prevDgram
+        prevDgram = Triple(stats.dgramSent, stats.dgramRecv, stats.dgramLost)
+        if (prev == null) return // first sample is a baseline, deltas need two
+
+        val dSent = stats.dgramSent - prev.first
+        val dRecv = stats.dgramRecv - prev.second
+        val dLost = stats.dgramLost - prev.third
+        val lossPct = if (dSent > 0) dLost * 100.0 / dSent else 0.0
+        diag.log(
+            "tunnel: dgram +${dSent} sent +${dRecv} recv +${dLost} lost " +
+                "(${"%.1f".format(lossPct)}% this window) srtt=${stats.srttMs}ms · " +
+                "reorder gaps=${reorder.gapCount} filled=${reorder.gapFilled} " +
+                "timeout=${reorder.gapTimeout} bufP99=${reorder.bufferedP99Ms}ms",
+        )
     }
 
     /**
@@ -751,6 +871,12 @@ class MyVpnService : MqvpnVpnService() {
          * driving inside the 64 KB ring while still showing how the split moves.
          */
         private const val THROUGHPUT_LOG_INTERVAL_MS = 30_000L
+
+        /** Full path roll-call cadence — answers "what is the state now". */
+        private const val SNAPSHOT_INTERVAL_MS = 60_000L
+
+        /** Tunnel-wide counter cadence (datagram loss, reorder). */
+        private const val STATS_LOG_INTERVAL_MS = 60_000L
 
         /** Silence before a path is written to the trace as not answering. */
         private const val SILENT_REPORT_MS = 5_000L

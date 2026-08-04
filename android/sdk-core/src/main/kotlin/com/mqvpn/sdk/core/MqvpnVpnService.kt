@@ -17,7 +17,9 @@ import com.mqvpn.sdk.core.model.MqvpnError
 import com.mqvpn.sdk.core.model.MqvpnState
 import com.mqvpn.sdk.core.model.PathInfo
 import com.mqvpn.sdk.core.model.ReconnectInfo
+import com.mqvpn.sdk.core.model.ReorderStats
 import com.mqvpn.sdk.core.model.TunnelInfo
+import com.mqvpn.sdk.core.model.VpnStats
 import com.mqvpn.sdk.network.NetworkMonitor
 import com.mqvpn.sdk.runtime.MqvpnPoller
 import kotlinx.coroutines.CoroutineScope
@@ -71,11 +73,14 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
                 val result = t?.tick() ?: 0
                 // Poll stats/paths and push to MqvpnManager on each tick
                 if (t != null) {
-                    manager?.updateStats(t.getStats())
+                    val polledStats = t.getStats()
+                    manager?.updateStats(polledStats)
                     val polledPaths = t.getPaths()
                     manager?.updatePaths(polledPaths)
                     onPathsPolled(polledPaths)
-                    manager?.updateReorderStats(t.getReorderStats())
+                    val polledReorder = t.getReorderStats()
+                    manager?.updateReorderStats(polledReorder)
+                    onStatsPolled(polledStats, polledReorder)
                 }
                 result
             },
@@ -288,6 +293,13 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
 
     /** Per-tick snapshot of live paths — subclasses may surface throughput. */
     open fun onPathsPolled(paths: List<PathInfo>) {}
+
+    /**
+     * Per-tick tunnel-wide counters. Separate from [onPathsPolled] because
+     * datagram loss and reorder behaviour are properties of the connection,
+     * not of any one path, and diagnosing a flaky link needs both.
+     */
+    open fun onStatsPolled(stats: VpnStats, reorder: ReorderStats) {}
 
     // --- Helpers ---
 
