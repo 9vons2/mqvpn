@@ -16,7 +16,8 @@ class SpeedTrackerTest {
         tx: Long,
         rx: Long,
         handle: Long = 1L,
-    ) = PathInfo(handle = handle, status = 1, iface = iface, bytesTx = tx, bytesRx = rx, srttMs = 10)
+        status: Int = 1,
+    ) = PathInfo(handle = handle, status = status, iface = iface, bytesTx = tx, bytesRx = rx, srttMs = 10)
 
     @Test
     fun `first sample reports zero rate`() {
@@ -199,5 +200,33 @@ class SpeedTrackerTest {
             emptyMap(), emptyMap(), 2000,
         )
         assertEquals(0f, idle.paths.first().downShare, 0.0f)
+    }
+
+    /**
+     * get_paths() keeps closed paths listed, and a re-created path reuses its
+     * iface name. Both entries then land under one key and the dead one, whose
+     * counters never move again, would overwrite the live one's rates.
+     */
+    @Test
+    fun `closed paths are excluded so a dead entry cannot mask its replacement`() {
+        val t = SpeedTracker()
+        t.update(
+            listOf(
+                path("wifi-1", tx = 500, rx = 500, handle = 1L, status = 4),
+                path("wifi-1", tx = 0, rx = 0, handle = 2L),
+            ),
+            emptyMap(), emptyMap(), 0,
+        )
+        val ui = t.update(
+            listOf(
+                path("wifi-1", tx = 500, rx = 500, handle = 1L, status = 4),
+                path("wifi-1", tx = 1_000, rx = 2_000, handle = 2L),
+            ),
+            emptyMap(), emptyMap(), 1000,
+        )
+
+        assertEquals(1, ui.paths.size)
+        assertEquals(16_000.0, ui.paths.single().downBps, 0.01)
+        assertEquals(8_000.0, ui.paths.single().upBps, 0.01)
     }
 }

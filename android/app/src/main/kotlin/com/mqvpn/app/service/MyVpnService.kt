@@ -29,6 +29,7 @@ import com.mqvpn.app.ui.SpeedTracker
 import com.mqvpn.app.ui.formatBps
 import com.mqvpn.sdk.core.MqvpnVpnService
 import com.mqvpn.sdk.core.model.MqvpnConfig
+import com.mqvpn.sdk.core.model.MqvpnError
 import com.mqvpn.sdk.core.model.MqvpnState
 import com.mqvpn.sdk.core.model.PathInfo
 import com.mqvpn.sdk.core.model.TunnelInfo
@@ -170,10 +171,39 @@ class MyVpnService : MqvpnVpnService() {
                 connectedForNotif = false
                 diag.log("ERROR ${newState.error.message}")
                 updateNotification("Error: ${newState.error.message}")
-                stopSelf()
+                // Do NOT stop here for a dropped connection. libmqvpn reports
+                // the close first and only then decides whether to reconnect —
+                // and that decision is `!shutting_down && reconnect_enable`.
+                // Stopping the service runs cleanup(), which sets
+                // shutting_down, so stopSelf() on every error was racing the
+                // library and, whenever it won, permanently disabling the
+                // reconnect the user had configured. That is the tunnel that
+                // "hangs" on the road and needs a manual reconnect.
+                //
+                // Only give up on errors no retry can fix.
+                if (isFatal(newState.error)) {
+                    diag.log("fatal — stopping service")
+                    stopSelf()
+                } else {
+                    diag.log("waiting for the library to reconnect")
+                }
             }
             else -> {}
         }
+    }
+
+    /**
+     * Errors where retrying is pointless: no amount of reconnecting fixes a
+     * wrong key, a rejected certificate, or a TUN the OS refused to hand over.
+     * Everything else — dropped connections above all — is exactly what the
+     * reconnect logic exists for.
+     */
+    private fun isFatal(error: MqvpnError): Boolean = when (error) {
+        is MqvpnError.TunCreationFailed,
+        is MqvpnError.AuthFailed,
+        is MqvpnError.AbiMismatch,
+        -> true
+        else -> false
     }
 
     override fun onLog(level: Int, message: String) {
@@ -388,10 +418,15 @@ class MyVpnService : MqvpnVpnService() {
 
     // --- Diagnostics ---
 
-    private val diagPathStatus = HashMap<String, Int>()      // iface -> last logged status
-    private val diagPrev = HashMap<String, Pair<Long, Long>>() // iface -> (tx, rx)
-    private val diagSilentSince = HashMap<String, Long>()     // iface -> first tx-without-rx tick
-    private val diagReported = HashSet<String>()              // ifaces already logged as silent
+    // Keyed by path handle, NOT by iface. get_paths() returns closed paths
+    // alongside live ones, and a re-created path reuses its iface name, so two
+    // entries can share it — an iface-keyed map then flip-flops between their
+    // statuses on every single poll tick and floods the log with phantom
+    // transitions. The handle is the only stable per-path identity.
+    private val diagPathStatus = HashMap<Long, Int>()
+    private val diagPrev = HashMap<Long, Pair<Long, Long>>()
+    private val diagSilentSince = HashMap<Long, Long>()
+    private val diagReported = HashSet<Long>()
 
     /**
      * Records path lifecycle and, more importantly, the failure this app keeps
@@ -406,35 +441,35 @@ class MyVpnService : MqvpnVpnService() {
      */
     private fun diagnosePaths(paths: List<PathInfo>) {
         val now = System.currentTimeMillis()
-        val seen = HashSet<String>()
+        val seen = HashSet<Long>()
 
         for (p in paths) {
-            seen += p.iface
-            val prevStatus = diagPathStatus.put(p.iface, p.status)
+            seen += p.handle
+            val prevStatus = diagPathStatus.put(p.handle, p.status)
             if (prevStatus == null) {
                 diag.log("path ${p.iface} appeared (status=${p.status})")
             } else if (prevStatus != p.status) {
                 diag.log("path ${p.iface} status $prevStatus → ${p.status}")
             }
 
-            val prev = diagPrev.put(p.iface, p.bytesTx to p.bytesRx)
+            val prev = diagPrev.put(p.handle, p.bytesTx to p.bytesRx)
             if (prev == null) continue
             val txMoved = p.bytesTx > prev.first
             val rxMoved = p.bytesRx > prev.second
 
             when {
                 rxMoved -> {
-                    if (diagReported.remove(p.iface)) {
-                        val since = diagSilentSince[p.iface]
+                    if (diagReported.remove(p.handle)) {
+                        val since = diagSilentSince[p.handle]
                         val secs = if (since != null) (now - since) / 1000 else 0
                         diag.log("path ${p.iface} answering again after ${secs}s of silence")
                     }
-                    diagSilentSince.remove(p.iface)
+                    diagSilentSince.remove(p.handle)
                 }
                 txMoved -> {
-                    val since = diagSilentSince.getOrPut(p.iface) { now }
+                    val since = diagSilentSince.getOrPut(p.handle) { now }
                     val silentMs = now - since
-                    if (silentMs >= SILENT_REPORT_MS && diagReported.add(p.iface)) {
+                    if (silentMs >= SILENT_REPORT_MS && diagReported.add(p.handle)) {
                         diag.log(
                             "path ${p.iface} SILENT: sending for ${silentMs / 1000}s with no " +
                                 "reply (srtt still reports ${p.srttMs} ms, status=${p.status})",
@@ -447,12 +482,12 @@ class MyVpnService : MqvpnVpnService() {
         }
 
         val gone = diagPathStatus.keys - seen
-        for (iface in gone) {
-            diag.log("path $iface gone")
-            diagPathStatus.remove(iface)
-            diagPrev.remove(iface)
-            diagSilentSince.remove(iface)
-            diagReported.remove(iface)
+        for (handle in gone) {
+            diag.log("path handle $handle gone")
+            diagPathStatus.remove(handle)
+            diagPrev.remove(handle)
+            diagSilentSince.remove(handle)
+            diagReported.remove(handle)
         }
     }
 

@@ -85,13 +85,20 @@ class SpeedTracker(private val maxSamples: Int = MAX_SAMPLES) {
         val dtSec = if (lastAtMs == Long.MIN_VALUE) 0.0 else (nowMs - lastAtMs) / 1000.0
         lastAtMs = nowMs
 
-        val out = ArrayList<PathThroughput>(paths.size)
+        // libmqvpn keeps closed paths in get_paths(), and a re-created path
+        // reuses its iface name — so a dead entry and its live replacement can
+        // both be present under one key, and the dead one would overwrite the
+        // live one's rates. A closed path carries nothing; drop it here and let
+        // the diagnostics log (keyed by handle) be what records its fate.
+        val active = paths.filter { it.status != STATUS_CLOSED }
+
+        val out = ArrayList<PathThroughput>(active.size)
         val frame = LinkedHashMap<String, ThroughputFrame.Sample>()
         val seen = HashSet<String>()
         var aggDown = 0.0
         var aggUp = 0.0
 
-        for (p in paths) {
+        for (p in active) {
             val key = p.iface
             seen += key
             val slot = slots.getOrPut(key) { nextSlot++ }
@@ -162,6 +169,9 @@ class SpeedTracker(private val maxSamples: Int = MAX_SAMPLES) {
 
     companion object {
         const val MAX_SAMPLES = 60
+
+        /** MQVPN_PATH_CLOSED — mirrors mqvpn_path_status_t in libmqvpn.h. */
+        const val STATUS_CLOSED = 4
 
         /**
          * Silence after which a path is reported as not answering instead of
