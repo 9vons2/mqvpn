@@ -245,7 +245,21 @@ private fun PathsSection(
     ThroughputSection(throughput)
     Spacer(modifier = Modifier.height(4.dp))
     if (throughput.paths.isEmpty()) {
-        // First tick after connect has no rates yet — keep the raw rows visible.
+        // Two very different situations reach this branch, and conflating them
+        // is what made a dead tunnel look like a frozen screen: the first tick
+        // after connect (no rates computed yet) and every path closed (nothing
+        // left to compute). Say which one it is.
+        val allClosed = paths.isNotEmpty() &&
+            paths.all { it.status == SpeedTracker.STATUS_CLOSED }
+        if (allClosed) {
+            Text(
+                "No live path — the tunnel is carrying nothing. " +
+                    "Waiting for a network to come back.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+        }
         paths.forEach { path -> PathCard(path) }
     } else {
         throughput.paths.forEach { p ->
