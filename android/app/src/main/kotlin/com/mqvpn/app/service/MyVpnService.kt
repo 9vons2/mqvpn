@@ -44,7 +44,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.io.File
@@ -86,54 +85,6 @@ class MyVpnService : MqvpnVpnService() {
     }
 
     private var lastForcedRestartMs = 0L
-    private var restartAttempts = 0
-    private var restartPending = false
-
-    /**
-     * Brings the tunnel back after the library has stopped being able to.
-     *
-     * Error has two very different sequels and they were being treated as one.
-     * `Error → Reconnecting` means libmqvpn kept the connection and will retry
-     * on its own timer — leave it alone. `Error → Disconnected` is the exit
-     * from cleanup(), after which the tunnel object is gone and shutting_down
-     * is set, so nothing in the library will ever try again. Logging "staying
-     * up" there was self-deception: the service stayed alive with nothing left
-     * to stay alive for.
-     *
-     * The 08-05 trace shows the cost — 15:30:24 Disconnected, then three hours
-     * and twenty-seven minutes of nothing, with a validated Wi-Fi at -50 dBm
-     * sitting there the whole time. It only recovered because a new network
-     * eventually appeared and tripped the other rescue path. Without that it
-     * would still be down.
-     *
-     * Backoff is ours because the library's is gone with its connection.
-     * Capped, and reset by a successful connect.
-     */
-    private fun scheduleRestart() {
-        if (restartPending) return
-        val config = lastConfig ?: restoreConfig() ?: run {
-            diag.log("disconnected and no config to restart with — stopping")
-            stopSelf()
-            return
-        }
-        val delayMs = RESTART_BACKOFF_MS shl restartAttempts.coerceAtMost(RESTART_BACKOFF_SHIFT_MAX)
-        restartAttempts++
-        restartPending = true
-        diag.log(
-            "disconnected without a user request and the library will not retry — " +
-                "restarting in ${delayMs / 1000}s (attempt $restartAttempts)",
-        )
-        serviceScope.launch {
-            delay(delayMs)
-            withMain {
-                restartPending = false
-                // Anything that revived the tunnel while we waited — a new
-                // network, a resume from a trusted pause — wins over this.
-                if (userRequestedStop || pausedOnTrustedWifi || connectedForNotif) return@withMain
-                startTunnel(config)
-            }
-        }
-    }
 
     /**
      * Restarts the tunnel when a genuinely new transport shows up while it is
@@ -317,7 +268,6 @@ class MyVpnService : MqvpnVpnService() {
                 )
                 downSinceMs = 0L
                 reconnectAttempts = 0
-                restartAttempts = 0
                 updateNotification("Connected: ${i.assignedIp}")
             }
             is MqvpnState.Reconnecting -> {
@@ -337,7 +287,7 @@ class MyVpnService : MqvpnVpnService() {
                 when {
                     pausedOnTrustedWifi -> Unit // parked, watching for the network to change
                     userRequestedStop -> stopSelf()
-                    else -> scheduleRestart()
+                    else -> diag.log("disconnected without a user request — staying up")
                 }
             }
             is MqvpnState.Error -> {
@@ -1012,12 +962,6 @@ class MyVpnService : MqvpnVpnService() {
 
         /** Floor between forced restarts, so a flapping link cannot loop us. */
         private const val FORCED_RESTART_COOLDOWN_MS = 30_000L
-
-        /** First retry after the library has given up; doubles from here. */
-        private const val RESTART_BACKOFF_MS = 5_000L
-
-        /** Caps the doubling at 5s << 4 = 80s. */
-        private const val RESTART_BACKOFF_SHIFT_MAX = 4
 
         /**
          * Diagnostics live in device-protected storage: the service is
