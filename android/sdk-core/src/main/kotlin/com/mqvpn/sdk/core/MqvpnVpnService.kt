@@ -26,6 +26,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -142,6 +143,22 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
 
             monitor.start { event ->
                 scope.launch(Dispatchers.IO) { pm.handleEvent(event) }
+            }
+
+            // A path can die without its network going anywhere, and Android
+            // only reports the latter. Nothing else will ever notice, so this
+            // has to be a poll rather than an event. See
+            // PathManager.rebuildDeadPaths.
+            scope.launch(Dispatchers.IO) {
+                while (true) {
+                    delay(REAP_INTERVAL_MS)
+                    if (tunnel == null) break
+                    try {
+                        pm.rebuildDeadPaths()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "path rebuild failed", e)
+                    }
+                }
             }
 
             emitState(MqvpnState.Connecting)
@@ -311,5 +328,12 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
 
     companion object {
         private const val TAG = "MqvpnVpnService"
+
+        /**
+         * How often to look for paths that died over a network that is still
+         * there. Cheap — one getPaths() against an in-memory map — and the
+         * failure it catches otherwise lasts until the user reconnects by hand.
+         */
+        private const val REAP_INTERVAL_MS = 5_000L
     }
 }
