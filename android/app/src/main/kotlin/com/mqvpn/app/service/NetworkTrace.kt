@@ -50,6 +50,9 @@ class NetworkTrace(
 ) {
     private val cm = context.getSystemService(ConnectivityManager::class.java)
     private val seen = HashMap<String, NetSnapshot>()
+
+    /** Handle → key, so a loss names the network it actually belongs to. */
+    private val keyByHandle = HashMap<Long, String>()
     private var callback: ConnectivityManager.NetworkCallback? = null
     private var defaultCallback: ConnectivityManager.NetworkCallback? = null
     private var defaultKey: String? = null
@@ -98,10 +101,12 @@ class NetworkTrace(
         defaultCallback = null
         defaultKey = null
         seen.clear()
+        keyByHandle.clear()
     }
 
     private fun onCaps(network: Network, caps: NetworkCapabilities) {
         val key = keyOf(network, caps)
+        keyByHandle[network.networkHandle] = key
         val now = snapshot(caps)
         val line = describeChange(key, labelFor(key), seen[key], now) ?: return
         seen[key] = now
@@ -109,12 +114,14 @@ class NetworkTrace(
     }
 
     private fun onLostNetwork(network: Network) {
-        val suffix = "-${network.networkHandle and 0xFFF}"
-        val gone = seen.keys.filter { it.endsWith(suffix) }
-        for (key in gone) {
-            seen.remove(key)
-            sink("net down: $key \"${labelFor(key)}\"")
-        }
+        // The transport is not on the callback at loss time, so the key has to
+        // come from what this network was last seen as. Matching by suffix
+        // instead reported a loss for every transport that shared it — and the
+        // old suffix was a constant, so losing Wi-Fi always printed a phantom
+        // "cellular down" on the same line of the trace.
+        val key = keyByHandle.remove(network.networkHandle) ?: return
+        seen.remove(key)
+        sink("net down: $key \"${labelFor(key)}\"")
     }
 
     /** Same key libmqvpn paths carry, so the two traces line up by eye. */
@@ -123,9 +130,14 @@ class NetworkTrace(
             caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
             caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
             caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+            // Our own tunnel. It shows up on the default-network callback the
+            // moment the VPN takes over routing, and reading that as a mystery
+            // link wastes the reader's time.
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
             else -> "other"
         }
-        return "$transport-${network.networkHandle and 0xFFF}"
+        // netId, the identifying half of the handle. See ProviderDirectory.
+        return "$transport-${(network.networkHandle ushr 32) % 10000}"
     }
 
     private fun snapshot(caps: NetworkCapabilities) = NetSnapshot(

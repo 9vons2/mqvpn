@@ -50,10 +50,45 @@ class NetworkMonitorTest {
     }
 
     @Test
-    fun `networkName includes type and partial handle`() {
+    fun `networkName includes type and network id`() {
         val network = ShadowNetwork.newInstance(42)
-        val name = NetworkMonitor.networkName(network, PathType.WIFI)
-        assertTrue("name should start with 'wifi-', got: $name", name.startsWith("wifi-"))
+        assertEquals("wifi-42", NetworkMonitor.networkName(network, PathType.WIFI))
+    }
+
+    /**
+     * The name has to identify the network, not just its transport: two
+     * successive Wi-Fi networks are two different links, and libmqvpn keys
+     * paths by this string.
+     */
+    @Test
+    fun `two networks never share a name`() {
+        val a = NetworkMonitor.networkName(ShadowNetwork.newInstance(105), PathType.WIFI)
+        val b = NetworkMonitor.networkName(ShadowNetwork.newInstance(106), PathType.WIFI)
+        assertEquals("wifi-105", a)
+        assertEquals("wifi-106", b)
+    }
+
+    /**
+     * Regression: the id used to be `handle and 0xFFF`. Android builds the
+     * handle as `(netId shl 32) or 0xcafed00d`, so that mask returned
+     * `0xd00d and 0xFFF` — a constant 13 — for every network ever seen, and a
+     * whole field trace named five different Wi-Fi networks "wifi-13".
+     */
+    @Test
+    fun `the identity is not in the low bits of the handle`() {
+        for (netId in listOf(1L, 42L, 105L, 999L)) {
+            val handle = (netId shl 32) or 0xcafed00dL
+            assertEquals(13L, handle and 0xFFFL) // what the old code read
+            assertEquals(netId, NetworkMonitor.networkIdOf(handle))
+        }
+    }
+
+    /** Names must fit libmqvpn's `char iface[16]`. */
+    @Test
+    fun `the longest name still fits the native iface field`() {
+        val handle = (99999L shl 32) or 0xcafed00dL
+        val name = "cellular-${NetworkMonitor.networkIdOf(handle)}"
+        assertTrue("too long for char iface[16]: $name", name.length <= 15)
     }
 
     @Test

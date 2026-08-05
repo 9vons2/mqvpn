@@ -206,8 +206,13 @@ class MyVpnService : MqvpnVpnService() {
                 notifPrev.clear()
                 notifSilentSince.clear()
                 notifHistory.clear()
-                diagPathStatus.clear()
-                diagSilentSince.clear()
+                // Tunnel-wide counters belong to the QUIC connection and
+                // restart at zero with it, so a delta taken across a reconnect
+                // is negative nonsense. Paths outlive the connection and are
+                // handle-keyed, so their maps are deliberately NOT cleared —
+                // clearing them made every surviving path log "appeared"
+                // again after each reconnect.
+                prevDgram = null
                 // The cost of the outage, in the two numbers that matter: how
                 // long the user had no tunnel, and how many tries it took.
                 // A backoff stuck at its ceiling shows up here as a small
@@ -730,6 +735,9 @@ class MyVpnService : MqvpnVpnService() {
         val dSent = stats.dgramSent - prev.first
         val dRecv = stats.dgramRecv - prev.second
         val dLost = stats.dgramLost - prev.third
+        // Any counter going backwards means the connection was replaced
+        // between samples; re-baseline rather than print a negative delta.
+        if (dSent < 0 || dRecv < 0 || dLost < 0) return
         val lossPct = if (dSent > 0) dLost * 100.0 / dSent else 0.0
         diag.log(
             "tunnel: dgram +${dSent} sent +${dRecv} recv +${dLost} lost " +

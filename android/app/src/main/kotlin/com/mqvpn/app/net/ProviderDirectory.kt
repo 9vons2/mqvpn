@@ -109,7 +109,7 @@ class ProviderDirectory @Inject constructor(
 
     private fun onCaps(network: Network, caps: NetworkCapabilities) {
         val (prefix, label) = resolve(caps)
-        val key = "$prefix-${network.networkHandle and 0xFFF}"
+        val key = "$prefix-${networkId(network)}"
         val current = _labels.value
         if (current[key] != label) {
             _labels.value = current + (key to label)
@@ -118,9 +118,11 @@ class ProviderDirectory @Inject constructor(
 
     private fun onNetworkLost(network: Network) {
         // Key prefix is unknown at loss time; drop every entry with this
-        // handle suffix (collisions across transports are harmless — the
-        // entry re-appears on the next onCapabilitiesChanged).
-        val suffix = "-${network.networkHandle and 0xFFF}"
+        // network's suffix. Safe because the suffix is a netId, which is
+        // unique across transports — with the old `handle and 0xFFF` it was
+        // the constant 13 for every network, so losing Wi-Fi silently
+        // dropped the cellular label too.
+        val suffix = "-${networkId(network)}"
         _labels.value = _labels.value.filterKeys { !it.endsWith(suffix) }
     }
 
@@ -166,6 +168,16 @@ class ProviderDirectory @Inject constructor(
 
     companion object {
         private const val TAG = "ProviderDirectory"
+
+        /**
+         * The identifying half of a [Network] handle, which Android builds as
+         * `(netId shl 32) or 0xcafed00d`. Must stay byte-identical to
+         * sdk-network's `NetworkMonitor.networkName`, since these keys are
+         * matched against the path names libmqvpn reports — sdk-network is an
+         * `implementation` dependency of sdk-core, so it cannot be shared.
+         */
+        internal fun networkId(network: Network): Long =
+            (network.networkHandle ushr 32) % 10000
 
         // WifiManager.UNKNOWN_SSID (constant added in API 30; same literal before)
         private const val UNKNOWN_SSID = "<unknown ssid>"

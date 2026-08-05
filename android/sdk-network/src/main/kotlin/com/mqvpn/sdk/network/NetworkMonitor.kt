@@ -138,7 +138,24 @@ class NetworkMonitor(private val context: Context) {
             else -> PathType.OTHER
         }
 
+        /**
+         * Stable per-network path name.
+         *
+         * The identity lives in the HIGH half of the handle: Android builds
+         * it as `(netId << 32) | 0xcafed00d`. Masking the low 12 bits
+         * therefore returned `0xd00d and 0xFFF` — a constant 13 — for every
+         * network on every device, so all Wi-Fi networks (and all cellular
+         * ones) collapsed onto the same name and nothing could tell one
+         * incarnation of a link from the next. A field trace with five
+         * successive Wi-Fi networks named every one of them "wifi-13".
+         *
+         * Taken modulo 10000 so the longest name ("cellular-9999", 13 chars)
+         * still fits libmqvpn's `char iface[16]`.
+         */
         internal fun networkName(network: Network, type: PathType): String =
-            "${type.name.lowercase()}-${network.networkHandle and 0xFFF}"
+            "${type.name.lowercase()}-${networkIdOf(network.networkHandle)}"
+
+        /** Split out from [networkName] so the arithmetic can be pinned by a test. */
+        internal fun networkIdOf(handle: Long): Long = (handle ushr 32) % 10000
     }
 }
