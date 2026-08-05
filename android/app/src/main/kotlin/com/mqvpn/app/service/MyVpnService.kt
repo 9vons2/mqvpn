@@ -42,6 +42,7 @@ import com.mqvpn.sdk.core.model.VpnStats
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
@@ -409,6 +410,52 @@ class MyVpnService : MqvpnVpnService() {
      * home is exactly where you both press Connect and sit on the trusted
      * network, so the one case the feature exists for was the one it skipped.
      */
+    private var trustedList: List<String> = emptyList()
+
+    /** The Wi-Fi the phone is on, kept so the decision can be retaken later. */
+    private var currentWifi: Pair<Network, NetworkCapabilities>? = null
+    private var labelWatchJob: Job? = null
+
+    /**
+     * Decides whether this Wi-Fi should park the tunnel, or release it.
+     *
+     * Deliberately idempotent and safe to call repeatedly: both branches are
+     * guarded by [pausedOnTrustedWifi], which flips before any work happens,
+     * so re-running on every name update settles rather than oscillates.
+     */
+    private fun evaluateTrustedWifi(network: Network, caps: NetworkCapabilities) {
+        val trusted = trustedList
+        if (trusted.isEmpty()) return
+        val ssid = trustedSsidOf(network, caps) ?: return
+        when {
+            !pausedOnTrustedWifi && ssid in trusted -> {
+                // System Always-on VPN fights this feature: lockdown
+                // blackholes ALL traffic the moment we stop, and plain
+                // always-on force-restarts us in a loop. Warn instead.
+                if (Build.VERSION.SDK_INT >= 29 && (isAlwaysOn || isLockdownEnabled)) {
+                    Log.w(
+                        TAG,
+                        "trusted Wi-Fi \"$ssid\" but system always-on " +
+                            "VPN active — skipping auto-pause",
+                    )
+                    updateNotification(
+                        "Trusted Wi-Fi detected, but system Always-on VPN " +
+                            "blocks auto-pause",
+                    )
+                } else {
+                    Log.i(TAG, "trusted Wi-Fi \"$ssid\" joined — pausing VPN")
+                    diag.log("paused on trusted Wi-Fi \"$ssid\"")
+                    setPaused(ssid)
+                    stopTunnel("parking on trusted Wi-Fi \"$ssid\"")
+                    updateNotification("Paused: trusted Wi-Fi \"$ssid\"")
+                }
+            }
+
+            pausedOnTrustedWifi && ssid !in trusted ->
+                resumeFromTrustedPause("switched to Wi-Fi \"$ssid\"")
+        }
+    }
+
     private fun startTrustedWifiWatcher(trusted: List<String>) {
         stopTrustedWifiWatcher()
         if (trusted.isEmpty()) return
@@ -417,44 +464,34 @@ class MyVpnService : MqvpnVpnService() {
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .build()
+        trustedList = trusted
         val handler = Handler(mainLooper)
         val onWifiCaps: (Network, NetworkCapabilities) -> Unit = { network, caps ->
-            val ssid = trustedSsidOf(network, caps)
-            handler.post {
-                when {
-                    !pausedOnTrustedWifi && ssid != null && ssid in trusted -> {
-                        // System Always-on VPN fights this feature: lockdown
-                        // blackholes ALL traffic the moment we stop, and plain
-                        // always-on force-restarts us in a loop. Warn instead.
-                        if (Build.VERSION.SDK_INT >= 29 && (isAlwaysOn || isLockdownEnabled)) {
-                            Log.w(
-                                TAG,
-                                "trusted Wi-Fi \"$ssid\" but system always-on " +
-                                    "VPN active — skipping auto-pause",
-                            )
-                            updateNotification(
-                                "Trusted Wi-Fi detected, but system Always-on VPN " +
-                                    "blocks auto-pause",
-                            )
-                        } else {
-                            Log.i(TAG, "trusted Wi-Fi \"$ssid\" joined — pausing VPN")
-                            diag.log("paused on trusted Wi-Fi \"$ssid\"")
-                            setPaused(ssid)
-                            stopTunnel("parking on trusted Wi-Fi \"$ssid\"")
-                            updateNotification("Paused: trusted Wi-Fi \"$ssid\"")
-                        }
-                    }
-
-                    pausedOnTrustedWifi && ssid != null && ssid !in trusted ->
-                        resumeFromTrustedPause("switched to Wi-Fi \"$ssid\"")
-                }
-            }
+            currentWifi = network to caps
+            handler.post { evaluateTrustedWifi(network, caps) }
         }
-        val onWifiLost: () -> Unit = {
+        val onWifiLost: (Network) -> Unit = { network ->
             handler.post {
+                if (currentWifi?.first == network) currentWifi = null
                 if (pausedOnTrustedWifi && currentWifiSsid(applicationContext) == null) {
                     resumeFromTrustedPause("Wi-Fi lost")
                 }
+            }
+        }
+        // The decision above is made in a network's first second, which is
+        // exactly when its name is least likely to be known: the SSID arrives
+        // through the location app-op, and the user is in the Wi-Fi settings —
+        // so mqvpn is backgrounded — precisely when they switch networks. The
+        // 08-05 trace shows wifi-394 logging "no SSID" at 22:13:14 and
+        // resolving to RT-AX52-5G only at 22:13:59, with no further
+        // capabilities callback in between and therefore no second chance.
+        //
+        // ProviderDirectory publishes names as it learns them, so the arrival
+        // of a name is itself the event this was missing.
+        labelWatchJob = serviceScope.launch {
+            providers.labels.collect {
+                val (network, caps) = currentWifi ?: return@collect
+                withMain { evaluateTrustedWifi(network, caps) }
             }
         }
         // API 31+ redacts the SSID from WifiInfo unless the callback is
@@ -466,14 +503,14 @@ class MyVpnService : MqvpnVpnService() {
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
                     onWifiCaps(network, caps)
 
-                override fun onLost(network: Network) = onWifiLost()
+                override fun onLost(network: Network) = onWifiLost(network)
             }
         } else {
             object : ConnectivityManager.NetworkCallback() {
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
                     onWifiCaps(network, caps)
 
-                override fun onLost(network: Network) = onWifiLost()
+                override fun onLost(network: Network) = onWifiLost(network)
             }
         }
         try {
@@ -514,6 +551,10 @@ class MyVpnService : MqvpnVpnService() {
             }
         }
         wifiCallback = null
+        labelWatchJob?.cancel()
+        labelWatchJob = null
+        currentWifi = null
+        trustedList = emptyList()
     }
 
     /**
