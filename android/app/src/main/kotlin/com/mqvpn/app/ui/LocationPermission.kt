@@ -6,6 +6,7 @@ package com.mqvpn.app.ui
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
@@ -39,36 +40,53 @@ fun hasLocationPermission(context: Context): Boolean =
         Manifest.permission.ACCESS_FINE_LOCATION,
     ) == PackageManager.PERMISSION_GRANTED
 
+/**
+ * Whether the system location toggle is on.
+ *
+ * A separate gate from the permission, and an equally hard one: Android
+ * redacts the SSID when location is switched off no matter what the app was
+ * granted. Distinguishing the two is what stops "I allowed it and it still
+ * says Wi-Fi" from being a mystery.
+ */
+fun isLocationEnabled(context: Context): Boolean =
+    context.getSystemService(LocationManager::class.java)?.isLocationEnabled == true
+
 /** Live permission state plus the call that asks for it. */
 data class LocationPermissionState(
     val granted: Boolean,
+    val locationOn: Boolean,
     val request: () -> Unit,
-)
+) {
+    /** Names are only readable when both gates are open. */
+    val canReadNames: Boolean get() = granted && locationOn
+}
 
 @Composable
 fun rememberLocationPermission(): LocationPermissionState {
     val context = LocalContext.current
     var granted by remember { mutableStateOf(hasLocationPermission(context)) }
+    var locationOn by remember { mutableStateOf(isLocationEnabled(context)) }
 
     val launcher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted = hasLocationPermission(context) }
 
     // Re-read on resume as well as on the dialog result: the user may grant it
-    // from system settings, and a "only this time" grant is revoked while the
-    // app sits in the background.
+    // from system settings or flip the location toggle from the shade, and a
+    // "only this time" grant is revoked while the app sits in the background.
     val owner = LocalLifecycleOwner.current
     DisposableEffect(owner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 granted = hasLocationPermission(context)
+                locationOn = isLocationEnabled(context)
             }
         }
         owner.lifecycle.addObserver(observer)
         onDispose { owner.lifecycle.removeObserver(observer) }
     }
 
-    return LocationPermissionState(granted) {
+    return LocationPermissionState(granted, locationOn) {
         launcher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
     }
 }

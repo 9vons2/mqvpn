@@ -403,7 +403,7 @@ fun SettingsScreen(
             val location = rememberLocationPermission()
             // Recomputed when the permission flips, since the SSID is redacted
             // until it is granted and this read would otherwise stay stale.
-            val currentSsid = remember(location.granted) { MyVpnService.currentWifiSsid(ctx) }
+            val currentSsid = remember(location.canReadNames) { MyVpnService.currentWifiSsid(ctx) }
             if (currentSsid != null && currentSsid !in trustedSsids.split(",").map { it.trim() }) {
                 TextButton(
                     onClick = {
@@ -424,6 +424,14 @@ fun SettingsScreen(
                     color = MaterialTheme.colorScheme.error,
                 )
                 TextButton(onClick = location.request) { Text("Allow Wi-Fi names") }
+            } else if (!location.locationOn) {
+                Text(
+                    "The permission is granted, but location is switched off " +
+                        "system-wide — Android hides Wi-Fi names either way. " +
+                        "Turn location on in the quick settings.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
             }
             Text(
                 "On these networks the tunnel parks itself and resumes when you leave. " +

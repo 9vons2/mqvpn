@@ -38,6 +38,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
@@ -45,6 +46,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.mqvpn.sdk.core.model.MqvpnState
 import com.mqvpn.sdk.core.model.PathInfo
@@ -76,6 +80,18 @@ fun DashboardScreen(
         if (result.resultCode == Activity.RESULT_OK) {
             viewModel.connectWithSavedSettings()
         }
+    }
+
+    // Being on screen is the one moment Android reliably lets the app read a
+    // Wi-Fi name, so this is where a network that came up unnamed — in a
+    // pocket, or before the permission existed — gets its real one.
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) viewModel.refreshProviderNames()
+        }
+        owner.lifecycle.addObserver(observer)
+        onDispose { owner.lifecycle.removeObserver(observer) }
     }
 
     Scaffold(
@@ -282,14 +298,24 @@ private fun PathsSection(
 private fun NameHint(paths: List<PathThroughput>) {
     val location = rememberLocationPermission()
     val unnamedWifi = paths.any { it.key.startsWith("wifi") && it.label == "Wi-Fi" }
-    if (location.granted || !unnamedWifi) return
+    if (location.canReadNames || !unnamedWifi) return
     Spacer(modifier = Modifier.height(8.dp))
-    Text(
-        "Android hides Wi-Fi names without the location permission — that is why " +
-            "this reads \"Wi-Fi\" and not the network's own name.",
-        style = MaterialTheme.typography.bodySmall,
-    )
-    TextButton(onClick = location.request) { Text("Show Wi-Fi names") }
+    if (!location.granted) {
+        Text(
+            "Android hides Wi-Fi names without the location permission — that is why " +
+                "this reads \"Wi-Fi\" and not the network's own name.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        TextButton(onClick = location.request) { Text("Show Wi-Fi names") }
+    } else {
+        // The permission alone is not enough, and this is the failure that
+        // looks like the app ignoring a granted permission.
+        Text(
+            "Location is switched off system-wide, so Android still hides Wi-Fi " +
+                "names. Turn it on in the quick settings and come back.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
 }
 
 @Composable

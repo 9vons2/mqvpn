@@ -155,6 +155,15 @@ class MqvpnViewModel(
         }
     }
 
+    /**
+     * Re-resolve provider names. Called when the dashboard comes to the
+     * foreground, which is the only moment Android reliably hands an app its
+     * Wi-Fi SSID — see [ProviderDirectory.refresh].
+     */
+    fun refreshProviderNames() {
+        providers.refresh()
+    }
+
     /** Persist a custom display name for the provider behind [pathKey]. */
     fun renameProvider(pathKey: String, name: String?) {
         val auto = providers.labels.value[pathKey] ?: SpeedTracker.fallbackLabel(pathKey)

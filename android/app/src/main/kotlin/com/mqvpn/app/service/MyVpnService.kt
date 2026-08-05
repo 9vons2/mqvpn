@@ -30,6 +30,7 @@ import com.mqvpn.app.ui.SpeedTracker
 import com.mqvpn.app.ui.formatBps
 import com.mqvpn.app.ui.formatBytes
 import com.mqvpn.app.ui.hasLocationPermission
+import com.mqvpn.app.ui.isLocationEnabled
 import com.mqvpn.sdk.core.MqvpnVpnService
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnError
@@ -139,10 +140,11 @@ class MyVpnService : MqvpnVpnService() {
                         "starting: scheduler=${config.scheduler.name} " +
                             "reorder=${config.reorderEnabled} hybrid=${config.hybridEnabled} " +
                             "trustedSsids=${trusted.size} excludedApps=${config.excludedApps.size} " +
-                            // Without it every Wi-Fi is called "Wi-Fi" and
-                            // Trusted Wi-Fi cannot match anything, so a trace
-                            // has to say which of the two situations it is.
-                            "wifiNames=${if (hasLocationPermission(this@MyVpnService)) "on" else "OFF"}",
+                            // Two independent gates, and either one closed
+                            // means every Wi-Fi is called "Wi-Fi" and Trusted
+                            // Wi-Fi has nothing to match. A trace has to say
+                            // which, or the next reader repeats the guess.
+                            "wifiNames=${wifiNameState()}",
                     )
                     startTunnel(config)
                 }
@@ -640,11 +642,8 @@ class MyVpnService : MqvpnVpnService() {
                 // Worth one line, because it is the difference between "ask
                 // the user for the permission" and "the permission is not
                 // enough", and guessing between those wastes a whole trip.
-                if (p.iface.startsWith("wifi") &&
-                    pathLabel(p.iface) == "Wi-Fi" &&
-                    hasLocationPermission(this)
-                ) {
-                    diag.log("  ↳ SSID redacted despite the location permission")
+                if (p.iface.startsWith("wifi") && pathLabel(p.iface) == "Wi-Fi") {
+                    diag.log("  ↳ no SSID (${wifiNameState()})")
                 }
             } else if (prevStatus != p.status) {
                 // A path reaching CLOSED is the end of its life — record what it
@@ -775,6 +774,19 @@ class MyVpnService : MqvpnVpnService() {
     private fun pathLabel(iface: String): String {
         val auto = providers.labels.value[iface] ?: SpeedTracker.fallbackLabel(iface)
         return customProviderNames()[auto.lowercase()] ?: auto
+    }
+
+    /**
+     * Why a Wi-Fi may be nameless, in one token.
+     *
+     * "on" means both gates are open and the SSID was still withheld — which
+     * is what Android does to a backgrounded app holding only while-in-use
+     * location, and it points at a different fix from the other two.
+     */
+    private fun wifiNameState(): String = when {
+        !hasLocationPermission(this) -> "NO-PERMISSION"
+        !isLocationEnabled(this) -> "LOCATION-OFF"
+        else -> "on"
     }
 
     /** Best-effort custom provider names (set via the rename dialog). */

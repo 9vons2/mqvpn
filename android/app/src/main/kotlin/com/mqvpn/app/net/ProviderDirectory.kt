@@ -71,6 +71,34 @@ class ProviderDirectory @Inject constructor(
         }
     }
 
+    /**
+     * Re-resolves the name of every live network.
+     *
+     * A name is otherwise decided once, on the first [onCapabilitiesChanged]
+     * for that network, and can never change afterwards — and two things
+     * conspire to make that first answer the wrong one. The callback is
+     * registered when the VPN service starts, which may be long before the
+     * user grants the location permission; and Android gates location behind
+     * an app-op that returns "ignored" for a backgrounded app holding only
+     * while-in-use access, so a Wi-Fi that appears while the phone is in a
+     * pocket has its SSID redacted. Either way the network is recorded as
+     * plain "Wi-Fi" and stays that way for its whole life.
+     *
+     * Re-registering makes the system re-deliver capabilities for every
+     * matching network, evaluated against the permissions in force now.
+     * Labels are deliberately not cleared first: they are replaced as the
+     * fresh callbacks land, so the UI never flickers back to the fallback.
+     */
+    fun refresh() {
+        val cb = callback ?: return
+        try {
+            cm?.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {
+        }
+        callback = null
+        start()
+    }
+
     fun stop() {
         callback?.let {
             try {
