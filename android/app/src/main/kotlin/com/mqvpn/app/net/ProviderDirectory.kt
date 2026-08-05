@@ -180,13 +180,38 @@ class ProviderDirectory @Inject constructor(
         }
     }
 
-    private fun wifiSsid(caps: NetworkCapabilities): String? {
-        val raw = if (Build.VERSION.SDK_INT >= 29) {
-            (caps.transportInfo as? WifiInfo)?.ssid
-        } else {
-            @Suppress("DEPRECATION")
-            context.getSystemService(WifiManager::class.java)?.connectionInfo?.ssid
-        }
+    /**
+     * The SSID, from whichever source will actually give it.
+     *
+     * transportInfo alone is not enough, and the trace proves it: with the
+     * location permission granted and location switched on, a Wi-Fi path still
+     * came up nameless, while at the same moment — same process, same seconds
+     * — the trusted-Wi-Fi watcher read "RT-AX52-5G" and parked the tunnel. The
+     * difference between the two was only that the watcher fell back to
+     * WifiManager and this did not.
+     *
+     * WifiManager reports the one Wi-Fi the phone is associated with, so it
+     * cannot distinguish between two simultaneously tracked Wi-Fi networks.
+     * A phone holds a single association at a time, and the alternative here
+     * is no name at all.
+     */
+    private fun wifiSsid(caps: NetworkCapabilities): String? =
+        fromTransportInfo(caps) ?: fromWifiManager()
+
+    private fun fromTransportInfo(caps: NetworkCapabilities): String? {
+        if (Build.VERSION.SDK_INT < 29) return null
+        return normalize((caps.transportInfo as? WifiInfo)?.ssid)
+    }
+
+    private fun fromWifiManager(): String? = try {
+        @Suppress("DEPRECATION")
+        normalize(context.getSystemService(WifiManager::class.java)?.connectionInfo?.ssid)
+    } catch (e: Exception) {
+        Log.w(TAG, "wifi ssid read failed: ${e.message}")
+        null
+    }
+
+    private fun normalize(raw: String?): String? {
         val ssid = raw?.removeSurrounding("\"")?.trim()
         return ssid?.takeIf { it.isNotEmpty() && it != UNKNOWN_SSID }
     }

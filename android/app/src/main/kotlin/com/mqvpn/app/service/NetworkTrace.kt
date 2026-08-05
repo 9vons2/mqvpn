@@ -125,28 +125,27 @@ class NetworkTrace(
     }
 
     /** Same key libmqvpn paths carry, so the two traces line up by eye. */
-    private fun keyOf(network: Network, caps: NetworkCapabilities): String {
-        val transport = when {
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
-            // Our own tunnel. It shows up on the default-network callback the
-            // moment the VPN takes over routing, and reading that as a mystery
-            // link wastes the reader's time.
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
-            else -> "other"
-        }
-        // netId, the identifying half of the handle. See ProviderDirectory.
-        return "$transport-${(network.networkHandle ushr 32) % 10000}"
+    private fun keyOf(network: Network, caps: NetworkCapabilities): String =
+        "${transportOf(caps)}-${(network.networkHandle ushr 32) % 10000}"
+
+    /**
+     * VPN is tested first on purpose. A VPN network carries TRANSPORT_VPN
+     * *plus* the transports of whatever it runs over, so testing Wi-Fi first
+     * labelled our own tunnel "wifi-253" — a network that never appeared in
+     * any "net up" line and changed transport to "cellular-253" when the
+     * underlying link changed. The default-network line is worth keeping, but
+     * only if it says the tunnel took over rather than inventing a link.
+     */
+    private fun transportOf(caps: NetworkCapabilities): String = when {
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> "vpn"
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+        else -> "other"
     }
 
     private fun snapshot(caps: NetworkCapabilities) = NetSnapshot(
-        transport = when {
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
-            else -> "other"
-        },
+        transport = transportOf(caps),
         validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
         metered = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED),
         downKbps = caps.linkDownstreamBandwidthKbps,
