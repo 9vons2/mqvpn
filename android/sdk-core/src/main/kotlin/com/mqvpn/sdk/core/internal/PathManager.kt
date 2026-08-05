@@ -7,6 +7,7 @@ import android.net.Network
 import android.system.Os
 import android.util.Log
 import com.mqvpn.sdk.core.MqvpnTunnel
+import com.mqvpn.sdk.core.model.PathInfo
 import com.mqvpn.sdk.network.NetworkEvent
 import com.mqvpn.sdk.network.NetworkMonitor
 import com.mqvpn.sdk.network.PathBinder
@@ -120,8 +121,44 @@ internal class PathManager(
         Log.i(TAG, "Path removed: $name (handle=$handle)")
     }
 
-    /** handle → when it was first seen CLOSED, for the debounce below. */
+    /** handle → when it was first seen dead, for the debounce below. */
     private val closedSince = mutableMapOf<Long, Long>()
+
+    /** handle → (bytesTx, bytesRx, when rx last moved). */
+    private val traffic = mutableMapOf<Long, Triple<Long, Long, Long>>()
+
+    /**
+     * Whether a path is beyond saving, by either of the two ways it happens.
+     *
+     * CLOSED is the tidy case. The other is a path that keeps its ACTIVE — or
+     * DEGRADED, or PENDING — status while nothing at all comes back over it:
+     * a field trace caught one going ACTIVE → DEGRADED → PENDING and sitting
+     * there silent for three minutes with the network underneath perfectly
+     * healthy. Checking the status alone missed it entirely.
+     *
+     * Silence is judged from the counters rather than from srtt, which freezes
+     * at its last live measurement and so keeps insisting a dead link is fine.
+     * bytes_tx rises on every successful send and bytes_rx only on a packet
+     * actually received, so "sending, nothing coming back" is exactly what the
+     * pair says. An idle tunnel moves neither and is left alone.
+     */
+    private fun isDead(info: PathInfo, nowMs: Long): Boolean {
+        if (info.status == MQVPN_PATH_CLOSED) return true
+
+        val prev = traffic[info.handle]
+        val rxMoved = prev == null || info.bytesRx > prev.second
+        val txMoved = prev != null && info.bytesTx > prev.first
+        val lastRx = when {
+            rxMoved -> nowMs
+            else -> prev?.third ?: nowMs
+        }
+        traffic[info.handle] = Triple(info.bytesTx, info.bytesRx, lastRx)
+
+        // Only sending counts as evidence. Without it the path is merely
+        // unused, and tearing down an idle link would be pure churn.
+        if (!txMoved || rxMoved) return false
+        return nowMs - lastRx >= DEAD_SILENCE_MS
+    }
 
     /**
      * Rebuilds paths that died over a network the OS still has.
@@ -150,11 +187,13 @@ internal class PathManager(
      */
     suspend fun rebuildDeadPaths(nowMs: Long = System.currentTimeMillis()) {
         val stale = executor.call {
-            val status = tunnel.getPaths().associate { it.handle to it.status }
+            val byHandle = tunnel.getPaths().associateBy { it.handle }
             val out = mutableListOf<Network>()
             for ((network, handle) in pathHandles) {
-                if (status[handle] != MQVPN_PATH_CLOSED) {
+                val info = byHandle[handle]
+                if (info == null || !isDead(info, nowMs)) {
                     closedSince.remove(handle)
+                    if (info == null) traffic.remove(handle)
                     continue
                 }
                 // Only act while the OS still has the network. If it went away
@@ -170,6 +209,7 @@ internal class PathManager(
                     // pathHandles and the entry would otherwise never be
                     // visited again.
                     closedSince.remove(handle)
+                    traffic.remove(handle)
                     out += network
                 }
             }
@@ -191,6 +231,8 @@ internal class PathManager(
         }
         pathFds.clear()
         pathHandles.clear()
+        closedSince.clear()
+        traffic.clear()
         connected = false
     }
 
@@ -218,6 +260,13 @@ internal class PathManager(
          * disappearing is handled by the ordinary Lost event instead.
          */
         private const val REBUILD_AFTER_MS = 8_000L
+
+        /**
+         * Sending this long with nothing coming back means the path is gone,
+         * whatever its status still claims. Well past any real stall — the
+         * trace that motivated this showed 165 s and still climbing.
+         */
+        private const val DEAD_SILENCE_MS = 45_000L
 
         /**
          * Sentinel returned from the executor block in [handleAvailable] when
