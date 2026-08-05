@@ -47,6 +47,13 @@ class NetworkTrace(
     context: Context,
     private val labelFor: (String) -> String,
     private val sink: (String) -> Unit,
+    /**
+     * A transport the phone did not have a moment ago. This is new
+     * information the tunnel's reconnect timer cannot know about, and acting
+     * on it is the difference between recovering now and waiting out a
+     * backoff that has climbed to a minute.
+     */
+    private val onNetworkUp: (String) -> Unit = {},
 ) {
     private val cm = context.getSystemService(ConnectivityManager::class.java)
     private val seen = HashMap<String, NetSnapshot>()
@@ -108,9 +115,12 @@ class NetworkTrace(
         val key = keyOf(network, caps)
         keyByHandle[network.networkHandle] = key
         val now = snapshot(caps)
+        val firstSighting = seen[key] == null
         val line = describeChange(key, labelFor(key), seen[key], now) ?: return
         seen[key] = now
         sink(line)
+        // Our own tunnel appearing is not a new way out to the server.
+        if (firstSighting && now.transport != "vpn") onNetworkUp(key)
     }
 
     private fun onLostNetwork(network: Network) {

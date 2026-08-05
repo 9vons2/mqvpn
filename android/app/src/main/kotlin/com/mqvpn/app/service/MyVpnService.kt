@@ -81,7 +81,43 @@ class MyVpnService : MqvpnVpnService() {
      * ones where the tunnel is down and only the OS has anything to say.
      */
     private val netTrace: NetworkTrace by lazy {
-        NetworkTrace(applicationContext, ::pathLabel) { diag.log(it) }
+        NetworkTrace(applicationContext, ::pathLabel, { diag.log(it) }, ::onNetworkAppeared)
+    }
+
+    private var lastForcedRestartMs = 0L
+
+    /**
+     * Restarts the tunnel when a genuinely new transport shows up while it is
+     * down, instead of waiting out libmqvpn's backoff.
+     *
+     * The backoff is right for "the server is unreachable" and wrong for
+     * "the phone just got a different way out". The 08-05 trace shows the
+     * difference costing minutes: five reconnects, every one of them over the
+     * same cellular network the OS had not yet given up on, backoff climbing
+     * to its 60 s ceiling — and at the moment a fresh network finally
+     * appeared, the client was sitting in that minute doing nothing. To the
+     * user that is a phone with working mobile data and no internet, because
+     * the TUN still holds the default route.
+     *
+     * Only fires once the library's own quick retries have had their turn, and
+     * not more than once per cooldown, so a flapping link cannot turn this
+     * into a restart loop.
+     */
+    private fun onNetworkAppeared(key: String) {
+        if (userRequestedStop || pausedOnTrustedWifi) return
+        if (downSinceMs == 0L) return // tunnel is up; nothing to rescue
+        val now = System.currentTimeMillis()
+        val downFor = now - downSinceMs
+        if (downFor < NEW_NETWORK_GRACE_MS) return
+        if (now - lastForcedRestartMs < FORCED_RESTART_COOLDOWN_MS) return
+        val config = lastConfig ?: restoreConfig() ?: return
+        lastForcedRestartMs = now
+        diag.log(
+            "new network $key after ${downFor / 1000}s down — restarting the " +
+                "tunnel now instead of waiting out the backoff",
+        )
+        stopTunnel()
+        startTunnel(config)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -916,6 +952,16 @@ class MyVpnService : MqvpnVpnService() {
 
         /** Silence before a path is written to the trace as not answering. */
         private const val SILENT_REPORT_MS = 5_000L
+
+        /**
+         * How long the tunnel must already be down before a new network is
+         * treated as worth a restart. Below this the library's own 5 s and
+         * 10 s retries are still running and are the better tool.
+         */
+        private const val NEW_NETWORK_GRACE_MS = 15_000L
+
+        /** Floor between forced restarts, so a flapping link cannot loop us. */
+        private const val FORCED_RESTART_COOLDOWN_MS = 30_000L
 
         /**
          * Diagnostics live in device-protected storage: the service is
