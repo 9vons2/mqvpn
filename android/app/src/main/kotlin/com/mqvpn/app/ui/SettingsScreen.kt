@@ -34,6 +34,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -399,7 +400,10 @@ fun SettingsScreen(
                 singleLine = true,
             )
             val ctx = LocalContext.current
-            val currentSsid = MyVpnService.currentWifiSsid(ctx)
+            val location = rememberLocationPermission()
+            // Recomputed when the permission flips, since the SSID is redacted
+            // until it is granted and this read would otherwise stay stale.
+            val currentSsid = remember(location.granted) { MyVpnService.currentWifiSsid(ctx) }
             if (currentSsid != null && currentSsid !in trustedSsids.split(",").map { it.trim() }) {
                 TextButton(
                     onClick = {
@@ -409,9 +413,20 @@ fun SettingsScreen(
                     enabled = fieldsEnabled,
                 ) { Text("Add current: $currentSsid") }
             }
+            if (!location.granted) {
+                Text(
+                    "Android hides Wi-Fi names from apps without the location " +
+                        "permission, so the app cannot read the network you are on: " +
+                        "every Wi-Fi shows as \"Wi-Fi\" instead of \"Starlink\", and " +
+                        "Trusted Wi-Fi has no name to match. The permission is used " +
+                        "for nothing else — no position is read or stored.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                TextButton(onClick = location.request) { Text("Allow Wi-Fi names") }
+            }
             Text(
                 "On these networks the tunnel parks itself and resumes when you leave. " +
-                    "Reading the Wi-Fi name needs the location permission. " +
                     "Not compatible with the system Always-on VPN setting.",
                 style = MaterialTheme.typography.bodySmall,
             )

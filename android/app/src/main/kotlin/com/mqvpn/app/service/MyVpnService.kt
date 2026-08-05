@@ -29,6 +29,7 @@ import com.mqvpn.app.net.ProviderDirectory
 import com.mqvpn.app.ui.SpeedTracker
 import com.mqvpn.app.ui.formatBps
 import com.mqvpn.app.ui.formatBytes
+import com.mqvpn.app.ui.hasLocationPermission
 import com.mqvpn.sdk.core.MqvpnVpnService
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnError
@@ -137,7 +138,11 @@ class MyVpnService : MqvpnVpnService() {
                     diag.log(
                         "starting: scheduler=${config.scheduler.name} " +
                             "reorder=${config.reorderEnabled} hybrid=${config.hybridEnabled} " +
-                            "trustedSsids=${trusted.size} excludedApps=${config.excludedApps.size}",
+                            "trustedSsids=${trusted.size} excludedApps=${config.excludedApps.size} " +
+                            // Without it every Wi-Fi is called "Wi-Fi" and
+                            // Trusted Wi-Fi cannot match anything, so a trace
+                            // has to say which of the two situations it is.
+                            "wifiNames=${if (hasLocationPermission(this@MyVpnService)) "on" else "OFF"}",
                     )
                     startTunnel(config)
                 }
@@ -630,6 +635,17 @@ class MyVpnService : MqvpnVpnService() {
             if (prevStatus == null) {
                 diagBornAt[p.handle] = now
                 diag.log("path ${p.iface}#${p.handle} \"${pathLabel(p.iface)}\" appeared (status=${p.status})")
+                // Permission held but the name still generic means Android
+                // redacted it anyway — which it does to a backgrounded app.
+                // Worth one line, because it is the difference between "ask
+                // the user for the permission" and "the permission is not
+                // enough", and guessing between those wastes a whole trip.
+                if (p.iface.startsWith("wifi") &&
+                    pathLabel(p.iface) == "Wi-Fi" &&
+                    hasLocationPermission(this)
+                ) {
+                    diag.log("  ↳ SSID redacted despite the location permission")
+                }
             } else if (prevStatus != p.status) {
                 // A path reaching CLOSED is the end of its life — record what it
                 // managed to carry, since from Android there is no way to

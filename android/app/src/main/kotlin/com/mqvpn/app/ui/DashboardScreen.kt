@@ -35,6 +35,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -265,7 +266,30 @@ private fun PathsSection(
         throughput.paths.forEach { p ->
             ProviderCard(p) { name -> onRenameProvider(p.key, name) }
         }
+        NameHint(throughput.paths)
     }
+}
+
+/**
+ * Surfaces the one reason a Wi-Fi shows up as "Wi-Fi" instead of "Starlink".
+ *
+ * Only shown when it would actually change something: a Wi-Fi path is present
+ * and stuck on the generic name. Renaming it by hand is not a substitute —
+ * overrides are keyed by the resolved name, so with every network called
+ * "Wi-Fi" one rename would relabel all of them at once.
+ */
+@Composable
+private fun NameHint(paths: List<PathThroughput>) {
+    val location = rememberLocationPermission()
+    val unnamedWifi = paths.any { it.key.startsWith("wifi") && it.label == "Wi-Fi" }
+    if (location.granted || !unnamedWifi) return
+    Spacer(modifier = Modifier.height(8.dp))
+    Text(
+        "Android hides Wi-Fi names without the location permission — that is why " +
+            "this reads \"Wi-Fi\" and not the network's own name.",
+        style = MaterialTheme.typography.bodySmall,
+    )
+    TextButton(onClick = location.request) { Text("Show Wi-Fi names") }
 }
 
 @Composable
