@@ -96,7 +96,7 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
     override fun onDestroy() {
         runBlocking {
             withTimeoutOrNull(2000) {
-                executor.call { cleanup() }
+                executor.call { cleanup("service destroyed") }
             }
         }
         scope.cancel()
@@ -107,7 +107,7 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
     override fun onRevoke() {
         runBlocking {
             withTimeoutOrNull(2000) {
-                executor.call { cleanup() }
+                executor.call { cleanup("system revoked the VPN") }
             }
         }
         scope.cancel()
@@ -173,14 +173,26 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
      * module, so this stays public.
      * Do NOT call from onDestroy — cleanup runs automatically.
      */
-    fun stopTunnel() {
-        executor.enqueue { cleanup() }
+    fun stopTunnel(reason: String = "unspecified") {
+        executor.enqueue { cleanup(reason) }
     }
+
+    /**
+     * Called just before the tunnel is torn down, naming what asked for it.
+     *
+     * Disconnected can only be emitted from [cleanup], so it always means
+     * somebody explicitly stopped the tunnel — but a field trace showed three
+     * of them with no caller identified anywhere, which made it impossible to
+     * tell a deliberate teardown from a stray one. Every call site now says
+     * who it is.
+     */
+    open fun onTunnelStopping(reason: String) {}
 
     // --- Internal cleanup (idempotent) ---
 
-    private fun cleanup() {
+    private fun cleanup(reason: String = "unspecified") {
         if (tunnel == null) return // already cleaned up
+        onTunnelStopping(reason)
         networkMonitor?.stop()
         tunnelBridge?.stop()
         udpReaderPool?.stopAll()

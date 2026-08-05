@@ -121,7 +121,7 @@ class MqvpnManager(private val context: Context) {
 
     /** Disconnect the VPN. */
     fun disconnect() {
-        boundService?.stopTunnel()
+        boundService?.stopTunnel("MqvpnManager.disconnect")
         _vpnState.value = MqvpnState.Disconnected
     }
 

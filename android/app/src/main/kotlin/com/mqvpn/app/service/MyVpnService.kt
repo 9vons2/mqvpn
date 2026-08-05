@@ -116,7 +116,7 @@ class MyVpnService : MqvpnVpnService() {
             "new network $key after ${downFor / 1000}s down — restarting the " +
                 "tunnel now instead of waiting out the backoff",
         )
-        stopTunnel()
+        stopTunnel("restarting for a new network")
         startTunnel(config)
     }
 
@@ -125,7 +125,7 @@ class MyVpnService : MqvpnVpnService() {
             diag.log("disconnect requested by user")
             userRequestedStop = true
             setPaused(null)
-            stopTunnel()
+            stopTunnel("notification Disconnect action")
             stopSelf()
             return START_NOT_STICKY
         }
@@ -329,6 +329,19 @@ class MyVpnService : MqvpnVpnService() {
         else -> false
     }
 
+    /**
+     * Names whatever tore the tunnel down.
+     *
+     * Disconnected can only come out of cleanup(), so it always means someone
+     * asked for it — but the 08-05 trace has three of them at 15:28, 15:29 and
+     * 15:30 with no caller identifiable anywhere, the last leading to three and
+     * a half hours of nothing. Restarting on Disconnected would have papered
+     * over that rather than explaining it, so the reason comes first.
+     */
+    override fun onTunnelStopping(reason: String) {
+        diag.log("tunnel stopping: $reason")
+    }
+
     override fun onLog(level: Int, message: String) {
         when (level) {
             0 -> Log.d(TAG, message)
@@ -364,7 +377,6 @@ class MyVpnService : MqvpnVpnService() {
     // --- Trusted Wi-Fi pause/resume ---
 
     private var wifiCallback: ConnectivityManager.NetworkCallback? = null
-    private var ssidAtStart: String? = null
     private var lastConfig: MqvpnConfig? = null
 
     /** True while the tunnel is parked because we're on a trusted network. */
@@ -389,27 +401,28 @@ class MyVpnService : MqvpnVpnService() {
     }
 
     /**
-     * JOINING a trusted Wi-Fi while the tunnel is up pauses it (the service
-     * stays alive, watching); leaving the trusted network — to another Wi-Fi
-     * or to cellular — resumes it. The network present at start is
-     * deliberately ignored: an explicit user connect wins over the list.
+     * JOINING a trusted Wi-Fi pauses the tunnel (the service stays alive,
+     * watching); leaving it — to another Wi-Fi or to cellular — resumes.
+     *
+     * The network present at start used to be excluded, on the reasoning that
+     * an explicit Connect should beat the list. In practice that is backwards:
+     * home is exactly where you both press Connect and sit on the trusted
+     * network, so the one case the feature exists for was the one it skipped.
      */
     private fun startTrustedWifiWatcher(trusted: List<String>) {
         stopTrustedWifiWatcher()
         if (trusted.isEmpty()) return
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
 
-        ssidAtStart = currentWifiSsid(applicationContext)
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .build()
         val handler = Handler(mainLooper)
-        val onWifiCaps: (NetworkCapabilities) -> Unit = { caps ->
-            val ssid = ssidFromCaps(caps) ?: currentWifiSsid(applicationContext)
+        val onWifiCaps: (Network, NetworkCapabilities) -> Unit = { network, caps ->
+            val ssid = trustedSsidOf(network, caps)
             handler.post {
                 when {
-                    !pausedOnTrustedWifi &&
-                        ssid != null && ssid != ssidAtStart && ssid in trusted -> {
+                    !pausedOnTrustedWifi && ssid != null && ssid in trusted -> {
                         // System Always-on VPN fights this feature: lockdown
                         // blackholes ALL traffic the moment we stop, and plain
                         // always-on force-restarts us in a loop. Warn instead.
@@ -427,7 +440,7 @@ class MyVpnService : MqvpnVpnService() {
                             Log.i(TAG, "trusted Wi-Fi \"$ssid\" joined — pausing VPN")
                             diag.log("paused on trusted Wi-Fi \"$ssid\"")
                             setPaused(ssid)
-                            stopTunnel()
+                            stopTunnel("parking on trusted Wi-Fi \"$ssid\"")
                             updateNotification("Paused: trusted Wi-Fi \"$ssid\"")
                         }
                     }
@@ -451,14 +464,14 @@ class MyVpnService : MqvpnVpnService() {
                 ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO
             ) {
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
-                    onWifiCaps(caps)
+                    onWifiCaps(network, caps)
 
                 override fun onLost(network: Network) = onWifiLost()
             }
         } else {
             object : ConnectivityManager.NetworkCallback() {
                 override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) =
-                    onWifiCaps(caps)
+                    onWifiCaps(network, caps)
 
                 override fun onLost(network: Network) = onWifiLost()
             }
@@ -482,7 +495,6 @@ class MyVpnService : MqvpnVpnService() {
         Log.i(TAG, "left trusted Wi-Fi ($reason) — resuming VPN")
         diag.log("resuming: $reason")
         setPaused(null)
-        ssidAtStart = currentWifiSsid(applicationContext)
         updateNotification("Connecting...")
         startTunnel(config)
     }
@@ -502,6 +514,25 @@ class MyVpnService : MqvpnVpnService() {
             }
         }
         wifiCallback = null
+    }
+
+    /**
+     * The SSID for trusted-network matching, cache first.
+     *
+     * Both live reads go through the location app-op, which Android gates on
+     * the app being in the foreground — and the moment this has to work is
+     * precisely the moment it is not: the user is in the Wi-Fi settings
+     * switching networks, so mqvpn is in the background and every live read
+     * returns null. That is the whole of "sometimes it pauses and sometimes it
+     * doesn't". ProviderDirectory already holds a name it resolved earlier and
+     * refreshes whenever the app is on screen, so it answers when the live
+     * reads cannot — the same trace shows it naming RT-AX52-5G in the very
+     * second the watcher saw nothing.
+     */
+    private fun trustedSsidOf(network: Network, caps: NetworkCapabilities): String? {
+        val key = "wifi-${ProviderDirectory.networkId(network)}"
+        val cached = providers.labels.value[key]?.takeIf { it != "Wi-Fi" }
+        return cached ?: ssidFromCaps(caps) ?: currentWifiSsid(applicationContext)
     }
 
     private fun ssidFromCaps(caps: NetworkCapabilities): String? {
