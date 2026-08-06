@@ -423,43 +423,70 @@ class MyVpnService : MqvpnVpnService() {
     private var currentWifi: Pair<Network, NetworkCapabilities>? = null
     private var labelWatchJob: Job? = null
 
+    /** Every way this check can end, so the trace can name the one it took. */
+    private enum class TrustedVerdict { PARK, RESUME, NO_LIST, NO_NAME, NOT_TRUSTED, PARKED, ALWAYS_ON }
+
+    /** Deduped so a check that runs on every capability update prints once. */
+    private val trustedCheckLogged = HashSet<String>()
+
     /**
      * Decides whether this Wi-Fi should park the tunnel, or release it.
      *
-     * Deliberately idempotent and safe to call repeatedly: both branches are
-     * guarded by [pausedOnTrustedWifi], which flips before any work happens,
-     * so re-running on every name update settles rather than oscillates.
+     * Every outcome is written to the trace, including the ones that do
+     * nothing. Two separate hypotheses about why the pause "sometimes" failed
+     * — a name that arrived too late, then always-on VPN — were both wrong,
+     * and each cost a build and a round of field testing, because the silent
+     * paths looked identical to the check never running at all. The code knew
+     * the answer the whole time and had no way to say it.
+     *
+     * Deliberately idempotent: [pausedOnTrustedWifi] flips before any work, so
+     * re-running on every name update settles rather than oscillates.
      */
     private fun evaluateTrustedWifi(network: Network, caps: NetworkCapabilities) {
+        val key = "wifi-${ProviderDirectory.networkId(network)}"
+        val ssid = trustedSsidOf(network, caps)
         val trusted = trustedList
-        if (trusted.isEmpty()) return
-        val ssid = trustedSsidOf(network, caps) ?: return
-        when {
-            !pausedOnTrustedWifi && ssid in trusted -> {
-                // System Always-on VPN fights this feature: lockdown
-                // blackholes ALL traffic the moment we stop, and plain
-                // always-on force-restarts us in a loop. Warn instead.
-                if (Build.VERSION.SDK_INT >= 29 && (isAlwaysOn || isLockdownEnabled)) {
-                    Log.w(
-                        TAG,
-                        "trusted Wi-Fi \"$ssid\" but system always-on " +
-                            "VPN active — skipping auto-pause",
-                    )
-                    updateNotification(
-                        "Trusted Wi-Fi detected, but system Always-on VPN " +
-                            "blocks auto-pause",
-                    )
-                } else {
-                    Log.i(TAG, "trusted Wi-Fi \"$ssid\" joined — pausing VPN")
-                    diag.log("paused on trusted Wi-Fi \"$ssid\"")
-                    setPaused(ssid)
-                    stopTunnel("parking on trusted Wi-Fi \"$ssid\"")
-                    updateNotification("Paused: trusted Wi-Fi \"$ssid\"")
-                }
+        val isTrusted = ssid != null && ssid in trusted
+        // System Always-on VPN fights this feature: lockdown blackholes ALL
+        // traffic the moment we stop, and plain always-on force-restarts us
+        // in a loop. Refuse to park rather than break the phone.
+        val alwaysOn = Build.VERSION.SDK_INT >= 29 && (isAlwaysOn || isLockdownEnabled)
+
+        val verdict = when {
+            trusted.isEmpty() -> TrustedVerdict.NO_LIST
+            ssid == null -> TrustedVerdict.NO_NAME
+            isTrusted && pausedOnTrustedWifi -> TrustedVerdict.PARKED
+            isTrusted && alwaysOn -> TrustedVerdict.ALWAYS_ON
+            isTrusted -> TrustedVerdict.PARK
+            pausedOnTrustedWifi -> TrustedVerdict.RESUME
+            else -> TrustedVerdict.NOT_TRUSTED
+        }
+
+        if (trustedCheckLogged.add("$key/$verdict")) {
+            diag.log(
+                "trusted check $key ssid=${ssid ?: "unknown"} " +
+                    "trusted=${trusted.size} parked=$pausedOnTrustedWifi " +
+                    "alwaysOn=$alwaysOn → $verdict",
+            )
+        }
+
+        when (verdict) {
+            TrustedVerdict.PARK -> {
+                Log.i(TAG, "trusted Wi-Fi \"$ssid\" joined — pausing VPN")
+                diag.log("paused on trusted Wi-Fi \"$ssid\"")
+                setPaused(ssid)
+                stopTunnel("parking on trusted Wi-Fi \"$ssid\"")
+                updateNotification("Paused: trusted Wi-Fi \"$ssid\"")
             }
 
-            pausedOnTrustedWifi && ssid !in trusted ->
+            TrustedVerdict.RESUME ->
                 resumeFromTrustedPause("switched to Wi-Fi \"$ssid\"")
+
+            TrustedVerdict.ALWAYS_ON -> updateNotification(
+                "Trusted Wi-Fi detected, but system Always-on VPN blocks auto-pause",
+            )
+
+            else -> Unit
         }
     }
 
@@ -562,6 +589,7 @@ class MyVpnService : MqvpnVpnService() {
         labelWatchJob = null
         currentWifi = null
         trustedList = emptyList()
+        trustedCheckLogged.clear()
     }
 
     /**
