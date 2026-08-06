@@ -23,6 +23,7 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.getSystemService
+import com.mqvpn.app.BuildConfig
 import com.mqvpn.app.R
 import com.mqvpn.app.data.SettingsRepository
 import com.mqvpn.app.net.ProviderDirectory
@@ -73,7 +74,13 @@ class MyVpnService : MqvpnVpnService() {
         createNotificationChannel()
         providers.start()
         netTrace.start()
-        diag.log("service created")
+        // First line of every run: which build produced this trace. Reading a
+        // log against the wrong version has already sent one diagnosis down
+        // the wrong path.
+        diag.log(
+            "service created — mqvpn ${BuildConfig.VERSION_NAME} " +
+                "(${BuildConfig.GIT_SHA}, build ${BuildConfig.VERSION_CODE})",
+        )
     }
 
     /**

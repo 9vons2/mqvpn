@@ -44,6 +44,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.mqvpn.app.BuildConfig
 import com.mqvpn.app.data.DemoSettings
 import com.mqvpn.sdk.core.model.MqvpnConfig
 
@@ -475,6 +476,18 @@ fun SettingsScreen(
             )
             Spacer(modifier = Modifier.height(4.dp))
             TextButton(onClick = { showDiagnosticsDialog = true }) { Text("View log") }
+
+            Spacer(modifier = Modifier.height(16.dp))
+            // With several builds a day and a reinstall forced by the
+            // ephemeral signing key, "which one is on the phone" has been a
+            // real question more than once — and answering it wrong sent a
+            // diagnosis down the wrong path.
+            Text(
+                "mqvpn ${BuildConfig.VERSION_NAME} · ${BuildConfig.GIT_SHA} · " +
+                    "build ${BuildConfig.VERSION_CODE}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
 
             if (saveError != null) {
                 Spacer(modifier = Modifier.height(16.dp))

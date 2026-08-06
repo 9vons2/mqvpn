@@ -1,3 +1,23 @@
+/**
+ * Short commit the APK was built from.
+ *
+ * Every build so far has been "the one I sent you last" — with several APKs
+ * a day and an ephemeral signing key forcing a reinstall each time, neither
+ * the log nor the screen could say which one was actually running, and that
+ * ambiguity has already cost a diagnosis. Falls back to "dev" outside a git
+ * checkout so a source-tarball build still works.
+ */
+val gitSha: String = try {
+    val p = ProcessBuilder("git", "rev-parse", "--short", "HEAD")
+        .directory(rootDir)
+        .redirectErrorStream(true)
+        .start()
+    p.inputStream.bufferedReader().readText().trim().ifEmpty { "dev" }
+        .also { p.waitFor() }
+} catch (_: Exception) {
+    "dev"
+}
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
@@ -29,6 +49,8 @@ android {
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
+
+        buildConfigField("String", "GIT_SHA", "\"$gitSha\"")
     }
 
     // Release signing config reads from env vars set by CI. When unset
@@ -63,6 +85,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
