@@ -119,8 +119,11 @@ class NetworkTrace(
         val line = describeChange(key, labelFor(key), seen[key], now) ?: return
         seen[key] = now
         sink(line)
-        // Our own tunnel appearing is not a new way out to the server.
-        if (firstSighting && now.transport != "vpn") onNetworkUp(key)
+        if (firstSighting && now.transport != "vpn") {
+            logLinkProperties(network, key)
+            // Our own tunnel appearing is not a new way out to the server.
+            onNetworkUp(key)
+        }
     }
 
     private fun onLostNetwork(network: Network) {
@@ -132,6 +135,40 @@ class NetworkTrace(
         val key = keyByHandle.remove(network.networkHandle) ?: return
         seen.remove(key)
         sink("net down: $key \"${labelFor(key)}\"")
+    }
+
+    /**
+     * The network's own addressing, which Android does not treat as location
+     * data and therefore does not withhold from a backgrounded app.
+     *
+     * The 08-06 trace shows why this matters: three Wi-Fi networks in a row
+     * resolved no SSID at all — one of them the router the tunnel cannot work
+     * through — so the trusted check had nothing to decide on and the phone
+     * spent 23 seconds trying to reach the server through a link that has
+     * never once answered. A gateway and a DNS server would have identified
+     * it. Logged first to establish whether these fields really do survive
+     * backgrounding, and whether the two routers differ, before anything is
+     * built on them.
+     */
+    private fun logLinkProperties(network: Network, key: String) {
+        val lp = try {
+            cm?.getLinkProperties(network)
+        } catch (e: Exception) {
+            Log.w(TAG, "linkProperties failed: ${e.message}")
+            null
+        } ?: return
+        val addresses = lp.linkAddresses.joinToString(",").ifEmpty { "none" }
+        val gateways = lp.routes
+            .filter { it.isDefaultRoute }
+            .mapNotNull { it.gateway?.hostAddress }
+            .joinToString(",")
+            .ifEmpty { "none" }
+        val dns = lp.dnsServers.mapNotNull { it.hostAddress }
+            .joinToString(",").ifEmpty { "none" }
+        sink(
+            "  ↳ $key addr=$addresses gw=$gateways dns=$dns " +
+                "domains=${lp.domains ?: "-"} iface=${lp.interfaceName ?: "-"}",
+        )
     }
 
     /** Same key libmqvpn paths carry, so the two traces line up by eye. */

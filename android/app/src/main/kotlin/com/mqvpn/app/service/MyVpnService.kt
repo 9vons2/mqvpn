@@ -608,7 +608,13 @@ class MyVpnService : MqvpnVpnService() {
     private fun trustedSsidOf(network: Network, caps: NetworkCapabilities): String? {
         val key = "wifi-${ProviderDirectory.networkId(network)}"
         val cached = providers.labels.value[key]?.takeIf { it != "Wi-Fi" }
-        return cached ?: ssidFromCaps(caps) ?: currentWifiSsid(applicationContext)
+        // Deliberately NOT falling back to currentWifiSsid(): that reports
+        // whichever Wi-Fi the phone is associated with right now, not the one
+        // being asked about, so during a switch it confidently returns the
+        // wrong name. The 08-06 trace has it labelling wifi-478 and wifi-481 —
+        // both RT-AX52-5G — as netis_82EFBC, which decides NOT_TRUSTED for a
+        // trusted network. No name is recoverable; a wrong name is not.
+        return cached ?: ssidFromCaps(caps)
     }
 
     private fun ssidFromCaps(caps: NetworkCapabilities): String? {
