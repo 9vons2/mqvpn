@@ -10,6 +10,8 @@
 #include "libmqvpn.h"
 #include "mqvpn_internal.h"
 #include "mqvpn_scheduler.h"
+#include "mqvpn_sched_names.h"
+#include "mqvpn_server_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -20,13 +22,18 @@
 #  include <ws2tcpip.h>
 #  include <windows.h>
 #  include <process.h>
-#  define EAGAIN      WSAEWOULDBLOCK
+#  undef EAGAIN
+#  define EAGAIN WSAEWOULDBLOCK
+#  undef EWOULDBLOCK
 #  define EWOULDBLOCK WSAEWOULDBLOCK
-#  define EINTR       WSAEINTR
-#  define errno       WSAGetLastError()
+#  undef EINTR
+#  define EINTR WSAEINTR
+#  undef errno
+#  define errno WSAGetLastError()
 #else
 #  include <unistd.h>
 #  include <sys/time.h>
+#  include <sys/resource.h>
 #  include <arpa/inet.h>
 #  include <pthread.h>
 #endif
@@ -34,6 +41,7 @@
 #  include <errno.h>
 #endif
 #include <inttypes.h>
+#include <limits.h>
 #include <time.h>
 #include <assert.h>
 
@@ -45,15 +53,18 @@
 #include "flow_sched.h"
 #include "icmp.h"
 #include "reorder.h"
+#include "reorder_gate.h"
 #include "reorder_rx.h"
 #include "reorder_tx.h"
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+#  include "hybrid/tcp_egress.h"
+#endif
 
 /* ─── Constants ─── */
 
 #define PACKET_BUF_SIZE  65536
 #define MASQUE_FRAME_BUF (PACKET_BUF_SIZE + 16)
 #define MAX_CAPSULE_BUF  65536
-#define PTB_RATE_LIMIT   10
 
 /* ─── Forward declarations ─── */
 
@@ -89,19 +100,49 @@ struct svr_conn_s {
     mqvpn_reorder_tx_t *reorder_tx;
     mqvpn_reorder_rx_t *reorder_rx;
     int peer_reorder_supported;
+
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+    int tcp_flow_count; /* per-session cap enforcement lands with the
+                         * server-side limits work — no 5-tuple table needed
+                         * server-side per Design Decision D2. */
+#endif
 };
 
 /* Forward decl: reorder RX deliver trampoline (defined near the datagram
  * callbacks) — referenced earlier in cb_h3_conn_create when engines are made. */
 static void svr_reorder_deliver(const uint8_t *pkt, size_t len, void *ctx);
 
+/* Forward decl: per-conn context teardown (defined with the H3 close path) —
+ * cb_refuse frees pre-H3 contexts through it, ahead of its definition. */
+static void svr_conn_free(svr_conn_t *conn);
+
+/* Role of an inbound H3 request stream, decided at header parse.
+ * Unrecognized requests keep ROLE_UNKNOWN, which now gets an explicit 501
+ * (see cb_request_read) instead of the historical capsule fall-through. */
+typedef enum {
+    SVR_STREAM_ROLE_UNKNOWN = 0,
+    SVR_STREAM_ROLE_CONNECT_IP,
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+    SVR_STREAM_ROLE_CONNECT_TCP,
+#endif
+} svr_stream_role_t;
+
 struct svr_stream_s {
     svr_conn_t *conn;
     xqc_h3_request_t *h3_request;
+    svr_stream_role_t role;
     int header_sent;
     uint8_t *capsule_buf;
     size_t capsule_len;
     size_t capsule_cap;
+
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+    /* Per D2, xqc_h3_request_t's user_data slot stays svr_stream_t*
+     * everywhere; per-flow egress state hangs off THIS field instead of
+     * ever calling xqc_h3_request_set_user_data() a second time. */
+    void *tcp_egress_flow; /* svr_tcp_egress_flow_t*, opaque here — only
+                            * tcp_egress.c casts it. */
+#endif
 };
 
 /* ─── Server handle (opaque mqvpn_server_t) ─── */
@@ -139,8 +180,7 @@ struct mqvpn_server_s {
     int tun_mtu;
 
     /* ICMP PTB rate limit */
-    int ptb_tokens;
-    int64_t ptb_refill_ms;
+    mqvpn_ptb_bucket_t ptb_bucket;
 
     /* Stats */
     uint64_t bytes_tx;
@@ -155,10 +195,42 @@ struct mqvpn_server_s {
      * mqvpn_server_uptime_seconds() uses (now_us() - boot_us) / 1e6. */
     uint64_t boot_us;
 
+    /* Egress fd budget, computed ONCE in mqvpn_server_new and intentionally
+     * frozen: the platform sizes its fd->event registry from this value at
+     * startup, so admission (tcp_egress.c's 503 cap check) must use the
+     * same snapshot — recomputing per call would let a runtime setrlimit
+     * grow admission past the fixed registry (flows admitted but never
+     * polled). min(rlimit_nofile - reserve, config.hybrid.tcp_max_global_flows
+     * [TcpMaxGlobalFlows / "tcp_max_global_flows"]) — see
+     * svr_compute_egress_fd_budget. */
+    int egress_fd_budget;
+
     /* Log filtering */
     mqvpn_log_level_t log_level;
 
     int started;
+
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+    /* Connect-stage bookkeeping for src/hybrid/tcp_egress.c: STORAGE only.
+     * Contents are mutated exclusively by tcp_egress.c through the bundled
+     * ctx accessor in mqvpn_server_internal.h (svr_get_tcp_egress_ctx) —
+     * this file never reads or writes them directly.
+     * tcp_egress_flow_list_head is the head of tcp_egress.c's intrusive
+     * doubly-linked (D3) list; the struct is forward-declared in
+     * mqvpn_server_internal.h and defined only in tcp_egress.c, so the
+     * pointer is typed but the layout stays opaque here. */
+    int tcp_egress_global_fd_count;
+    /* Cumulative counters (never decrement), same STORAGE-only contract as
+     * tcp_egress_global_fd_count above — mutated only by tcp_egress.c via
+     * svr_get_tcp_egress_ctx. flows_total_opened counts every admitted
+     * egress flow; flows_rejected_cap counts every SYN refused by a cap
+     * (503) — the global fd-budget cap and the per-session tcp_max_flows
+     * cap, NOT ACL 403s or 5xx syscall failures. Surfaced as get_stats'
+     * tcp_flows_total / tcp_flows_rejected. */
+    uint64_t tcp_egress_flows_total_opened;
+    uint64_t tcp_egress_flows_rejected_cap;
+    struct svr_tcp_egress_flow_s *tcp_egress_flow_list_head;
+#endif
 
     /* Debug: tick thread assertion */
 #ifndef NDEBUG
@@ -176,13 +248,7 @@ struct mqvpn_server_s {
 static const char *
 mqvpn_scheduler_label(int s)
 {
-    switch (s) {
-    case MQVPN_SCHED_MINRTT: return "minrtt";
-    case MQVPN_SCHED_WLB: return "wlb";
-    case MQVPN_SCHED_BACKUP_FEC: return "backup_fec";
-    case MQVPN_SCHED_WLB_UDP_PIN: return "wlb_udp_pin";
-    default: return "unknown";
-    }
+    return mqvpn_sched_to_name((mqvpn_scheduler_t)s);
 }
 
 static uint64_t
@@ -198,6 +264,32 @@ now_us(void)
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000000 + (uint64_t)tv.tv_usec;
 #endif
+}
+
+/* One-shot at mqvpn_server_new (rlimit-derived headroom under the
+ * config-supplied cap, config.hybrid.tcp_max_global_flows — TcpMaxGlobalFlows
+ * in INI/JSON, MQVPN_TCP_MAX_GLOBAL_FLOWS_DEFAULT if unset); the result is
+ * stored in s->egress_fd_budget and intentionally never recomputed — see
+ * that field's comment for the admission/registry non-divergence rationale.
+ * `configured_max` is a plain uint32_t (not the whole config struct) so this
+ * stays a pure, easily-unit-testable function of its input. */
+static int
+svr_compute_egress_fd_budget(uint32_t configured_max)
+{
+    int budget = (configured_max > (uint32_t)INT_MAX) ? INT_MAX : (int)configured_max;
+#ifndef _WIN32
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY &&
+        rl.rlim_cur <= (rlim_t)LLONG_MAX) {
+        /* Widen before subtracting/comparing: rlim_cur is unsigned and may
+         * exceed int range; the guards above keep the cast well-defined. */
+        long long headroom = (long long)rl.rlim_cur - 64;
+        if (headroom < 0) headroom = 0;
+        if (headroom < budget) budget = (int)headroom;
+    }
+#endif
+    if (budget < 0) budget = 0;
+    return budget;
 }
 
 static int64_t
@@ -284,21 +376,15 @@ svr_log_conn_stats(mqvpn_server_t *s, const char *tag, const xqc_cid_t *cid)
     free(st.paths_info);
 }
 
-/* ─── ICMP PTB rate limiter ─── */
+/* ─── ICMP PTB rate limiter ───
+ * Thin wrapper around the shared bucket (src/reorder_gate.h, also used by
+ * mqvpn_client.c) so the many call sites below stay untouched; only the
+ * struct field and the refill logic itself moved. */
 
 static int
 ptb_rate_allow(mqvpn_server_t *s)
 {
-    int64_t ms = now_ms_mono();
-    if (ms - s->ptb_refill_ms >= 1000) {
-        s->ptb_tokens = PTB_RATE_LIMIT;
-        s->ptb_refill_ms = ms;
-    }
-    if (s->ptb_tokens > 0) {
-        s->ptb_tokens--;
-        return 1;
-    }
-    return 0;
+    return mqvpn_ptb_bucket_allow(&s->ptb_bucket, now_ms_mono());
 }
 
 /* ─── Thin wrapper: send ICMP packet via MASQUE datagram to client ─── */
@@ -372,7 +458,8 @@ svr_do_send(mqvpn_server_t *s, const unsigned char *buf, size_t size,
     if (s->udp_fd < 0) return XQC_SOCKET_ERROR;
     ssize_t res;
     do {
-        res = sendto(s->udp_fd, buf, size, 0, peer, peerlen);
+        /* Winsock sendto() len is int; cast silences C4267 under /WX (size<=MTU). */
+        res = sendto(s->udp_fd, buf, (int)size, 0, peer, peerlen);
     } while (res < 0 && errno == EINTR);
     if (res < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return XQC_SOCKET_EAGAIN;
@@ -414,9 +501,29 @@ cb_accept(xqc_engine_t *engine, xqc_connection_t *conn, const xqc_cid_t *cid,
           void *user_data)
 {
     (void)engine;
-    (void)conn;
-    (void)cid;
     mqvpn_server_t *s = (mqvpn_server_t *)user_data;
+
+    /* Allocate the per-connection context at the headmost server callback and
+     * bind it as the transport user_data NOW. Immediately after this returns,
+     * xquic sets SERVER_ACCEPT and every server->client send switches to
+     * cb_write_socket, which reinterprets conn_user_data as an svr_conn_t*.
+     * Binding it here closes the pre-handshake window in which conn_user_data
+     * was still the engine handle (mqvpn_server_t *) — a type confusion an
+     * unauthenticated no-ALPN / no-SNI probe could turn into a remote crash
+     * (svr_conn_t.server aliases mqvpn_config_t.server_host at offset 0).
+     * cb_h3_conn_create later fills in the H3-specific fields; the context is
+     * freed by cb_h3_conn_close (H3 was reached) or cb_refuse (connection
+     * closed before H3). */
+    svr_conn_t *conn_ctx = calloc(1, sizeof(*conn_ctx));
+    if (!conn_ctx) {
+        LOG_E(s, "accept: connection context alloc failed");
+        return -1; /* refuse: SERVER_ACCEPT is not set, nothing to free */
+    }
+    conn_ctx->server = s;
+    /* cid may be misaligned inside xquic's internal structures */
+    memcpy(&conn_ctx->cid, (const void *)cid, sizeof(conn_ctx->cid));
+    xqc_conn_set_transport_user_data(conn, conn_ctx);
+
     LOG_I(s, "connection accepted");
     return 0;
 }
@@ -428,11 +535,16 @@ cb_refuse(xqc_engine_t *engine, xqc_connection_t *conn, const xqc_cid_t *cid,
     (void)engine;
     (void)conn;
     (void)cid;
-    (void)user_data;
-    /* No per-connection context is allocated in cb_accept.
-     * svr_conn_t is allocated in cb_h3_conn_create and freed in cb_h3_conn_close.
-     * If refuse fires before H3 setup, user_data is the engine user_data
-     * (mqvpn_server_t *), which must NOT be freed. */
+    /* Fires from xqc_conn_destroy for a connection that set SERVER_ACCEPT but
+     * never negotiated an ALPN — so cb_h3_conn_create / cb_h3_conn_close never
+     * ran. user_data is the svr_conn_t* bound in cb_accept; free it here. This
+     * is the pre-H3 counterpart of cb_h3_conn_close, and the two are mutually
+     * exclusive in xqc_conn_destroy (UPPER_CONN_EXIST selects the ALPN close
+     * path, else SERVER_ACCEPT selects refuse), so there is no double free.
+     * Such a connection never entered the session table or addr pool, so no
+     * other bookkeeping is required. */
+    svr_conn_t *conn_ctx = (svr_conn_t *)user_data;
+    if (conn_ctx) svr_conn_free(conn_ctx);
 }
 
 static ssize_t
@@ -474,13 +586,14 @@ cb_path_removed(const xqc_cid_t *cid, uint64_t path_id, void *conn_user_data)
 static int
 cb_h3_conn_create(xqc_h3_conn_t *h3_conn, const xqc_cid_t *cid, void *conn_user_data)
 {
-    /* For server-side connections, xquic passes engine_user_data
-     * as conn_user_data initially (set during xqc_engine_create). */
-    mqvpn_server_t *s = (mqvpn_server_t *)conn_user_data;
-
-    svr_conn_t *conn = calloc(1, sizeof(*conn));
+    /* The per-connection context was allocated and bound as the transport
+     * user_data back in cb_accept; xquic hands it back here (conn_create_notify
+     * passes conn->user_data). Fill in the H3-specific fields — do NOT
+     * allocate a second context. */
+    svr_conn_t *conn = (svr_conn_t *)conn_user_data;
     if (!conn) return -1;
-    conn->server = s;
+    mqvpn_server_t *s = conn->server;
+
     conn->h3_conn = h3_conn;
     /* cid may be misaligned inside xquic's internal structures */
     memcpy(&conn->cid, (const void *)cid, sizeof(conn->cid));
@@ -581,12 +694,30 @@ cb_h3_handshake_finished(xqc_h3_conn_t *h3_conn, void *conn_user_data)
  *  MASQUE session handling
  * ================================================================ */
 
+/* Canned error responses. Callers on the H3 read-notify path deliberately
+ * ignore the return value: escalating a failed canned-response send by
+ * returning an error from the notify callback would kill the whole H3
+ * connection (XQC_H3_CONN_ERR) — worse than dropping the reply. */
 static int
 svr_masque_send_403(xqc_h3_request_t *h3_request)
 {
     xqc_http_header_t resp[] = {
         {.name = {.iov_base = ":status", .iov_len = 7},
          .value = {.iov_base = "403", .iov_len = 3},
+         .flags = 0},
+    };
+    xqc_http_headers_t hdrs = {.headers = resp, .count = 1, .capacity = 1};
+    return xqc_h3_request_send_headers(h3_request, &hdrs, 1) < 0 ? -1 : 0;
+}
+
+/* Unrecognized :protocol (or missing Extended CONNECT framing entirely):
+ * explicit 501, replacing the historical silent capsule fall-through. */
+static int
+svr_masque_send_501(xqc_h3_request_t *h3_request)
+{
+    xqc_http_header_t resp[] = {
+        {.name = {.iov_base = ":status", .iov_len = 7},
+         .value = {.iov_base = "501", .iov_len = 3},
          .flags = 0},
     };
     xqc_http_headers_t hdrs = {.headers = resp, .count = 1, .capacity = 1};
@@ -842,6 +973,7 @@ cb_request_create(xqc_h3_request_t *h3_request, void *strm_user_data)
     (void)strm_user_data;
     svr_conn_t *conn = xqc_h3_get_conn_user_data_by_request(h3_request);
 
+    /* calloc zero-inits role to SVR_STREAM_ROLE_UNKNOWN. */
     svr_stream_t *stream = calloc(1, sizeof(*stream));
     if (!stream) return -1;
     stream->conn = conn;
@@ -856,19 +988,395 @@ cb_request_close(xqc_h3_request_t *h3_request, void *strm_user_data)
     (void)h3_request;
     svr_stream_t *stream = (svr_stream_t *)strm_user_data;
     if (stream) {
-        if (stream->conn) stream->conn->tunnel_established = 0;
+        /* Only the CONNECT-IP tunnel stream owns tunnel_established — a
+         * closing non-tunnel stream (per-flow connect-tcp, or a 501'd
+         * unknown request) on the same H3 connection must not flip the
+         * tunnel dead. Mirrors the client-side role gate in
+         * mqvpn_client.c's cb_request_close. */
+        if (stream->conn && stream->role == SVR_STREAM_ROLE_CONNECT_IP)
+            stream->conn->tunnel_established = 0;
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+        /* A connect-tcp stream can close (client resets it, or the H3
+         * connection itself is torn down) while its egress flow is still
+         * CONNECTING or ACTIVE. Tear the flow down here too — closes the
+         * fd, unregisters it from the platform reactor, unlinks it from
+         * the D3 tick list, decrements both flow counters, and frees it.
+         * If the flow already went through svr_tcp_egress_flow_destroy via
+         * fail_connect/timeout (which NULLs this same field), this is a
+         * no-op: exactly-once teardown either way, and destroy never
+         * touches h3_request so calling it from a stream-close path (where
+         * the request is already going away) is safe. */
+        if (stream->role == SVR_STREAM_ROLE_CONNECT_TCP && stream->conn &&
+            stream->tcp_egress_flow) {
+            svr_tcp_egress_flow_destroy(stream->conn->server, stream->tcp_egress_flow);
+        }
+#endif
         free(stream->capsule_buf);
         free(stream);
     }
     return 0;
 }
 
+/* svr_req_headers_t is shared with src/hybrid/tcp_egress.c — defined in
+ * mqvpn_server_internal.h (see that header for why only this struct + two
+ * accessor functions moved, not the rest of this file's internals). */
+
+/* Walks the header list; also sets conn->peer_reorder_supported on the
+ * mqvpn-reorder echo (deliberate side effect). */
+static void
+svr_parse_request_headers(mqvpn_server_t *s, svr_stream_t *stream,
+                          xqc_http_headers_t *headers, svr_req_headers_t *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    for (int i = 0; i < (int)headers->count; i++) {
+        xqc_http_header_t *h = &headers->headers[i];
+        if (h->name.iov_len == 7 && memcmp(h->name.iov_base, ":method", 7) == 0 &&
+            h->value.iov_len == 7 && memcmp(h->value.iov_base, "CONNECT", 7) == 0)
+            out->is_connect = 1;
+        if (h->name.iov_len == 9 && memcmp(h->name.iov_base, ":protocol", 9) == 0) {
+            out->protocol = (const char *)h->value.iov_base;
+            out->protocol_len = h->value.iov_len;
+            if (h->value.iov_len == 10 &&
+                memcmp(h->value.iov_base, "connect-ip", 10) == 0)
+                out->is_connect_ip = 1;
+        }
+        if (h->name.iov_len == 7 && memcmp(h->name.iov_base, ":scheme", 7) == 0 &&
+            h->value.iov_len == 5 && memcmp(h->value.iov_base, "https", 5) == 0)
+            out->has_scheme_https = 1;
+        if (h->name.iov_len == 5 && memcmp(h->name.iov_base, ":path", 5) == 0) {
+            /* Raw capture for connect-tcp's own template parse
+             * (svr_tcp_egress_parse_path); has_valid_path below stays
+             * CONNECT-IP's specific fixed-prefix check. */
+            out->path = (const char *)h->value.iov_base;
+            out->path_len = h->value.iov_len;
+            if (h->value.iov_len >= 24 &&
+                memcmp(h->value.iov_base, "/.well-known/masque/ip/", 22) == 0)
+                out->has_valid_path = 1;
+        }
+        if (h->name.iov_len == 16 &&
+            memcmp(h->name.iov_base, "capsule-protocol", 16) == 0 &&
+            h->value.iov_len == 2 && memcmp(h->value.iov_base, "?1", 2) == 0)
+            out->has_capsule_proto = 1;
+        if (h->name.iov_len == 13 && memcmp(h->name.iov_base, "authorization", 13) == 0 &&
+            h->value.iov_len > 7 && memcmp(h->value.iov_base, "Bearer ", 7) == 0) {
+            out->auth_token = (const char *)h->value.iov_base + 7;
+            out->auth_token_len = h->value.iov_len - 7;
+        }
+        /* §19.3: client advertised mqvpn-reorder → it supports the shim. */
+        if (mqvpn_reorder_header_match(h->name.iov_base, h->name.iov_len,
+                                       h->value.iov_base, h->value.iov_len)) {
+            stream->conn->peer_reorder_supported = 1;
+            LOG_I(s, "client advertised mqvpn-reorder");
+        }
+    }
+}
+
+/* Whether request-level auth must be checked at all — shared by CONNECT-IP
+ * and connect-tcp so the two protocols can never silently diverge on this.
+ * Declared in mqvpn_server_internal.h. */
+int
+svr_auth_required(const mqvpn_server_t *s)
+{
+    return (s->config.auth_key[0] != '\0') || (s->config.n_users > 0);
+}
+
+/* Credential check shared by every authenticated request type (CONNECT-IP,
+ * connect-tcp). Constant-time over the global PSK and ALL configured users
+ * regardless of early match. Returns 0 and writes the matched identity
+ * ("(global)" or the user name) into out_username on success; -1 on
+ * failure. Does NOT touch conn state and does NOT log — the caller records
+ * username/connected_at_us, logs, and sends the 403. Precondition: caller
+ * has already determined auth is required (svr_auth_required); with no
+ * credentials configured this always returns -1. Declared (non-static) in
+ * mqvpn_server_internal.h for src/hybrid/tcp_egress.c. */
+int
+svr_auth_check(const mqvpn_server_t *s, const char *auth_token, size_t auth_token_len,
+               char *out_username, size_t username_cap)
+{
+    int authed = 0;
+
+    if (username_cap > 0) out_username[0] = '\0';
+
+    if (auth_token) {
+        if (s->config.auth_key[0] != '\0' &&
+            mqvpn_auth_ct_compare(auth_token, auth_token_len, s->config.auth_key,
+                                  strlen(s->config.auth_key)) == 0) {
+            authed = 1;
+        }
+
+        /* Always iterate all users to keep timing constant */
+        for (int i = 0; i < s->config.n_users; i++) {
+            const char *expected_key = s->config.user_keys[i];
+            if (expected_key[0] == '\0') continue;
+            authed |= (mqvpn_auth_ct_compare(auth_token, auth_token_len, expected_key,
+                                             strlen(expected_key)) == 0);
+        }
+    }
+
+    if (!authed) return -1;
+
+    /* Record which user matched (second pass, not timing-sensitive) */
+    if (s->config.auth_key[0] != '\0' &&
+        mqvpn_auth_ct_compare(auth_token, auth_token_len, s->config.auth_key,
+                              strlen(s->config.auth_key)) == 0) {
+        snprintf(out_username, username_cap, "(global)");
+    } else {
+        for (int i = 0; i < s->config.n_users; i++) {
+            const char *ek = s->config.user_keys[i];
+            if (ek[0] != '\0' &&
+                mqvpn_auth_ct_compare(auth_token, auth_token_len, ek, strlen(ek)) == 0) {
+                snprintf(out_username, username_cap, "%s", s->config.user_names[i]);
+                break;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/* CONNECT-IP request: header-phase handling (validate, auth, 200 response).
+ * Returns 0 on success, -1 to reset the stream. */
+static int
+svr_connect_ip_on_request(mqvpn_server_t *s, svr_stream_t *stream,
+                          xqc_h3_request_t *h3_request, const svr_req_headers_t *hdrs)
+{
+    if (!hdrs->has_scheme_https || !hdrs->has_valid_path || !hdrs->has_capsule_proto) {
+        LOG_W(s,
+              "rejecting CONNECT-IP: missing headers "
+              "(scheme=%d path=%d capsule=%d)",
+              hdrs->has_scheme_https, hdrs->has_valid_path, hdrs->has_capsule_proto);
+        return -1;
+    }
+
+    if (svr_auth_required(s)) {
+        char username[sizeof(stream->conn->username)];
+
+        if (svr_auth_check(s, hdrs->auth_token, hdrs->auth_token_len, username,
+                           sizeof(username)) != 0) {
+            LOG_W(s, "authentication failed: invalid or missing PSK");
+            svr_masque_send_403(h3_request);
+            return -1;
+        }
+
+        stream->conn->connected_at_us = now_us();
+        snprintf(stream->conn->username, sizeof(stream->conn->username), "%s", username);
+
+        LOG_I(s, "client authenticated successfully (user=%s)", stream->conn->username);
+    }
+
+    LOG_I(s, "Extended CONNECT for connect-ip received");
+    if (svr_masque_send_response(h3_request, stream) < 0) return -1;
+    return 0;
+}
+
+/* Egress ACL policy snapshot for src/hybrid/tcp_egress.c (connect-tcp
+ * destination check). Declared in mqvpn_server_internal.h. The v4 tunnel
+ * subnet (tunnels[0]) is derived from the SAME address pool CONNECT-IP
+ * address assignment uses (s->pool) — addr_pool.c enforces prefix_len in
+ * [16,30] at init time, so mqvpn_cidr_premask below never hits a
+ * pathological prefix from arbitrary (config-supplied) egress_allow/
+ * egress_deny entries. tunnels[1] (v6) mirrors tunnels[0] from s->pool.base6/
+ * prefix6, but ONLY when s->pool.has_v6 (i.e. Subnet6 was configured) —
+ * left at family == 0 (the unset sentinel) otherwise. This gate is
+ * load-bearing, not cosmetic: mqvpn_cidr_match ignores prefix_len when
+ * family == 0, but a same-shaped {family=6, prefix_len=0} would be
+ * indistinguishable from a real "::/0" entry and would match EVERY v6
+ * address, silently denying all v6 egress for any server that never
+ * configured Subnet6. */
+void
+svr_get_egress_policy(const mqvpn_server_t *s, const mqvpn_cidr_entry_t **allow,
+                      int *n_allow, const mqvpn_cidr_entry_t **deny, int *n_deny,
+                      mqvpn_cidr_entry_t tunnels[2])
+{
+    *allow = s->config.hybrid.egress_allow;
+    *n_allow = s->config.hybrid.n_egress_allow;
+    *deny = s->config.hybrid.egress_deny;
+    *n_deny = s->config.hybrid.n_egress_deny;
+
+    memset(&tunnels[0], 0, sizeof(tunnels[0]));
+    tunnels[0].family = 4;
+    tunnels[0].prefix_len = (uint8_t)s->pool.prefix_len;
+    uint32_t net_hip = ntohl(s->pool.base.s_addr);
+    tunnels[0].net[0] = (uint8_t)(net_hip >> 24);
+    tunnels[0].net[1] = (uint8_t)(net_hip >> 16);
+    tunnels[0].net[2] = (uint8_t)(net_hip >> 8);
+    tunnels[0].net[3] = (uint8_t)(net_hip);
+    mqvpn_cidr_premask(tunnels[0].net, tunnels[0].prefix_len);
+
+    memset(&tunnels[1], 0, sizeof(tunnels[1]));
+    if (s->pool.has_v6) {
+        tunnels[1].family = 6;
+        tunnels[1].prefix_len = (uint8_t)s->pool.prefix6;
+        memcpy(tunnels[1].net, s->pool.base6.s6_addr, 16);
+        mqvpn_cidr_premask(tunnels[1].net, tunnels[1].prefix_len);
+    }
+    /* else: family stays 0 (memset above) — the unset sentinel, NOT a
+     * {family=6, prefix_len=0} "match everything" shape. See the has_v6
+     * gate rationale in this function's docstring. */
+}
+
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+/* ---- connect()/relay boundary accessors for src/hybrid/tcp_egress.c ----
+ * See the docstring block in mqvpn_server_internal.h for why each of these
+ * exists as its own narrow function. */
+
+void **
+svr_stream_tcp_egress_flow_ptr(void *stream)
+{
+    svr_stream_t *st = (svr_stream_t *)stream;
+    return st ? &st->tcp_egress_flow : NULL;
+}
+
+int *
+svr_conn_tcp_flow_count_ptr(void *stream)
+{
+    svr_stream_t *st = (svr_stream_t *)stream;
+    if (!st || !st->conn) return NULL;
+    return &st->conn->tcp_flow_count;
+}
+
+void
+svr_get_tcp_egress_ctx(mqvpn_server_t *s, svr_tcp_egress_srv_ctx_t *out)
+{
+    out->flow_list_head = &s->tcp_egress_flow_list_head;
+    out->global_fd_count = &s->tcp_egress_global_fd_count;
+    out->flows_total_opened = &s->tcp_egress_flows_total_opened;
+    out->flows_rejected_cap = &s->tcp_egress_flows_rejected_cap;
+    out->tcp_max_flows = s->config.hybrid.tcp_max_flows;
+    out->tcp_connect_timeout_sec = s->config.hybrid.tcp_connect_timeout_sec;
+    out->tcp_idle_timeout_sec = s->config.hybrid.tcp_idle_timeout_sec;
+    out->global_fd_budget = s->egress_fd_budget; /* frozen at server_new */
+}
+
+int
+svr_egress_fd_register(mqvpn_server_t *s, int fd, int want_read, int want_write,
+                       void *fd_ctx)
+{
+    if (!s->cbs.egress_fd_register) return -1;
+    s->cbs.egress_fd_register(fd, want_read, want_write, fd_ctx, s->user_ctx);
+    return 0;
+}
+
+int
+svr_egress_fd_register_is_set(mqvpn_server_t *s)
+{
+    return s->cbs.egress_fd_register != NULL;
+}
+
+void
+svr_egress_fd_unregister(mqvpn_server_t *s, int fd)
+{
+    if (s->cbs.egress_fd_unregister) s->cbs.egress_fd_unregister(fd, s->user_ctx);
+}
+
+uint64_t
+svr_now_us(void)
+{
+    return now_us();
+}
+
+/* Formats once locally, then hands the finished string to server_log as a
+ * literal "%s" argument — reuses server_log's null/level-gate and cbs.log
+ * dispatch instead of duplicating them here (server_log can't take a
+ * va_list, so a one-shot vsnprintf is the only way to bridge `...`). */
+void
+svr_log(mqvpn_server_t *s, mqvpn_log_level_t level, const char *fmt, ...)
+{
+    if (!s->cbs.log || level < s->log_level) return;
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    server_log(s, level, "%s", buf);
+}
+#endif /* MQVPN_HYBRID_TCP_EGRESS_ENABLED */
+
+/* CONNECT-IP stream body: capsule reassembly + ADDRESS_REQUEST handling. */
+static int
+svr_connect_ip_on_body(mqvpn_server_t *s, svr_stream_t *stream,
+                       xqc_h3_request_t *h3_request)
+{
+    unsigned char fin = 0;
+    unsigned char buf[4096];
+    ssize_t n;
+    do {
+        n = xqc_h3_request_recv_body(h3_request, buf, sizeof(buf), &fin);
+        if (n <= 0) break;
+
+        size_t need = stream->capsule_len + (size_t)n;
+        if (need > MAX_CAPSULE_BUF) {
+            LOG_E(s, "server capsule buffer overflow");
+            break;
+        }
+        if (need > stream->capsule_cap) {
+            size_t new_cap = stream->capsule_cap ? stream->capsule_cap * 2 : 4096;
+            while (new_cap < need) {
+                if (new_cap > SIZE_MAX / 2) {
+                    new_cap = need;
+                    break;
+                }
+                new_cap *= 2;
+            }
+            uint8_t *nb = realloc(stream->capsule_buf, new_cap);
+            if (!nb) break;
+            stream->capsule_buf = nb;
+            stream->capsule_cap = new_cap;
+        }
+        memcpy(stream->capsule_buf + stream->capsule_len, buf, (size_t)n);
+        stream->capsule_len += (size_t)n;
+
+        while (stream->capsule_len > 0) {
+            uint64_t cap_type;
+            const uint8_t *cap_payload;
+            size_t cap_len, consumed;
+            xqc_int_t xr =
+                xqc_h3_ext_capsule_decode(stream->capsule_buf, stream->capsule_len,
+                                          &cap_type, &cap_payload, &cap_len, &consumed);
+            if (xr != XQC_OK) break;
+
+            if (cap_type == XQC_H3_CAPSULE_ADDRESS_REQUEST && stream->conn &&
+                stream->conn->tunnel_established) {
+                uint64_t req_id;
+                uint8_t ip_ver, ip_addr[16], prefix;
+                size_t ip_len = 16, aa_consumed;
+                xr = xqc_h3_ext_connectip_parse_address_assign(
+                    cap_payload, cap_len, &req_id, &ip_ver, ip_addr, &ip_len, &prefix,
+                    &aa_consumed);
+                if (xr == XQC_OK && req_id != 0) {
+                    LOG_I(s, "ADDRESS_REQUEST: req_id=%" PRIu64 " ipv%d", req_id, ip_ver);
+                    uint8_t resp_payload[64];
+                    size_t resp_written = 0;
+                    uint8_t resp_ip[4];
+                    memcpy(resp_ip, &stream->conn->assigned_ip.s_addr, 4);
+                    xqc_h3_ext_connectip_build_address_request(
+                        resp_payload, sizeof(resp_payload), &resp_written, req_id, 4,
+                        resp_ip, 32);
+                    uint8_t cap_buf[128];
+                    size_t cap_w = 0;
+                    xqc_h3_ext_capsule_encode(cap_buf, sizeof(cap_buf), &cap_w,
+                                              XQC_H3_CAPSULE_ADDRESS_ASSIGN, resp_payload,
+                                              resp_written);
+                    xqc_h3_request_send_body(h3_request, cap_buf, cap_w, 0);
+                }
+            }
+
+            if (consumed < stream->capsule_len)
+                memmove(stream->capsule_buf, stream->capsule_buf + consumed,
+                        stream->capsule_len - consumed);
+            stream->capsule_len -= consumed;
+        }
+    } while (1);
+
+    return 0;
+}
+
 /*
  * cb_request_read — xquic H3 request read callback for MASQUE streams.
  *
- * Handles the CONNECT-IP handshake (header validation, 200 response,
- * DATAGRAM context setup) and processes incoming MASQUE capsules
- * (ADDRESS_REQUEST → allocate IP, ROUTE_ADVERTISEMENT parsing).
+ * Parses request headers, tags the stream's role, and dispatches to the
+ * role's handlers (header phase and body phase).
  */
 static int
 cb_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t flag,
@@ -882,186 +1390,80 @@ cb_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t flag,
         xqc_http_headers_t *headers = xqc_h3_request_recv_headers(h3_request, &fin);
         if (!headers) return -1;
 
-        int is_connect = 0, is_connect_ip = 0;
-        int has_scheme_https = 0, has_capsule_proto = 0, has_valid_path = 0;
-        const char *auth_token = NULL;
-        size_t auth_token_len = 0;
+        svr_req_headers_t hdrs;
+        svr_parse_request_headers(s, stream, headers, &hdrs);
 
-        for (int i = 0; i < (int)headers->count; i++) {
-            xqc_http_header_t *h = &headers->headers[i];
-            if (h->name.iov_len == 7 && memcmp(h->name.iov_base, ":method", 7) == 0 &&
-                h->value.iov_len == 7 && memcmp(h->value.iov_base, "CONNECT", 7) == 0)
-                is_connect = 1;
-            if (h->name.iov_len == 9 && memcmp(h->name.iov_base, ":protocol", 9) == 0 &&
-                h->value.iov_len == 10 &&
-                memcmp(h->value.iov_base, "connect-ip", 10) == 0)
-                is_connect_ip = 1;
-            if (h->name.iov_len == 7 && memcmp(h->name.iov_base, ":scheme", 7) == 0 &&
-                h->value.iov_len == 5 && memcmp(h->value.iov_base, "https", 5) == 0)
-                has_scheme_https = 1;
-            if (h->name.iov_len == 5 && memcmp(h->name.iov_base, ":path", 5) == 0 &&
-                h->value.iov_len >= 24 &&
-                memcmp(h->value.iov_base, "/.well-known/masque/ip/", 22) == 0)
-                has_valid_path = 1;
-            if (h->name.iov_len == 16 &&
-                memcmp(h->name.iov_base, "capsule-protocol", 16) == 0 &&
-                h->value.iov_len == 2 && memcmp(h->value.iov_base, "?1", 2) == 0)
-                has_capsule_proto = 1;
-            if (h->name.iov_len == 13 &&
-                memcmp(h->name.iov_base, "authorization", 13) == 0 &&
-                h->value.iov_len > 7 && memcmp(h->value.iov_base, "Bearer ", 7) == 0) {
-                auth_token = (const char *)h->value.iov_base + 7;
-                auth_token_len = h->value.iov_len - 7;
-            }
-            /* §19.3: client advertised mqvpn-reorder → it supports the shim. */
-            if (mqvpn_reorder_header_match(h->name.iov_base, h->name.iov_len,
-                                           h->value.iov_base, h->value.iov_len)) {
-                stream->conn->peer_reorder_supported = 1;
-                LOG_I(s, "client advertised mqvpn-reorder");
-            }
+        if (hdrs.is_connect && hdrs.is_connect_ip) {
+            /* Role is tagged even though the handler may still fail with -1
+             * (stream reset); harmless — a reset stream's role is never
+             * consulted again. */
+            stream->role = SVR_STREAM_ROLE_CONNECT_IP;
+            return svr_connect_ip_on_request(s, stream, h3_request, &hdrs);
         }
-
-        if (is_connect && is_connect_ip) {
-            if (!has_scheme_https || !has_valid_path || !has_capsule_proto) {
-                LOG_W(s,
-                      "rejecting CONNECT-IP: missing headers "
-                      "(scheme=%d path=%d capsule=%d)",
-                      has_scheme_https, has_valid_path, has_capsule_proto);
-                return -1;
-            }
-
-            int auth_required =
-                (s->config.auth_key[0] != '\0') || (s->config.n_users > 0);
-            if (auth_required) {
-                int authed = 0;
-
-                if (auth_token) {
-                    if (s->config.auth_key[0] != '\0' &&
-                        mqvpn_auth_ct_compare(auth_token, auth_token_len,
-                                              s->config.auth_key,
-                                              strlen(s->config.auth_key)) == 0) {
-                        authed = 1;
-                    }
-
-                    /* Always iterate all users to keep timing constant */
-                    for (int i = 0; i < s->config.n_users; i++) {
-                        const char *expected_key = s->config.user_keys[i];
-                        if (expected_key[0] == '\0') continue;
-                        authed |= (mqvpn_auth_ct_compare(auth_token, auth_token_len,
-                                                         expected_key,
-                                                         strlen(expected_key)) == 0);
-                    }
-                }
-
-                if (!authed) {
-                    LOG_W(s, "authentication failed: invalid or missing PSK");
-                    svr_masque_send_403(h3_request);
-                    return -1;
-                }
-
-                /* Record which user matched (second pass, not timing-sensitive) */
-                stream->conn->connected_at_us = now_us();
-                if (s->config.auth_key[0] != '\0' &&
-                    mqvpn_auth_ct_compare(auth_token, auth_token_len, s->config.auth_key,
-                                          strlen(s->config.auth_key)) == 0) {
-                    snprintf(stream->conn->username, sizeof(stream->conn->username),
-                             "(global)");
-                } else {
-                    for (int i = 0; i < s->config.n_users; i++) {
-                        const char *ek = s->config.user_keys[i];
-                        if (ek[0] != '\0' &&
-                            mqvpn_auth_ct_compare(auth_token, auth_token_len, ek,
-                                                  strlen(ek)) == 0) {
-                            snprintf(stream->conn->username,
-                                     sizeof(stream->conn->username), "%s",
-                                     s->config.user_names[i]);
-                            break;
-                        }
-                    }
-                }
-
-                LOG_I(s, "client authenticated successfully (user=%s)",
-                      stream->conn->username);
-            }
-
-            LOG_I(s, "Extended CONNECT for connect-ip received");
-            if (svr_masque_send_response(h3_request, stream) < 0) return -1;
-            return 0;
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+        /* [Hybrid] Enabled is a client+server kill switch (docs/control-api.md),
+         * default false, and IS parsed into config.hybrid.enabled (config.c
+         * CFG_BOOL(SEC_HYBRID, "Enabled", ...)). Gating on the compile flag
+         * alone means a hybrid-compiled server with Enabled=false still
+         * serves egress — require the runtime flag too. A disabled feature
+         * is treated exactly like an unrecognized protocol: fall through to
+         * the 501 below rather than a dedicated status, since the server
+         * offers no such capability right now. */
+        if (hdrs.is_connect && hdrs.protocol_len == 9 &&
+            memcmp(hdrs.protocol, "mqvpn-tcp", 9) == 0 && s->config.hybrid.enabled) {
+            stream->role = SVR_STREAM_ROLE_CONNECT_TCP;
+            return svr_tcp_egress_on_request(s, stream, h3_request, &hdrs);
         }
+#endif
+        /* Unrecognized request: explicit 501, replacing the historical
+         * silent fall-through. Role stays UNKNOWN — no body is expected. */
+        svr_masque_send_501(h3_request);
+        return 0;
     }
 
-    /* Parse capsule traffic (ADDRESS_REQUEST) */
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+    /* READ_BODY is the common case; READ_EMPTY_FIN is the OTHER real wire
+     * shape for a downlink close (third_party/xquic src/http3/xqc_h3_request.c
+     * xqc_h3_request_on_recv_empty_fin): fired standalone, WITHOUT READ_BODY,
+     * when a bodiless FIN STREAM frame arrives while the request's read_flag
+     * is back to NULL (no header/body notify still pending application
+     * consumption — see that function's own guard). Missing this notify
+     * would mean a peer that FINs on an idle/fully-drained stream never gets
+     * its downlink half-close observed, so shutdown(fd, SHUT_WR) is never
+     * issued and a peer waiting for EOF hangs. Mirrors the client's handling
+     * at mqvpn_client.c cb_request_read (CLI_STREAM_ROLE_CONNECT_TCP case).
+     * svr_tcp_egress_on_body/svr_tcp_egress_drain_body correctly report this
+     * as n==0 && *fin==1 either way, so one handler covers both notify
+     * shapes; this is scoped to CONNECT_TCP only — CONNECT_IP and UNKNOWN
+     * are unaffected and still route through the switch below. */
+    if (stream->role == SVR_STREAM_ROLE_CONNECT_TCP &&
+        (flag & (XQC_REQ_NOTIFY_READ_BODY | XQC_REQ_NOTIFY_READ_EMPTY_FIN))) {
+        return svr_tcp_egress_on_body(s, stream, h3_request);
+    }
+#endif
+
     if (flag & XQC_REQ_NOTIFY_READ_BODY) {
-        unsigned char buf[4096];
-        ssize_t n;
-        do {
-            n = xqc_h3_request_recv_body(h3_request, buf, sizeof(buf), &fin);
-            if (n <= 0) break;
-
-            size_t need = stream->capsule_len + (size_t)n;
-            if (need > MAX_CAPSULE_BUF) {
-                LOG_E(s, "server capsule buffer overflow");
-                break;
+        switch (stream->role) {
+        case SVR_STREAM_ROLE_CONNECT_IP:
+            return svr_connect_ip_on_body(s, stream, h3_request);
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+        case SVR_STREAM_ROLE_CONNECT_TCP:
+            /* Handled above in the CONNECT_TCP-scoped block
+             * (READ_BODY | READ_EMPTY_FIN); unreachable here, listed only
+             * to satisfy -Wswitch. */
+            return 0;
+#endif
+        case SVR_STREAM_ROLE_UNKNOWN: {
+            /* 501 already sent at header time. Drain and discard any body
+             * so it doesn't sit in xquic's recv buffers until flow control
+             * stalls. */
+            unsigned char drain[4096];
+            while (xqc_h3_request_recv_body(h3_request, drain, sizeof(drain), &fin) > 0) {
             }
-            if (need > stream->capsule_cap) {
-                size_t new_cap = stream->capsule_cap ? stream->capsule_cap * 2 : 4096;
-                while (new_cap < need) {
-                    if (new_cap > SIZE_MAX / 2) {
-                        new_cap = need;
-                        break;
-                    }
-                    new_cap *= 2;
-                }
-                uint8_t *nb = realloc(stream->capsule_buf, new_cap);
-                if (!nb) break;
-                stream->capsule_buf = nb;
-                stream->capsule_cap = new_cap;
-            }
-            memcpy(stream->capsule_buf + stream->capsule_len, buf, (size_t)n);
-            stream->capsule_len += (size_t)n;
-
-            while (stream->capsule_len > 0) {
-                uint64_t cap_type;
-                const uint8_t *cap_payload;
-                size_t cap_len, consumed;
-                xqc_int_t xr = xqc_h3_ext_capsule_decode(
-                    stream->capsule_buf, stream->capsule_len, &cap_type, &cap_payload,
-                    &cap_len, &consumed);
-                if (xr != XQC_OK) break;
-
-                if (cap_type == XQC_H3_CAPSULE_ADDRESS_REQUEST && stream->conn &&
-                    stream->conn->tunnel_established) {
-                    uint64_t req_id;
-                    uint8_t ip_ver, ip_addr[16], prefix;
-                    size_t ip_len = 16, aa_consumed;
-                    xr = xqc_h3_ext_connectip_parse_address_assign(
-                        cap_payload, cap_len, &req_id, &ip_ver, ip_addr, &ip_len, &prefix,
-                        &aa_consumed);
-                    if (xr == XQC_OK && req_id != 0) {
-                        LOG_I(s, "ADDRESS_REQUEST: req_id=%" PRIu64 " ipv%d", req_id,
-                              ip_ver);
-                        uint8_t resp_payload[64];
-                        size_t resp_written = 0;
-                        uint8_t resp_ip[4];
-                        memcpy(resp_ip, &stream->conn->assigned_ip.s_addr, 4);
-                        xqc_h3_ext_connectip_build_address_request(
-                            resp_payload, sizeof(resp_payload), &resp_written, req_id, 4,
-                            resp_ip, 32);
-                        uint8_t cap_buf[128];
-                        size_t cap_w = 0;
-                        xqc_h3_ext_capsule_encode(cap_buf, sizeof(cap_buf), &cap_w,
-                                                  XQC_H3_CAPSULE_ADDRESS_ASSIGN,
-                                                  resp_payload, resp_written);
-                        xqc_h3_request_send_body(h3_request, cap_buf, cap_w, 0);
-                    }
-                }
-
-                if (consumed < stream->capsule_len)
-                    memmove(stream->capsule_buf, stream->capsule_buf + consumed,
-                            stream->capsule_len - consumed);
-                stream->capsule_len -= consumed;
-            }
-        } while (1);
+            return 0;
+        }
+        }
+        return 0;
     }
 
     return 0;
@@ -1071,8 +1473,47 @@ static int
 cb_request_write(xqc_h3_request_t *h3_request, void *strm_user_data)
 {
     (void)h3_request;
-    (void)strm_user_data;
+    svr_stream_t *stream = (svr_stream_t *)strm_user_data;
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+    if (stream && stream->role == SVR_STREAM_ROLE_CONNECT_TCP && stream->conn) {
+        svr_tcp_egress_on_h3_writable(stream->conn->server, stream);
+    }
+#else
+    (void)stream;
+#endif
     return 0;
+}
+
+/* Peer sent RESET_STREAM — xquic is already tearing this
+ * request down (verified against the vendored source, same citation trail
+ * as mqvpn_client.c's cb_request_closing_notify: this notify fires ONLY on
+ * RESET_STREAM frame reception, never on STOP_SENDING alone or on a clean
+ * bidi-FIN completion). CONNECT-IP has no per-flow teardown concept of its
+ * own (its close is handled via cb_request_close/h3_conn_close_notify), so
+ * only the connect-tcp branch does anything here — reuses the EXISTING
+ * svr_tcp_egress_flow_destroy funnel (the same one cb_request_close below
+ * already calls for the connect-timeout/synchronous-failure paths): the
+ * `stream->tcp_egress_flow` guard is what makes this idempotent against a
+ * flow that already went through a different teardown (svr_tcp_egress_
+ * flow_destroy NULLs it), so whichever of this callback or
+ * cb_request_close reaches the flow first destroys it and the other is a
+ * no-op. (void)err: the flow is dead either way, no err-code-specific
+ * handling needed. */
+static void
+cb_request_closing_notify(xqc_h3_request_t *h3_request, xqc_int_t err,
+                          void *strm_user_data)
+{
+    (void)h3_request;
+    (void)err;
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+    svr_stream_t *stream = (svr_stream_t *)strm_user_data;
+    if (stream && stream->role == SVR_STREAM_ROLE_CONNECT_TCP && stream->conn &&
+        stream->tcp_egress_flow) {
+        svr_tcp_egress_flow_destroy(stream->conn->server, stream->tcp_egress_flow);
+    }
+#else
+    (void)strm_user_data;
+#endif
 }
 
 /* ================================================================
@@ -1259,14 +1700,43 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
     if (!s) return NULL;
 
     memcpy(&s->config, cfg, sizeof(*cfg));
-    memcpy(&s->cbs, cbs, sizeof(*cbs));
+    /* Clamp to the caller's struct_size: a platform built against an older
+     * (shorter) callbacks struct must not be over-read — appended fields
+     * stay NULL (s is calloc'd), which is the "callback unset" state. */
+    size_t cbs_size = (cbs->struct_size && cbs->struct_size < sizeof(*cbs))
+                          ? cbs->struct_size
+                          : sizeof(*cbs);
+    memcpy(&s->cbs, cbs, cbs_size);
     s->user_ctx = user_ctx;
     s->log_level = cfg->log_level;
     /* caller guarantees lifetime exceeds this object */ // lgtm[cpp/stack-address-escape]
     s->udp_fd = -1;
     s->max_clients = cfg->max_clients > 0 ? cfg->max_clients : 64;
-    s->ptb_tokens = PTB_RATE_LIMIT;
+    mqvpn_ptb_bucket_init(&s->ptb_bucket);
     s->boot_us = now_us();
+    /* Sanitize the [Hybrid] block at its consumer (validate-at-consumer
+     * pattern — same as mqvpn_reorder_config_validate run by
+     * mqvpn_reorder_rx_new): the INI/JSON loaders store raw scalars (CFG_U32
+     * accepts 0) and only the PUBLIC setters range-check, so a file config
+     * with e.g. TcpMaxGlobalFlows = 0 would otherwise freeze the egress fd
+     * budget at 0 below and silently 503 every connect-tcp request.
+     * PER-FIELD reset (mqvpn_hybrid_config_sanitize), never a whole-block
+     * default reset: that would silently drop the operator's EgressDeny/
+     * EgressAllow policy over an unrelated scalar typo — fail-open. Warned
+     * per field, matching the loaders' own per-key warn-and-ignore
+     * convention; never a hard server-start failure. */
+    {
+        const char *bad_fields[8];
+        int n_bad = mqvpn_hybrid_config_sanitize(&s->config.hybrid, bad_fields, 8);
+        for (int i = 0; i < n_bad && i < 8; i++)
+            LOG_W(s, "invalid [Hybrid] %s; using default", bad_fields[i]);
+    }
+    /* s->config was already populated by the memcpy above (and its hybrid
+     * scalars possibly sanitized just above) — the budget computation MUST
+     * read the applied config, not `cfg` directly, so a future refactor that
+     * changes what memcpy copies can't silently desync the two. */
+    s->egress_fd_budget =
+        svr_compute_egress_fd_budget(s->config.hybrid.tcp_max_global_flows);
 
     /* Initialize address pool */
     if (cfg->subnet[0] == '\0') {
@@ -1282,6 +1752,24 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
             LOG_E(s, "failed to init IPv6 pool: %s", cfg->subnet6);
             goto cleanup;
         }
+    }
+
+    /* Startup advisory, not a refusal: a pool wider than /24 is legal
+     * (addr_pool.c allows prefix_len in [16,30]) and plenty of deployments
+     * never use intra-VPN client-to-client TCP. But the client widens its
+     * assigned /32 to /24 for the tunnel-subnet RAW gate, and the server's
+     * egress ACL denies the full pool subnet, so two clients outside a
+     * shared /24 within a wider pool get their hybrid TCP-lane traffic
+     * silently, permanently RST'd. Warn once at startup so operators with a
+     * wide pool + hybrid enabled know to either narrow the pool to /24 (or
+     * smaller) or add an explicit EgressAllow for the pool subnet. */
+    if (s->config.hybrid.enabled && s->pool.prefix_len < 24) {
+        LOG_W(s,
+              "hybrid TCP-lane: pool subnet is wider than /24 (prefix_len=%u) — "
+              "client-to-client TCP between clients outside a shared /24 will be "
+              "denied by the egress ACL; use a /24-or-narrower pool or add an "
+              "EgressAllow entry",
+              (unsigned)s->pool.prefix_len);
     }
 
     /* ── xquic engine setup ── */
@@ -1348,9 +1836,36 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
         .scheduler = cfg->scheduler,
         .cc = cfg->cc,
         .init_max_path_id = cfg->init_max_path_id,
+        /* recv_rate_bytes_per_sec: intentionally absent (=0) — client-only knob */
+        .reinjection = cfg->reinjection,
+        .reinj_srtt_factor_pct = cfg->reinj_srtt_factor_pct,
+        .reinj_hard_deadline_ms = cfg->reinj_hard_deadline_ms,
+        .reinj_deadline_lower_bound_ms = cfg->reinj_deadline_lower_bound_ms,
     };
     mqvpn_build_conn_settings(&cs_input, &conn_settings);
     xqc_server_set_conn_settings(s->engine, &conn_settings);
+
+    if (cfg->reinjection == MQVPN_REINJ_DEADLINE) {
+        /* Read back from the just-built conn_settings, not the raw config:
+         * this reflects the 0->default fallback AND the lower<=hard clamp
+         * applied in mqvpn_apply_reinjection(). */
+        LOG_I(s,
+              "reinjection enabled: mode=deadline factor_pct=%d hard_ms=%d lower_ms=%d",
+              (int)(conn_settings.reinj_flexible_deadline_srtt_factor * 100 + 0.5),
+              (int)(conn_settings.reinj_hard_deadline / 1000),
+              (int)(conn_settings.reinj_deadline_lower_bound / 1000));
+        if (!s->config.hybrid.enabled) {
+            LOG_W(s, "reinjection mode=deadline protects only stream traffic; hybrid "
+                     "lane is disabled, effect limited to control streams");
+        }
+    } else if (cfg->reinjection == MQVPN_REINJ_IDLE ||
+               cfg->reinjection == MQVPN_REINJ_DGRAM) {
+        LOG_I(s, "reinjection enabled: mode=%s", mqvpn_reinj_to_name(cfg->reinjection));
+        if (cfg->reinjection == MQVPN_REINJ_DGRAM) {
+            LOG_I(s, "reinjection mode=dgram duplicates every datagram: datagram-lane "
+                     "goodput is capped at one path's capacity");
+        }
+    }
 
     /* H3 callbacks */
     xqc_h3_callbacks_t h3_cbs = {
@@ -1366,6 +1881,7 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
                 .h3_request_close_notify = cb_request_close,
                 .h3_request_read_notify = cb_request_read,
                 .h3_request_write_notify = cb_request_write,
+                .h3_request_closing_notify = cb_request_closing_notify,
             },
         .h3_ext_dgram_cbs =
             {
@@ -1410,7 +1926,21 @@ mqvpn_server_destroy(mqvpn_server_t *s)
         s->engine = NULL;
     }
 
-    /* Step 2: Defensive sweep — free any sessions not freed by engine callbacks.
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+    /* Step 2: Defensive sweep — destroy any egress flows not torn down by
+     * the request-closing notify during the engine destroy above (same
+     * contingency the session sweep below defends against: a stream whose
+     * h3_request_closing_notify didn't fire leaves its tcp_egress_flow on
+     * the D3 list, leaking the open OS fd + heap). MUST run BEFORE the
+     * session sweep below: svr_tcp_egress_flow_destroy dereferences
+     * ef->stream->conn (via svr_conn_tcp_flow_count_ptr) to decrement the
+     * per-connection flow counter, and svr_conn_free() below frees that
+     * same conn — reversing the order would turn this leak fix into a
+     * heap-use-after-free on any conn that hit both contingencies at once. */
+    svr_tcp_egress_destroy_all(s);
+#endif
+
+    /* Step 3: Defensive sweep — free any sessions not freed by engine callbacks.
      * Uses svr_conn_free so the reorder engines are freed here too (the close
      * callback that would normally free them did not fire for these conns). */
     for (int i = 1; i <= MQVPN_ADDR_POOL_MAX; i++) {
@@ -1420,7 +1950,7 @@ mqvpn_server_destroy(mqvpn_server_t *s)
         }
     }
 
-    /* Step 3: free server handle */
+    /* Step 4: free server handle */
     free(s);
 }
 
@@ -1504,6 +2034,32 @@ mqvpn_server_on_socket_recv(mqvpn_server_t *s, const uint8_t *pkt, size_t len,
     return MQVPN_OK;
 }
 
+void
+mqvpn_server_on_egress_fd_ready(mqvpn_server_t *s, int fd, void *fd_ctx, int readable,
+                                int writable)
+{
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+    svr_tcp_egress_fd_ready(s, fd, fd_ctx, readable, writable);
+#else
+    (void)s;
+    (void)fd;
+    (void)fd_ctx;
+    (void)readable;
+    (void)writable;
+#endif
+}
+
+int
+mqvpn_server_egress_fd_budget(mqvpn_server_t *s)
+{
+    /* Frozen snapshot from mqvpn_server_new — see svr_compute_egress_fd_
+     * budget and the egress_fd_budget field comment for why this must not
+     * recompute per call. Fed by config.hybrid.tcp_max_global_flows
+     * (TcpMaxGlobalFlows in INI/JSON). */
+    if (!s) return 0;
+    return s->egress_fd_budget;
+}
+
 int
 mqvpn_server_on_tun_packet(mqvpn_server_t *s, const uint8_t *pkt, size_t len)
 {
@@ -1563,65 +2119,40 @@ mqvpn_server_on_tun_packet(mqvpn_server_t *s, const uint8_t *pkt, size_t len)
         udp_mss = xqc_h3_ext_masque_udp_mss(target->dgram_mss, target->masque_stream_id);
 
     mqvpn_reorder_tx_peek_t peek = {0};
-    int do_stamp = 0;
-    if (target->reorder_tx && target->peer_reorder_supported &&
-        s->config.reorder.mode != MQVPN_REORDER_OFF && udp_mss > 0) {
-        mqvpn_reorder_tx_action_t act = mqvpn_reorder_tx_peek(
-            target->reorder_tx, pkt, len, now_us(), (uint32_t)udp_mss, &peek);
-        if (act == MQVPN_REORDER_TX_STAMP) {
-            do_stamp = 1;
-        } else if (act == MQVPN_REORDER_TX_DROP_MTU) {
-            /* 8 + len exceeds the DATAGRAM payload: emit ICMP PTB advertising the
-             * reorder-reduced effective MTU (udp_mss - 8) and drop. */
-            size_t eff_mtu =
-                udp_mss > MQVPN_REORDER_HDR_LEN ? udp_mss - MQVPN_REORDER_HDR_LEN : 0;
-            if (ip_ver == 4) {
-                if (ptb_rate_allow(s)) {
-                    struct in_addr srv;
-                    mqvpn_addr_pool_server_addr(&s->pool, &srv);
-                    mqvpn_icmp_send_v4(
-                        s->cbs.tun_output, s->user_ctx, (const uint8_t *)&srv.s_addr, 3,
-                        4, (eff_mtu > 0xFFFF) ? 0xFFFF : (uint16_t)eff_mtu, pkt, len);
-                    LOG_D(s, "sent ICMP Frag Needed (reorder mtu=%zu) to TUN", eff_mtu);
-                }
-            } else {
-                if (s->pool.has_v6 && ptb_rate_allow(s)) {
-                    struct in6_addr srv6;
-                    mqvpn_addr_pool_server_addr6(&s->pool, &srv6);
-                    mqvpn_icmp_send_v6(s->cbs.tun_output, s->user_ctx, srv6.s6_addr, 2, 0,
-                                       (uint32_t)eff_mtu, pkt, len);
-                    LOG_D(s, "sent ICMPv6 PTB (reorder mtu=%zu) to TUN", eff_mtu);
-                }
-            }
-            return MQVPN_OK;
+    size_t ptb_mtu = 0;
+    mqvpn_rgate_verdict_t rv = mqvpn_rgate_decide(
+        target->reorder_tx, target->peer_reorder_supported, s->config.reorder.mode, pkt,
+        len, now_us(), (uint32_t)udp_mss, &peek, &ptb_mtu);
+    int do_stamp = (rv == MQVPN_RGATE_STAMP);
+    if (rv == MQVPN_RGATE_DROP_REORDER_MTU || rv == MQVPN_RGATE_DROP_RAW_MTU) {
+        int sent;
+        if (ip_ver == 4) {
+            struct in_addr srv;
+            mqvpn_addr_pool_server_addr(&s->pool, &srv);
+            sent = mqvpn_rgate_send_ptb(&s->ptb_bucket, now_ms_mono(), 4, /*addr_ok=*/1,
+                                        (const uint8_t *)&srv.s_addr, ptb_mtu,
+                                        s->cbs.tun_output, s->user_ctx, pkt, len);
+        } else {
+            struct in6_addr srv6;
+            mqvpn_addr_pool_server_addr6(&s->pool, &srv6);
+            sent = mqvpn_rgate_send_ptb(&s->ptb_bucket, now_ms_mono(), 6, s->pool.has_v6,
+                                        srv6.s6_addr, ptb_mtu, s->cbs.tun_output,
+                                        s->user_ctx, pkt, len);
         }
-        /* MQVPN_REORDER_TX_RAW falls through. */
-    }
-
-    /* ICMP PTB if a RAW packet exceeds tunnel capacity. (When stamping, the
-     * peek's DROP_MTU branch above already handled over-MTU.) */
-    if (!do_stamp && udp_mss > 0) {
-        if (len > udp_mss) {
-            if (ip_ver == 4) {
-                if (ptb_rate_allow(s)) {
-                    struct in_addr srv;
-                    mqvpn_addr_pool_server_addr(&s->pool, &srv);
-                    mqvpn_icmp_send_v4(
-                        s->cbs.tun_output, s->user_ctx, (const uint8_t *)&srv.s_addr, 3,
-                        4, (udp_mss > 0xFFFF) ? 0xFFFF : (uint16_t)udp_mss, pkt, len);
-                    LOG_D(s, "sent ICMP Fragmentation Needed (mtu=%zu) to TUN", udp_mss);
-                }
+        if (sent) {
+            if (rv == MQVPN_RGATE_DROP_REORDER_MTU) {
+                if (ip_ver == 4)
+                    LOG_D(s, "sent ICMP Frag Needed (reorder mtu=%zu) to TUN", ptb_mtu);
+                else
+                    LOG_D(s, "sent ICMPv6 PTB (reorder mtu=%zu) to TUN", ptb_mtu);
             } else {
-                if (s->pool.has_v6 && ptb_rate_allow(s)) {
-                    struct in6_addr srv6;
-                    mqvpn_addr_pool_server_addr6(&s->pool, &srv6);
-                    mqvpn_icmp_send_v6(s->cbs.tun_output, s->user_ctx, srv6.s6_addr, 2, 0,
-                                       (uint32_t)udp_mss, pkt, len);
-                    LOG_D(s, "sent ICMPv6 Packet Too Big (mtu=%zu) to TUN", udp_mss);
-                }
+                if (ip_ver == 4)
+                    LOG_D(s, "sent ICMP Fragmentation Needed (mtu=%zu) to TUN", ptb_mtu);
+                else
+                    LOG_D(s, "sent ICMPv6 Packet Too Big (mtu=%zu) to TUN", ptb_mtu);
             }
-            return MQVPN_OK;
         }
+        return MQVPN_OK;
     }
 
     /* §7.3 step 4: TTL / Hop Limit decrement (RFC 9484 §4.3) */
@@ -1726,6 +2257,13 @@ mqvpn_server_tick(mqvpn_server_t *s)
         }
     }
 
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+    /* Connect-timeout sweep over the D3 egress-flow list (one list, one
+     * tick function — the future ACTIVE-idle-timeout work extends this
+     * same walk rather than adding a second sweep). */
+    svr_tcp_egress_tick(s, now_us());
+#endif
+
     return MQVPN_OK;
 }
 
@@ -1743,6 +2281,19 @@ mqvpn_server_get_stats(const mqvpn_server_t *s, mqvpn_stats_t *out)
     out->dgram_recv = s->dgram_recv;
     out->dgram_lost = s->dgram_lost;
     out->dgram_acked = s->dgram_acked;
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+    /* tcp_flows_active: whole-server count of currently open egress TCP
+     * flows. tcp_egress_global_fd_count is the live, exactly-once
+     * incremented/decremented admission counter (svr_tcp_egress_start_connect
+     * / svr_tcp_egress_flow_destroy) — no separate list-length walk needed.
+     * tcp_flows_total: cumulative admitted egress flows (never decrements).
+     * tcp_flows_rejected: cumulative cap-503 rejections (global fd-budget +
+     * per-session tcp_max_flows caps; ACL 403s and 5xx syscall failures are
+     * not caps and are not counted). See tcp_egress.c for the sites. */
+    out->tcp_flows_active = (uint64_t)s->tcp_egress_global_fd_count;
+    out->tcp_flows_total = s->tcp_egress_flows_total_opened;
+    out->tcp_flows_rejected = s->tcp_egress_flows_rejected_cap;
+#endif
     return MQVPN_OK;
 }
 
@@ -1762,21 +2313,21 @@ mqvpn_server_scheduler_label(const mqvpn_server_t *s)
     return mqvpn_scheduler_label(s->config.scheduler);
 }
 
-/* xquic XQC_PATH_STATE_* values (xqc_multipath.h). Kept as switch on raw int
- * rather than the xquic enum so this TU does not need to include xquic
- * internal headers — values are part of the on-wire xquic stats contract.
- * The _Static_assert in derive_mp_state_label below pins the active value
- * we depend on; if any other value drifts, the labels here become wrong
- * silently and the catch is e2e-only. */
+/* xqc_path_state_t values (private xqc_multipath.h). Uses the mqvpn mirror
+ * constants rather than the xquic enum so this TU need not include xquic
+ * internal headers — the values are part of the xquic stats contract and
+ * are surfaced through the public control API. Every value is pinned to the
+ * real enum by tests/test_xquic_abi_pin.c, so an upstream renumber fails
+ * the build instead of silently mislabeling paths. */
 const char *
 mqvpn_path_state_label(int state)
 {
     switch (state) {
-    case 0: return "init";
-    case 1: return "validating";
-    case 2: return "active";
-    case 3: return "closing";
-    case 4: return "closed";
+    case MQVPN_XQC_PATH_STATE_INIT: return "init";
+    case MQVPN_XQC_PATH_STATE_VALIDATING: return "validating";
+    case MQVPN_XQC_PATH_STATE_ACTIVE: return "active";
+    case MQVPN_XQC_PATH_STATE_CLOSING: return "closing";
+    case MQVPN_XQC_PATH_STATE_CLOSED: return "closed";
     default: return "unknown";
     }
 }
@@ -1798,12 +2349,10 @@ mqvpn_path_state_label(int state)
 static const char *
 derive_mp_state_label(const xqc_conn_stats_t *st)
 {
-    /* Pin the xquic constants we depend on. XQC_PATH_STATE_ACTIVE = 2 lives
-     * in private xqc_multipath.h so we assert against the literal we use
-     * below; XQC_APP_PATH_STATUS_STANDBY is in the public xquic_typedef.h. */
-    _Static_assert(XQC_APP_PATH_STATUS_STANDBY == 1,
-                   "xquic XQC_APP_PATH_STATUS_STANDBY drifted from 1");
-
+    /* This function reads path_app_status via the public XQC_APP_PATH_STATUS_*
+     * symbols (below), so it does not depend on their numeric values. The
+     * path_state values it does depend on (via MQVPN_XQC_PATH_STATE_ACTIVE)
+     * are pinned in tests/test_xquic_abi_pin.c. */
     if (!st) return "unknown";
 
     int available = 0, standby = 0;
@@ -1811,10 +2360,10 @@ derive_mp_state_label(const xqc_conn_stats_t *st)
      * iterate by paths_info_count. paths_info may be NULL when count==0. */
     for (uint32_t i = 0; st->paths_info && i < st->paths_info_count; i++) {
         const xqc_path_metrics_t *p = &st->paths_info[i];
-        /* Only count paths in XQC_PATH_STATE_ACTIVE (=2); paths that are
-         * still validating, closing, or already closed should not influence
-         * the operator-facing label. */
-        if (p->path_state != 2) continue;
+        /* Only count ACTIVE paths; paths that are still validating,
+         * closing, or already closed should not influence the
+         * operator-facing label. */
+        if (p->path_state != MQVPN_XQC_PATH_STATE_ACTIVE) continue;
         /* FROZEN means xquic flushed the send buffer and stopped forwarding
          * on that path (xqc_set_application_path_status, xqc_multipath.c).
          * It cannot contribute to operational redundancy — neither as
@@ -2022,6 +2571,9 @@ mqvpn_server_remove_user(mqvpn_server_t *s, const char *username)
     return MQVPN_OK;
 }
 
+/* Iteration order and the tunnel_established guard here are load-bearing:
+ * mqvpn_server_get_client_reinject() below mirrors this walk and must stay
+ * index-aligned — change both together. */
 int
 mqvpn_server_get_client_info(const mqvpn_server_t *server, mqvpn_client_info_t *out,
                              int max_clients, int *n_clients)
@@ -2106,6 +2658,41 @@ mqvpn_server_get_client_info(const mqvpn_server_t *server, mqvpn_client_info_t *
 }
 
 int
+mqvpn_server_get_client_reinject(const mqvpn_server_t *s,
+                                 mqvpn_internal_client_reinject_t *out, int max)
+{
+    if (!s || !out || max <= 0) return -1;
+
+    mqvpn_server_t *srv = (mqvpn_server_t *)s;
+    int count = 0;
+
+    /* Same iteration order + tunnel_established guard as
+     * mqvpn_server_get_client_info() so out[] stays index-aligned with that
+     * call's client array within one control-command handler. */
+    for (int i = 1; i <= MQVPN_ADDR_POOL_MAX && count < max; i++) {
+        svr_conn_t *conn = srv->sessions[i];
+        if (!conn || !conn->tunnel_established) continue;
+
+        mqvpn_internal_client_reinject_t *e = &out[count];
+        e->n_paths = 0;
+
+        xqc_conn_stats_t st = xqc_conn_get_stats(srv->engine, &conn->cid);
+        for (uint32_t p = 0;
+             st.paths_info && p < st.paths_info_count && e->n_paths < MQVPN_MAX_PATHS;
+             p++) {
+            xqc_path_metrics_t *pm = &st.paths_info[p];
+            e->paths[e->n_paths].path_id = pm->path_id;
+            e->paths[e->n_paths].reinject_tx_bytes = pm->path_send_reinject_bytes;
+            e->n_paths++;
+        }
+        free(st.paths_info);
+        count++;
+    }
+
+    return count;
+}
+
+int
 mqvpn_server_get_interest(const mqvpn_server_t *s, mqvpn_interest_t *out)
 {
     if (!s || !out) return MQVPN_ERR_INVALID_ARG;
@@ -2114,6 +2701,17 @@ mqvpn_server_get_interest(const mqvpn_server_t *s, mqvpn_interest_t *out)
 
     int ms = (int)(s->next_wake_us / 1000);
     out->next_timer_ms = ms > 0 ? ms : 1;
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+    /* next_wake_us above comes solely from xquic's event timer, which knows
+     * nothing about the egress deadlines (connect timeout -> 504, ACTIVE
+     * idle eviction) that svr_tcp_egress_tick enforces — on a quiet server
+     * they could otherwise fire arbitrarily late. Clamp to a 1s ceiling
+     * whenever any egress flow is live: a simple clamp on purpose (not the
+     * exact nearest deadline — both deadlines have seconds granularity, so
+     * sub-second precision buys nothing and the clamp can't go stale). */
+    if (s->tcp_egress_flow_list_head != NULL && out->next_timer_ms > 1000)
+        out->next_timer_ms = 1000;
+#endif
     out->tun_readable = s->tun_paused ? 0 : 1;
     out->is_idle = (s->n_sessions == 0) ? 1 : 0;
     return MQVPN_OK;

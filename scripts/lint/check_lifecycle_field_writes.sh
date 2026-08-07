@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqvpn contributors
 # scripts/lint/check_lifecycle_field_writes.sh
 #
 # Enforce spec §3.3 / §7.1: direct assignment to path_entry_t lifecycle
@@ -38,7 +40,11 @@ src/path_mgr.c
 src/path_mgr.h
 src/mqvpn_server.c
 src/platform/linux/platform_linux.c
+src/platform/linux/netlink_mon.c
 src/platform/windows/platform_windows.c
+src/platform/windows/net_mon.c
+src/platform/darwin/platform_darwin.c
+src/platform/darwin/route_mon.c
 '
 
 cd "$REPO_ROOT"

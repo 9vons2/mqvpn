@@ -218,116 +218,144 @@ mqvpn_flow_key_hash(const mqvpn_flow_key_t *k, uint64_t seed)
     return h;
 }
 
-/* ─────────────────── §4 / §10.2: inner-IP 5-tuple parser ───────────────────
+/* ─────────────────── §4 / §10.2: inner-IP L3/L4 parser ─────────────────────
  *
- * mqvpn_reorder_parse_5tuple() extracts the inner 5-tuple from a bare inner IP
- * packet, for both the TX gating path (§10.2) and the RX dispatch. It returns 0
- * only for a parseable, non-fragmented UDP packet; -1 for anything that must be
- * sent RAW (§4 / §4.1): too short, not IPv4/IPv6, fragmented, non-UDP, or an
- * IPv6 chain we cannot walk to a UDP header.
- *
- * On success out->{ip_version, proto=17, src/dst_ip, src/dst_port(host order)}
- * are filled (v4 addresses in [0..3], rest zero, per §6.1).
+ * mqvpn_parse_l3l4() walks a bare inner IP packet once and classifies it;
+ * mqvpn_reorder_parse_5tuple() wraps it for the reorder TX gating path
+ * (§10.2) and RX dispatch: 0 only for a parseable, non-fragmented UDP packet;
+ * -1 for anything that must be sent RAW (§4 / §4.1).
  */
 #define MQVPN_IPPROTO_UDP 17
+#define MQVPN_IPPROTO_TCP 6
 
-/* IPv6 extension headers we walk through to reach the UDP header (§4.1). */
+/* IPv6 extension headers we walk through to reach the UDP/TCP header (§4.1). */
 #define MQVPN_IP6_HOPOPTS  0  /* Hop-by-Hop Options */
 #define MQVPN_IP6_ROUTING  43 /* Routing */
 #define MQVPN_IP6_FRAGMENT 44 /* Fragment → not eligible (§4.1) */
 #define MQVPN_IP6_DSTOPTS  60 /* Destination Options */
 
-static inline int
-mqvpn_reorder_parse_5tuple(const uint8_t *pkt, size_t len, mqvpn_flow_key_t *out)
+/* Generalized inner L3/L4 parse verdict (hybrid H1). One walk classifies
+ * the packet; reorder TX/RX consume it through the
+ * mqvpn_reorder_parse_5tuple() wrapper (contract unchanged), the hybrid
+ * classifier consumes the verdict directly. *out is written only for the
+ * UDP/TCP verdicts (ip_version, proto, src/dst_ip, src/dst_port in host
+ * order; v4 addresses in [0..3], rest zero, per §6.1); undefined otherwise. */
+typedef enum {
+    MQVPN_L4_UDP,
+    MQVPN_L4_TCP,
+    MQVPN_L4_FRAGMENT,  /* IPv4 MF/offset or IPv6 fragment ext header */
+    MQVPN_L4_OTHER,     /* other L4 (ICMP, ...) or unwalkable v6 chain */
+    MQVPN_L4_MALFORMED, /* truncated / not IPv4/IPv6 */
+} mqvpn_l4_verdict_t;
+
+static inline mqvpn_l4_verdict_t
+mqvpn_parse_l3l4(const uint8_t *pkt, size_t len, mqvpn_flow_key_t *out)
 {
     if (len < 1) {
-        return -1;
+        return MQVPN_L4_MALFORMED;
     }
     uint8_t version = (uint8_t)(pkt[0] >> 4);
 
     if (version == 4) {
         /* IPv4: need at least the 20-byte fixed header. */
         if (len < 20) {
-            return -1;
+            return MQVPN_L4_MALFORMED;
         }
         uint8_t ihl = (uint8_t)(pkt[0] & 0x0f);
         size_t hdr_len = (size_t)ihl * 4;
         if (ihl < 5 || len < hdr_len) {
-            return -1;
+            return MQVPN_L4_MALFORMED;
         }
-        /* §4.1: MF set or fragment offset != 0 → RAW (port not visible / order
-         * across fragments breaks). flags+frag-offset is the 16-bit field at
-         * offset 6; bit 13 (0x2000) = MF, low 13 bits = offset. */
+        /* §4.1: MF set or fragment offset != 0 → FRAGMENT (port not visible /
+         * order across fragments breaks). flags+frag-offset is the 16-bit field
+         * at offset 6; bit 13 (0x2000) = MF, low 13 bits = offset. Checked
+         * before the protocol switch so a fragmented TCP/UDP packet is a
+         * FRAGMENT, never a TCP/UDP verdict. */
         uint16_t frag = (uint16_t)((pkt[6] << 8) | pkt[7]);
         if (frag & 0x3fff) {
-            return -1;
+            return MQVPN_L4_FRAGMENT;
         }
-        if (pkt[9] != MQVPN_IPPROTO_UDP) {
-            return -1;
+        uint8_t proto = pkt[9];
+        if (proto != MQVPN_IPPROTO_UDP && proto != MQVPN_IPPROTO_TCP) {
+            return MQVPN_L4_OTHER;
         }
-        /* UDP header (8 bytes) must fit after the IP header. */
-        if (len < hdr_len + 8) {
-            return -1;
+        /* L4 length rule: the UDP header (8 bytes) or the full fixed TCP
+         * header (20 bytes — future termination needs the whole header) must
+         * fit after the IP header. */
+        size_t l4_min = proto == MQVPN_IPPROTO_TCP ? 20 : 8;
+        if (len < hdr_len + l4_min) {
+            return MQVPN_L4_MALFORMED;
         }
         memset(out, 0, sizeof(*out));
         out->ip_version = 4;
-        out->proto = MQVPN_IPPROTO_UDP;
+        out->proto = proto;
         memcpy(out->src_ip, pkt + 12, 4);
         memcpy(out->dst_ip, pkt + 16, 4);
         out->src_port = (uint16_t)((pkt[hdr_len] << 8) | pkt[hdr_len + 1]);
         out->dst_port = (uint16_t)((pkt[hdr_len + 2] << 8) | pkt[hdr_len + 3]);
-        return 0;
+        return proto == MQVPN_IPPROTO_TCP ? MQVPN_L4_TCP : MQVPN_L4_UDP;
     }
 
     if (version == 6) {
         /* IPv6: 40-byte fixed header, then walk the extension-header chain. */
         if (len < 40) {
-            return -1;
+            return MQVPN_L4_MALFORMED;
         }
         uint8_t next = pkt[6];
         size_t off = 40;
         /* Bound the walk: each ext header is >= 8 bytes, so the chain length is
          * bounded by len; cap iterations defensively regardless. */
         for (int i = 0; i < 16; i++) {
-            if (next == MQVPN_IPPROTO_UDP) {
-                if (len < off + 8) {
-                    return -1;
+            if (next == MQVPN_IPPROTO_UDP || next == MQVPN_IPPROTO_TCP) {
+                /* UDP ports only need the 8-byte UDP header; TCP requires the
+                 * full 20-byte fixed header (same rule as IPv4). */
+                size_t l4_min = next == MQVPN_IPPROTO_TCP ? 20 : 8;
+                if (len < off + l4_min) {
+                    return MQVPN_L4_MALFORMED;
                 }
                 memset(out, 0, sizeof(*out));
                 out->ip_version = 6;
-                out->proto = MQVPN_IPPROTO_UDP;
+                out->proto = next;
                 memcpy(out->src_ip, pkt + 8, 16);
                 memcpy(out->dst_ip, pkt + 24, 16);
                 out->src_port = (uint16_t)((pkt[off] << 8) | pkt[off + 1]);
                 out->dst_port = (uint16_t)((pkt[off + 2] << 8) | pkt[off + 3]);
-                return 0;
+                return next == MQVPN_IPPROTO_TCP ? MQVPN_L4_TCP : MQVPN_L4_UDP;
             }
             if (next == MQVPN_IP6_FRAGMENT) {
-                return -1; /* §4.1: fragmented → RAW */
+                return MQVPN_L4_FRAGMENT; /* §4.1: fragmented */
             }
             if (next == MQVPN_IP6_HOPOPTS || next == MQVPN_IP6_ROUTING ||
                 next == MQVPN_IP6_DSTOPTS) {
                 /* Each of these ext headers: next(1) + hdr_ext_len(1, in 8-octet
                  * units excluding the first 8) + ... */
                 if (len < off + 2) {
-                    return -1;
+                    return MQVPN_L4_MALFORMED;
                 }
                 uint8_t hdr_ext_len = pkt[off + 1];
                 size_t ext_bytes = (size_t)(hdr_ext_len + 1) * 8;
                 next = pkt[off];
                 off += ext_bytes;
                 if (off > len) {
-                    return -1;
+                    return MQVPN_L4_MALFORMED;
                 }
                 continue;
             }
-            /* Unknown / unsupported next-header (incl. TCP, ICMPv6) → RAW. */
-            return -1;
+            /* Unknown / unsupported next-header (e.g. ICMPv6). */
+            return MQVPN_L4_OTHER;
         }
-        return -1; /* chain too long */
+        return MQVPN_L4_OTHER; /* chain too long */
     }
 
-    return -1; /* not IPv4 or IPv6 */
+    return MQVPN_L4_MALFORMED; /* not IPv4 or IPv6 */
+}
+
+/* Contract-identical wrapper around mqvpn_parse_l3l4(): 0 only for a
+ * parseable, non-fragmented UDP packet; -1 otherwise. */
+static inline int
+mqvpn_reorder_parse_5tuple(const uint8_t *pkt, size_t len, mqvpn_flow_key_t *out)
+{
+    return mqvpn_parse_l3l4(pkt, len, out) == MQVPN_L4_UDP ? 0 : -1;
 }
 
 /* ───────────────────────────── §16: config ────────────────────────────────
@@ -469,8 +497,9 @@ mqvpn_reorder_config_finalize(mqvpn_reorder_config_t *cfg)
  *
  * Per-flow receiver counters (§17). Lives here (not in reorder_rx.c) so the RX
  * snapshot accessor (mqvpn_reorder_rx_get_stats) can return it across the TU
- * boundary. wait period 1 回 = arm_gap_timer 1 回; each period ends in exactly
- * one of filled / timeout / overflow / demote / reset, giving the §17 identity:
+ * boundary. One wait period corresponds to one arm_gap_timer call; each period
+ * ends in exactly one of filled / timeout / overflow / demote / reset, giving the
+ * §17 identity:
  *
  *   gap_count = gap_filled_count + gap_timeout_count + gap_overflow_count
  *             + gap_demote_count  + gap_reset_count
@@ -498,6 +527,25 @@ typedef struct {
     uint64_t residence_bucket[MQVPN_REORDER_LAT_BUCKETS]; /* added-latency histogram */
     uint64_t residence_max_us;                            /* exact max residence */
 } mqvpn_reorder_stats_t;
+
+/* ABI layout fingerprint of mqvpn_reorder_stats_t: folds sizeof + the offsets
+ * of the five counters cross-module consumers read (delivered / gap_count /
+ * gap_filled / gap_timeout / ack_demote). Compile-time constant; equal on both
+ * sides only if both were compiled against the same struct. A cross-module
+ * consumer (the iOS extension) compares its own MQVPN_REORDER_STATS_LAYOUT_ID
+ * against mqvpn_reorder_stats_layout_id() from the linked library and refuses
+ * to read the struct on mismatch. Requires <stddef.h> for offsetof. */
+#define MQVPN_REORDER_STATS_LAYOUT_ID                                       \
+    (((uint64_t)sizeof(mqvpn_reorder_stats_t) << 0) ^                       \
+     ((uint64_t)offsetof(mqvpn_reorder_stats_t, delivered_count) << 8) ^    \
+     ((uint64_t)offsetof(mqvpn_reorder_stats_t, gap_count) << 16) ^         \
+     ((uint64_t)offsetof(mqvpn_reorder_stats_t, gap_filled_count) << 24) ^  \
+     ((uint64_t)offsetof(mqvpn_reorder_stats_t, gap_timeout_count) << 32) ^ \
+     ((uint64_t)offsetof(mqvpn_reorder_stats_t, ack_demote_count) << 40))
+
+/* Returns MQVPN_REORDER_STATS_LAYOUT_ID as compiled into THIS library, so a
+ * consumer can detect a stale/mismatched libmqvpn.a at runtime. */
+uint64_t mqvpn_reorder_stats_layout_id(void);
 
 /* Added-latency percentiles over the residence histogram (non-static so the
  * control API can link them). _percentile spans all buckets (includes the

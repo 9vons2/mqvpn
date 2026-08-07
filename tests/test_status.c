@@ -6,13 +6,19 @@
  *
  * Include status.c directly to access static functions.
  */
+
+/* Keep assert() live even in Release builds: CI runs ctest on Release too,
+ * where NDEBUG would silently no-op every assertion in this file. */
+#undef NDEBUG
+#include <assert.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
 
 /* Pull in static functions from status.c */
-#include "../src/platform/linux/status.c"
+#include "../src/platform/posix/status.c"
 
 /* ── Test infrastructure ── */
 

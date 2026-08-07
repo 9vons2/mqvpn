@@ -7,6 +7,7 @@ import android.net.Network
 import android.system.Os
 import android.util.Log
 import com.mqvpn.sdk.core.MqvpnTunnel
+import com.mqvpn.sdk.core.model.PathInfo
 import com.mqvpn.sdk.network.NetworkEvent
 import com.mqvpn.sdk.network.NetworkMonitor
 import com.mqvpn.sdk.network.PathBinder
@@ -120,6 +121,109 @@ internal class PathManager(
         Log.i(TAG, "Path removed: $name (handle=$handle)")
     }
 
+    /** handle → when it was first seen dead, for the debounce below. */
+    private val closedSince = mutableMapOf<Long, Long>()
+
+    /** handle → (bytesTx, bytesRx, when rx last moved). */
+    private val traffic = mutableMapOf<Long, Triple<Long, Long, Long>>()
+
+    /**
+     * Whether a path is beyond saving, by either of the two ways it happens.
+     *
+     * CLOSED is the tidy case. The other is a path that keeps its ACTIVE — or
+     * DEGRADED, or PENDING — status while nothing at all comes back over it:
+     * a field trace caught one going ACTIVE → DEGRADED → PENDING and sitting
+     * there silent for three minutes with the network underneath perfectly
+     * healthy. Checking the status alone missed it entirely.
+     *
+     * Silence is judged from the counters rather than from srtt, which freezes
+     * at its last live measurement and so keeps insisting a dead link is fine.
+     * bytes_tx rises on every successful send and bytes_rx only on a packet
+     * actually received, so "sending, nothing coming back" is exactly what the
+     * pair says. An idle tunnel moves neither and is left alone.
+     */
+    private fun isDead(info: PathInfo, nowMs: Long): Boolean {
+        if (info.status == MQVPN_PATH_CLOSED) return true
+
+        val prev = traffic[info.handle]
+        val rxMoved = prev == null || info.bytesRx > prev.second
+        val txMoved = prev != null && info.bytesTx > prev.first
+        val lastRx = when {
+            rxMoved -> nowMs
+            else -> prev?.third ?: nowMs
+        }
+        traffic[info.handle] = Triple(info.bytesTx, info.bytesRx, lastRx)
+
+        // Only sending counts as evidence. Without it the path is merely
+        // unused, and tearing down an idle link would be pure churn.
+        if (!txMoved || rxMoved) return false
+        return nowMs - lastRx >= DEAD_SILENCE_MS
+    }
+
+    /**
+     * Rebuilds paths that died over a network the OS still has.
+     *
+     * libmqvpn closes a path on its own once it stops answering, but nothing
+     * tells Android: a NetworkCallback fires when the *network* changes, and
+     * here the network is fine — it is the path over it that died. Nothing in
+     * this class had a rule for that, and the consequences compound:
+     *
+     * - removePath was never called, so the C slot kept platform_attached=1
+     *   and could not be reused. With MQVPN_MAX_PATHS slots, eight such deaths
+     *   leave add_path_fd failing outright and no path can ever be added again.
+     * - removeNetwork was never called either, so the network stayed in
+     *   NetworkMonitor's active set and could never be reported as new. No
+     *   further Available event was possible for it — ever.
+     * - reactivate_path is not exposed through JNI, so the dead path could not
+     *   be revived either.
+     *
+     * The link therefore kept working for the rest of the phone — status bar,
+     * hotspot, everything — while the tunnel had a corpse over it and no way
+     * to make a new one. Only a full manual reconnect cleared it.
+     *
+     * Removing and immediately re-adding is deliberate over reviving: it walks
+     * the same two paths that already handle a network coming and going, so
+     * there is no second code path to keep correct.
+     */
+    suspend fun rebuildDeadPaths(nowMs: Long = System.currentTimeMillis()) {
+        val stale = executor.call {
+            val byHandle = tunnel.getPaths().associateBy { it.handle }
+            val out = mutableListOf<Network>()
+            for ((network, handle) in pathHandles) {
+                val info = byHandle[handle]
+                if (info == null || !isDead(info, nowMs)) {
+                    closedSince.remove(handle)
+                    if (info == null) traffic.remove(handle)
+                    continue
+                }
+                // Only act while the OS still has the network. If it went away
+                // too, the ordinary Lost event is already doing this properly.
+                if (!networkMonitor.activeNetworks.containsKey(network)) continue
+                val since = closedSince.getOrPut(handle) { nowMs }
+                // A path often closes moments before its network disappears;
+                // rebinding into that gap wastes a socket and races the Lost
+                // event. Waiting confirms the network really did outlive it.
+                if (nowMs - since >= REBUILD_AFTER_MS) {
+                    // Cleared here, on the executor thread that owns this map,
+                    // because handleLost below drops the handle from
+                    // pathHandles and the entry would otherwise never be
+                    // visited again.
+                    closedSince.remove(handle)
+                    traffic.remove(handle)
+                    out += network
+                }
+            }
+            out
+        }
+
+        for (network in stale) {
+            val path = networkMonitor.activeNetworks[network] ?: continue
+            Log.i(TAG, "Path over ${path.name} died while the network is still up; rebuilding")
+            handleLost(NetworkEvent.Lost(path))
+            handleAvailable(NetworkEvent.Available(path))
+        }
+    }
+
     /** Close all remaining fds. Called from executor during cleanup. */
     fun closeAllFds() {
         for ((_, fd) in pathFds) {
@@ -127,6 +231,8 @@ internal class PathManager(
         }
         pathFds.clear()
         pathHandles.clear()
+        closedSince.clear()
+        traffic.clear()
         connected = false
     }
 
@@ -144,6 +250,23 @@ internal class PathManager(
 
     companion object {
         private const val TAG = "PathManager"
+
+        /** mqvpn_path_status_t CLOSED — retries exhausted, never revived. */
+        private const val MQVPN_PATH_CLOSED = 4
+
+        /**
+         * How long a path must stay closed over a live network before it is
+         * rebuilt. Long enough that a path closing just ahead of its network
+         * disappearing is handled by the ordinary Lost event instead.
+         */
+        private const val REBUILD_AFTER_MS = 8_000L
+
+        /**
+         * Sending this long with nothing coming back means the path is gone,
+         * whatever its status still claims. Well past any real stall — the
+         * trace that motivated this showed 165 s and still climbing.
+         */
+        private const val DEAD_SILENCE_MS = 45_000L
 
         /**
          * Sentinel returned from the executor block in [handleAvailable] when

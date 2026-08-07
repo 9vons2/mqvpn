@@ -18,19 +18,16 @@
 #include "control_socket.h"
 #include "log.h"
 #include "mqvpn_internal.h" /* mqvpn_config_apply_reorder (INI reorder bridge) */
+#include "netlink_mon.h"
 
 #include <stdio.h>
 #include <inttypes.h>
 
-#define STATUS_INTERVAL_SEC        30
-#define RECOVER_INTERVAL_SEC       3
-#define PATH_RECOVER_FAILURE_LIMIT 5
-#define BULK_READ_COUNT            64
-#define NETLINK_BUF_SIZE           8192
-#define TUN_BUF_SIZE               65536
-#define SOCK_BUF_SIZE              65536
+#define STATUS_INTERVAL_SEC 30
+#define BULK_READ_COUNT     64
+#define TUN_BUF_SIZE        65536
+#define SOCK_BUF_SIZE       65536
 static void status_log_cb(evutil_socket_t fd, short what, void *arg);
-static void recover_dropped_paths_cb(evutil_socket_t fd, short what, void *arg);
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -39,11 +36,6 @@ static void recover_dropped_paths_cb(evutil_socket_t fd, short what, void *arg);
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <linux/if.h>
-#include <linux/netlink.h>
-#include <linux/rtnetlink.h>
-#include <ifaddrs.h>
-#include <sys/ioctl.h>
 
 /* ================================================================
  *  Socket pinning to a specific egress interface
@@ -53,7 +45,7 @@ static void recover_dropped_paths_cb(evutil_socket_t fd, short what, void *arg);
  * Symmetric to win_pin_socket_to_iface() in platform_windows.c.
  * Returns 0 on success, -1 on failure. The caller decides whether
  * failure is fatal. */
-static int
+int
 linux_pin_socket_to_iface(int fd, const char *ifname)
 {
     if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname,
@@ -70,7 +62,7 @@ linux_pin_socket_to_iface(int fd, const char *ifname)
 
 /* Forward declarations for event handlers */
 static void on_tun_read(evutil_socket_t fd, short what, void *arg);
-static void on_socket_read(evutil_socket_t fd, short what, void *arg);
+void on_socket_read(evutil_socket_t fd, short what, void *arg);
 
 static void
 cb_tun_output(const uint8_t *pkt, size_t len, void *user_ctx)
@@ -316,8 +308,13 @@ status_log_cb(evutil_socket_t fd, short what, void *arg)
     mqvpn_client_get_paths(p->client, paths, MQVPN_MAX_PATHS, &n_paths);
 
     LOG_INF("[STATUS] state=established paths=%d tx=%" PRIu64 " rx=%" PRIu64
-            " srtt=%dms dgram_lost=%" PRIu64,
-            n_paths, stats.bytes_tx, stats.bytes_rx, stats.srtt_ms, stats.dgram_lost);
+            " srtt=%dms dgram_lost=%" PRIu64 " lanes tcp/dgram/raw=%" PRIu64 "/%" PRIu64
+            "/%" PRIu64 " tcp_dropped=%" PRIu64 " flows act/tot/rej=%" PRIu64 "/%" PRIu64
+            "/%" PRIu64 " raw_markers=%" PRIu64,
+            n_paths, stats.bytes_tx, stats.bytes_rx, stats.srtt_ms, stats.dgram_lost,
+            stats.pkts_lane_tcp, stats.pkts_lane_dgram, stats.pkts_lane_raw,
+            stats.pkts_lane_tcp_dropped, stats.tcp_flows_active, stats.tcp_flows_total,
+            stats.tcp_flows_rejected, stats.raw_markers_active);
 
     for (int i = 0; i < n_paths; i++) {
         const char *st_str = mqvpn_path_status_string(paths[i].status);
@@ -339,7 +336,7 @@ status_log_cb(evutil_socket_t fd, short what, void *arg)
 
 static void on_tick_timer(evutil_socket_t fd, short what, void *arg);
 
-static void
+void
 schedule_next_tick(platform_ctx_t *p)
 {
     mqvpn_interest_t interest;
@@ -391,9 +388,18 @@ on_tun_read(evutil_socket_t fd, short what, void *arg)
             break;
         }
     }
+
+    /* The sends above updated the engine's requested wake (pacing flush,
+     * PTO) — drive the engine and re-arm the tick from it, exactly as
+     * on_socket_read does. Without this, outbound-only traffic leaves the
+     * old timer armed: if the sent packet is lost, no ACK arrives to
+     * re-arm, and the PTO probe waits on the stale (possibly seconds-out)
+     * timer. */
+    mqvpn_client_tick(p->client);
+    schedule_next_tick(p);
 }
 
-static void
+void
 on_socket_read(evutil_socket_t fd, short what, void *arg)
 {
     (void)what;
@@ -440,540 +446,6 @@ on_signal(evutil_socket_t sig, short what, void *arg)
     /* state_changed callback will call event_base_loopbreak on CLOSED */
 }
 
-/* ================================================================
- *  Netlink path recovery accelerator
- * ================================================================ */
-
-/* Extract interface name from IFLA_IFNAME attribute in netlink message.
- * Required for RTM_DELLINK where if_indextoname() fails (interface gone). */
-static const char *
-nlmsg_get_ifname(struct nlmsghdr *nh)
-{
-    struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(nh);
-    struct rtattr *rta = IFLA_RTA(ifi);
-    int rtl = (int)IFLA_PAYLOAD(nh);
-    for (; RTA_OK(rta, rtl); rta = RTA_NEXT(rta, rtl)) {
-        if (rta->rta_type == IFLA_IFNAME) return (const char *)RTA_DATA(rta);
-    }
-    return NULL;
-}
-
-/* Extract IFLA_OPERSTATE (RFC 2863 operational state) from a netlink message.
- * Returns the IF_OPER_* enum value (0..7), or -1 if the attribute is missing. */
-static int
-nlmsg_get_operstate(struct nlmsghdr *nh)
-{
-    struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(nh);
-    struct rtattr *rta = IFLA_RTA(ifi);
-    int rtl = (int)IFLA_PAYLOAD(nh);
-    for (; RTA_OK(rta, rtl); rta = RTA_NEXT(rta, rtl)) {
-        if (rta->rta_type == IFLA_OPERSTATE && RTA_PAYLOAD(rta) >= 1)
-            return *(const uint8_t *)RTA_DATA(rta);
-    }
-    return -1;
-}
-
-/* Remove a path because the kernel says it's no longer usable.
- * Two callers: RTM_DELLINK (interface gone) and RTM_NEWLINK with IFLA_OPERSTATE
- * = IF_OPER_DOWN / IF_OPER_LOWERLAYERDOWN (carrier lost — cable unplugged etc).
- * Both share cleanup; only the log message differs.
- *
- * Cleans up: library path, libevent, fd. Preserves iface name for re-add. */
-static void
-remove_path_by_index(platform_ctx_t *p, int idx, const char *reason)
-{
-    if (p->path_mgr.paths[idx].fd < 0) return; /* already removed */
-
-    LOG_WRN("netlink: interface %s %s, closing path %d", p->path_mgr.paths[idx].iface,
-            reason, idx);
-
-    /* PR5: emit PLATFORM_DROP via new public API with diagnostic info.
-     * Library transitions slot to CLOSED_DROPPED; fd close is reported
-     * via mqvpn_client_on_platform_fd_closed() below. */
-    mqvpn_platform_path_event_info_t info = {0};
-    snprintf(info.iface, sizeof(info.iface), "%s", p->path_mgr.paths[idx].iface);
-    info.reason = MQVPN_PLATFORM_REASON_RTM_DELLINK;
-    mqvpn_client_on_platform_path_dropped(p->client, p->lib_path_handles[idx], &info);
-
-    /* Remove libevent watcher */
-    if (p->ev_udp[idx]) {
-        event_del(p->ev_udp[idx]);
-        event_free(p->ev_udp[idx]);
-        p->ev_udp[idx] = NULL;
-    }
-
-    /* Close dead socket + notify lib so CLOSED_DROPPED -> CLOSED_FREE
-     * cleanup can complete (once xquic-side also clears). */
-    close(p->path_mgr.paths[idx].fd);
-    p->path_mgr.paths[idx].fd = -1;
-    p->path_mgr.paths[idx].platform_attached = 0;
-    mqvpn_client_on_platform_fd_closed(p->client, p->lib_path_handles[idx]);
-}
-
-/* Check whether `ifname` is admin-up AND has carrier (IFF_UP & IFF_RUNNING).
- * Used by the periodic recovery timer to skip retries on a still-down link. */
-static int
-iface_is_up_and_running(const char *ifname)
-{
-    int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    if (s < 0) return 0;
-    struct ifreq ifr;
-    memset(&ifr, 0, sizeof(ifr));
-    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", ifname);
-    int ok = 0;
-    if (ioctl(s, SIOCGIFFLAGS, &ifr) == 0)
-        ok = (ifr.ifr_flags & IFF_UP) && (ifr.ifr_flags & IFF_RUNNING);
-    close(s);
-    return ok;
-}
-
-/* Check if interface has an IP address (v4 or v6) */
-static int
-iface_has_ip(const char *ifname)
-{
-    struct ifaddrs *ifa_list = NULL, *ifa;
-    int found = 0;
-    if (getifaddrs(&ifa_list) < 0) return 0;
-    for (ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr) continue;
-        if (strcmp(ifa->ifa_name, ifname) != 0) continue;
-        if (ifa->ifa_addr->sa_family == AF_INET || ifa->ifa_addr->sa_family == AF_INET6) {
-            found = 1;
-            break;
-        }
-    }
-    freeifaddrs(ifa_list);
-    return found;
-}
-
-static void
-try_reactivate_by_ifname(platform_ctx_t *p, const char *ifname)
-{
-    /* PR5: query lib state instead of platform-tracked path_recoverable[].
-     * Reactivate is valid for slots in DEGRADED / CREATE_WAIT /
-     * CLOSED_RECOVERABLE (per lib's reactivate_slot_eligible gate added
-     * in 433272f). Public projection collapses these to MQVPN_PATH_DEGRADED
-     * (for DEGRADED+CREATE_WAIT) and MQVPN_PATH_CLOSED (for CLOSED_RECOVERABLE),
-     * so both warrant attempting reactivate. The lib's gate rejects bad
-     * states with MQVPN_ERR_INVALID_STATE which we silently swallow. */
-    mqvpn_path_info_t pinfo[MQVPN_MAX_PATHS];
-    int n = 0;
-    if (mqvpn_client_get_paths(p->client, pinfo, MQVPN_MAX_PATHS, &n) != MQVPN_OK) return;
-
-    for (int i = 0; i < p->path_mgr.n_paths; i++) {
-        if (strcmp(p->path_mgr.paths[i].iface, ifname) != 0) continue;
-        mqvpn_path_handle_t h = p->lib_path_handles[i];
-        if (h < 0) continue;
-
-        int found = 0;
-        mqvpn_path_status_t st = MQVPN_PATH_PENDING;
-        for (int j = 0; j < n; j++) {
-            if (pinfo[j].handle == h) {
-                found = 1;
-                st = pinfo[j].status;
-                break;
-            }
-        }
-        if (!found) continue;
-        if (st != MQVPN_PATH_DEGRADED && st != MQVPN_PATH_CLOSED) continue;
-
-        int ret = mqvpn_client_reactivate_path(p->client, h);
-        if (ret == MQVPN_OK) {
-            LOG_INF("netlink: reactivated path %s", ifname);
-        } else if (ret == MQVPN_ERR_INVALID_STATE) {
-            /* slot not in 3-state acceptance window (e.g. already VALIDATING) */
-        } else {
-            LOG_WRN("netlink: reactivate %s failed: %s", ifname, mqvpn_error_string(ret));
-        }
-    }
-}
-
-/* Create a UDP socket bound to the wildcard address and pinned to ifname.
- * Updates mp->local_addr / mp->local_addrlen on success.
- * Returns the new fd, or -1 (already logged). */
-static int
-recovery_socket_create(sa_family_t af, const char *ifname, mqvpn_path_t *mp)
-{
-    int fd = (int)socket(af, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        LOG_WRN("netlink: socket() for re-add %s: %s", ifname, strerror(errno));
-        return -1;
-    }
-    if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0) {
-        LOG_WRN("netlink: fcntl() for re-add %s: %s", ifname, strerror(errno));
-        goto fail;
-    }
-
-    /* Socket buffers are set by mqvpn_client_add_path_fd() (7 MiB) */
-
-    memset(&mp->local_addr, 0, sizeof(mp->local_addr));
-    if (af == AF_INET6) {
-        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&mp->local_addr;
-        sin6->sin6_family = AF_INET6;
-        sin6->sin6_addr = in6addr_any;
-        mp->local_addrlen = sizeof(struct sockaddr_in6);
-    } else {
-        struct sockaddr_in *sin4 = (struct sockaddr_in *)&mp->local_addr;
-        sin4->sin_family = AF_INET;
-        sin4->sin_addr.s_addr = htonl(INADDR_ANY);
-        mp->local_addrlen = sizeof(struct sockaddr_in);
-    }
-    if (bind(fd, (struct sockaddr *)&mp->local_addr, mp->local_addrlen) < 0) {
-        LOG_WRN("netlink: bind() for re-add %s: %s", ifname, strerror(errno));
-        goto fail;
-    }
-
-    /* Pin AFTER bind, matching startup-loop order. */
-    if (linux_pin_socket_to_iface(fd, ifname) < 0) {
-        LOG_WRN("netlink: iface pin for re-add %s failed", ifname);
-        goto fail;
-    }
-
-    return fd;
-fail:
-    close(fd);
-    return -1;
-}
-
-/* Register a freshly-created socket with the library and capture the
- * synchronous activation outcome via the with_outcome API. Returns the
- * new handle and writes *outcome (MQVPN_ADD_PATH_OK / TRANSIENT / PERMANENT);
- * returns -1 on handle-allocation failure (already logged). */
-static mqvpn_path_handle_t
-recovery_register_with_lib(platform_ctx_t *p, int slot, int fd, const char *ifname,
-                           mqvpn_add_path_outcome_t *outcome)
-{
-    mqvpn_path_t *mp = &p->path_mgr.paths[slot];
-
-    mqvpn_path_desc_t desc = {0};
-    desc.struct_size = sizeof(desc);
-    desc.fd = fd;
-    snprintf(desc.iface, sizeof(desc.iface), "%s", mp->iface);
-    if (mp->local_addrlen > 0 && mp->local_addrlen <= sizeof(desc.local_addr)) {
-        memcpy(desc.local_addr, &mp->local_addr, mp->local_addrlen);
-        desc.local_addr_len = mp->local_addrlen;
-    }
-
-    mqvpn_path_handle_t handle =
-        mqvpn_client_add_path_fd_with_outcome(p->client, fd, &desc, outcome);
-    if (handle < 0) {
-        LOG_WRN("netlink: add_path_fd() for re-add %s failed", ifname);
-        return -1;
-    }
-    p->lib_path_handles[slot] = handle;
-    return handle;
-}
-
-/* Roll back a failed re-add so the next attempt starts from a clean slate.
- *
- * Safe ordering: remove_path() first, then close(fd). The xquic_path_live=0
- * invariant (enforced by apply_path_activation_failure /
- * apply_path_create_permanent_failure) makes remove_path() skip
- * xqc_conn_close_path(), so xquic never touches this fd during teardown.
- * Do NOT remove that defensive clear — it's what makes this rollback safe. */
-static void
-recovery_rollback(platform_ctx_t *p, int slot, mqvpn_add_path_outcome_t outcome)
-{
-    mqvpn_path_t *mp = &p->path_mgr.paths[slot];
-    const char *ifname = mp->iface;
-
-    mqvpn_client_remove_path(p->client, p->lib_path_handles[slot]);
-    close(mp->fd);
-    mp->fd = -1;
-    mp->platform_attached = 0;
-
-    if (outcome == MQVPN_ADD_PATH_PERMANENT_FAIL) {
-        /* Saturate the per-slot counter — recover_dropped_paths_cb will
-         * skip this slot until a fresh Level-2 reconnect resets the limit. */
-        p->path_recover_failures[slot] = PATH_RECOVER_FAILURE_LIMIT;
-        LOG_WRN("netlink: path %s recovery abandoned (xquic budget exhausted; "
-                "reconnect required)",
-                ifname);
-        return;
-    }
-
-    /* Transient failure (most commonly -XQC_EMP_NO_AVAIL_PATH_ID during
-     * WiFi reassoc CID-lag burst). Bump the consecutive-failure counter so
-     * the 3s recovery timer eventually gives up and waits for reconnect. */
-    p->path_recover_failures[slot]++;
-    if (p->path_recover_failures[slot] >= PATH_RECOVER_FAILURE_LIMIT) {
-        LOG_WRN("netlink: path %s recovery abandoned after %d consecutive "
-                "failures (will resume on reconnect)",
-                ifname, PATH_RECOVER_FAILURE_LIMIT);
-    } else {
-        LOG_WRN("netlink: re-add %s not activated, will retry (%d/%d)", ifname,
-                p->path_recover_failures[slot], PATH_RECOVER_FAILURE_LIMIT);
-    }
-}
-
-/* PR5: replace path_removed_by_platform[] polling with lib state query.
- * The slot is considered "ready for re-add" if its public status is
- * MQVPN_PATH_CLOSED — i.e., lib has fully cleaned up the previous incarnation
- * (CLOSED_FREE) OR is mid-cleanup (CLOSED_DROPPED with all xquic-side fields
- * drained). add_path_fd_with_outcome will refuse to reuse a non-CLOSED slot;
- * if cleanup hasn't completed we get TRANSIENT_FAIL and bail — next netlink
- * event will retry. */
-static int
-try_readd_removed_path(platform_ctx_t *p, const char *ifname)
-{
-    mqvpn_path_info_t pinfo[MQVPN_MAX_PATHS];
-    int n = 0;
-    if (mqvpn_client_get_paths(p->client, pinfo, MQVPN_MAX_PATHS, &n) != MQVPN_OK)
-        return 0;
-
-    for (int i = 0; i < p->path_mgr.n_paths; i++) {
-        if (strcmp(p->path_mgr.paths[i].iface, ifname) != 0) continue;
-        if (p->path_recover_failures[i] >= PATH_RECOVER_FAILURE_LIMIT) continue;
-        mqvpn_path_handle_t h = p->lib_path_handles[i];
-
-        int found = 0;
-        mqvpn_path_status_t st = MQVPN_PATH_PENDING;
-        for (int j = 0; j < n; j++) {
-            if (pinfo[j].handle == h) {
-                found = 1;
-                st = pinfo[j].status;
-                break;
-            }
-        }
-        /* Re-add candidate: slot exists in lib as CLOSED (DROPPED or FREE),
-         * or slot was never tracked (handle invalid / removed before lib saw it). */
-        if (found && st != MQVPN_PATH_CLOSED) continue;
-
-        mqvpn_path_t *mp = &p->path_mgr.paths[i];
-        int fd = recovery_socket_create(p->server_addr.ss_family, ifname, mp);
-        if (fd < 0) return 0;
-
-        mp->fd = fd;
-        mp->platform_attached = 1;
-        mp->xquic_path_live = 0;
-        mp->path_id = 0;
-
-        mqvpn_add_path_outcome_t outcome = MQVPN_ADD_PATH_OK;
-        mqvpn_path_handle_t new_h =
-            recovery_register_with_lib(p, i, fd, ifname, &outcome);
-        if (new_h < 0) {
-            close(fd);
-            mp->fd = -1;
-            mp->platform_attached = 0;
-            return 0;
-        }
-
-        if (outcome != MQVPN_ADD_PATH_OK) {
-            recovery_rollback(p, i, outcome);
-            return 0;
-        }
-
-        /* Activation confirmed — register libevent so packets are read from
-         * the new socket. */
-        p->ev_udp[i] = event_new(p->eb, fd, EV_READ | EV_PERSIST, on_socket_read, p);
-        event_add(p->ev_udp[i], NULL);
-
-        p->path_recover_failures[i] = 0; /* success resets the budget */
-        LOG_INF("netlink: path %s re-added (handle=%lld)", ifname, (long long)new_h);
-        return 1;
-    }
-    return 0;
-}
-
-/* Periodically re-add platform slots whose library state is CLOSED but
- * whose interface is currently up. Fires every RECOVER_INTERVAL_SEC.
- *
- * Spec sec 3.4 "Stateless Platforms" compliance: this handler holds NO
- * lifecycle state — it queries the library via mqvpn_client_get_paths()
- * each tick (in try_readd_removed_path) and acts based on the public
- * MQVPN_PATH_CLOSED status. path_recover_failures[] is pure backpressure
- * to bound the busy-loop on transient xquic errors during a WiFi
- * reassoc CID-lag burst — not a state mirror.
- *
- * Why this timer is necessary: on carrier loss/restore the kernel emits
- * a single RTM_NEWLINK with IFF_RUNNING toggled — IP/admin state don't
- * change, so no RTM_NEWADDR follows. If the one-shot
- * try_readd_removed_path() driven by that single event fails
- * synchronously (e.g. xqc_conn_create_path returns
- * -XQC_EMP_NO_AVAIL_PATH_ID because the server hasn't replenished CIDs
- * yet, or the previous CLOSED_DROPPED slot hasn't drained xquic-side
- * fields), there is no further event to retry on. The library's
- * tick_drive_retry_timer only services CREATE_WAIT/DEGRADED, not
- * CLOSED_DROPPED — so a platform-side periodic poll is the only way
- * to recover.
- *
- * Pre-filters on link state + IP so we don't burn syscalls
- * (socket/bind/IP_BOUND_IF) when the interface is still down. */
-static void
-recover_dropped_paths_cb(evutil_socket_t fd, short what, void *arg)
-{
-    (void)fd;
-    (void)what;
-    platform_ctx_t *p = (platform_ctx_t *)arg;
-
-    mqvpn_path_info_t pinfo[MQVPN_MAX_PATHS];
-    int n = 0;
-    if (mqvpn_client_get_paths(p->client, pinfo, MQVPN_MAX_PATHS, &n) != MQVPN_OK)
-        goto rearm;
-
-    for (int i = 0; i < p->path_mgr.n_paths; i++) {
-        if (p->path_recover_failures[i] >= PATH_RECOVER_FAILURE_LIMIT) continue;
-        if (p->path_mgr.paths[i].platform_attached) continue; /* already live */
-
-        mqvpn_path_handle_t h = p->lib_path_handles[i];
-        int is_closed = 0;
-        for (int j = 0; j < n; j++) {
-            if (pinfo[j].handle == h) {
-                is_closed = (pinfo[j].status == MQVPN_PATH_CLOSED);
-                break;
-            }
-        }
-        if (!is_closed) continue;
-
-        const char *ifname = p->path_mgr.paths[i].iface;
-        if (!iface_is_up_and_running(ifname)) continue;
-        if (!iface_has_ip(ifname)) continue;
-
-        /* try_readd_removed_path scans by ifname, finds this slot via
-         * lib state, and either succeeds (resets the counter via line
-         * above) or fails through recovery_rollback (which bumps the
-         * counter). Multiple slots sharing one ifname are handled by
-         * try_readd's internal loop. */
-        if (try_readd_removed_path(p, ifname))
-            LOG_INF("netlink: timer re-added path %s after carrier-up failure", ifname);
-    }
-
-rearm:
-    if (p->ev_recover) {
-        struct timeval tv = {.tv_sec = RECOVER_INTERVAL_SEC};
-        event_add(p->ev_recover, &tv);
-    }
-}
-
-/* RTM_NEWADDR: an interface gained an IP address.
- * Try re-add first because RTM_DELLINK invalidates the fd; only fall back
- * to reactivate if this slot wasn't fully dropped (fd still valid). */
-static void
-handle_rtm_newaddr(platform_ctx_t *p, struct nlmsghdr *nh)
-{
-    struct ifaddrmsg *ifa = (struct ifaddrmsg *)NLMSG_DATA(nh);
-    char ifname[IFNAMSIZ];
-    if (!if_indextoname(ifa->ifa_index, ifname)) return;
-    if (!try_readd_removed_path(p, ifname)) try_reactivate_by_ifname(p, ifname);
-}
-
-/* RTM_DELLINK: interface gone. remove_path_by_index() uses drop_path
- * semantics (not orderly close) so surviving paths aren't blocked by
- * xquic shutdown handshakes. */
-static void
-handle_rtm_dellink(platform_ctx_t *p, struct nlmsghdr *nh)
-{
-    const char *ifname = nlmsg_get_ifname(nh);
-    if (!ifname) return;
-    for (int i = 0; i < p->path_mgr.n_paths; i++) {
-        if (strcmp(p->path_mgr.paths[i].iface, ifname) == 0)
-            remove_path_by_index(p, i, "removed");
-    }
-}
-
-/* Decide whether this RTM_NEWLINK is a carrier-loss event we should drop on.
- *
- * Gate on IFLA_OPERSTATE rather than !IFF_RUNNING. IFF_RUNNING also clears
- * during wifi association / dormant transitions, so an !IFF_RUNNING-based
- * gate would burn one path_id slot per wifi roam — defeating the very
- * XQC_MAX_PATHS_COUNT budget the drop is meant to preserve.
- *
- * Drop only on a definite operational-down report (RFC 2863): IF_OPER_DOWN
- * (link admin/peer down) or IF_OPER_LOWERLAYERDOWN (e.g. underlying ethernet
- * of a vlan/bridge went away). IF_OPER_DORMANT (wifi associating),
- * IF_OPER_UNKNOWN (driver doesn't report; common on virtual interfaces) and
- * IF_OPER_TESTING are tolerated — the carrier-up handler / recovery timer
- * will still re-add once IFF_RUNNING + has_ip become true. */
-static int
-is_carrier_loss(struct ifinfomsg *ifi, int operstate)
-{
-    return (ifi->ifi_flags & IFF_UP) &&
-           (operstate == IF_OPER_DOWN || operstate == IF_OPER_LOWERLAYERDOWN);
-}
-
-/* RTM_NEWLINK: link state changed. Either drop on carrier loss, or attempt
- * recovery if the link is now usable. */
-static void
-handle_rtm_newlink(platform_ctx_t *p, struct nlmsghdr *nh)
-{
-    struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(nh);
-    const char *ifname = nlmsg_get_ifname(nh);
-    if (!ifname) return;
-
-    if (is_carrier_loss(ifi, nlmsg_get_operstate(nh))) {
-        for (int i = 0; i < p->path_mgr.n_paths; i++) {
-            if (strcmp(p->path_mgr.paths[i].iface, ifname) == 0)
-                remove_path_by_index(p, i, "carrier lost");
-        }
-        return;
-    }
-
-    if (!(ifi->ifi_flags & IFF_UP) || !(ifi->ifi_flags & IFF_RUNNING)) return;
-    if (!iface_has_ip(ifname)) return;
-
-    /* First: try to re-add paths removed by RTM_DELLINK (dead fd).
-     * Otherwise: reactivate degraded/closed paths (fd still valid). */
-    if (try_readd_removed_path(p, ifname)) return;
-    try_reactivate_by_ifname(p, ifname);
-}
-
-static void
-on_netlink_event(evutil_socket_t fd, short what, void *arg)
-{
-    (void)what;
-    platform_ctx_t *p = (platform_ctx_t *)arg;
-    char buf[NETLINK_BUF_SIZE];
-
-    for (;;) {
-        ssize_t len = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
-        if (len <= 0) break;
-
-        int nlen = (int)len;
-        for (struct nlmsghdr *nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, nlen);
-             nh = NLMSG_NEXT(nh, nlen)) {
-            switch (nh->nlmsg_type) {
-            case RTM_NEWADDR: handle_rtm_newaddr(p, nh); break;
-            case RTM_DELLINK: handle_rtm_dellink(p, nh); break;
-            case RTM_NEWLINK: handle_rtm_newlink(p, nh); break;
-            }
-        }
-    }
-}
-
-static int
-setup_netlink(platform_ctx_t *p)
-{
-    p->nl_fd =
-        socket(AF_NETLINK, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_ROUTE);
-    if (p->nl_fd < 0) {
-        LOG_WRN("netlink socket failed: %s (path recovery via timer only)",
-                strerror(errno));
-        return -1;
-    }
-
-    struct sockaddr_nl sa = {
-        .nl_family = AF_NETLINK,
-        .nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR,
-    };
-    if (bind(p->nl_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        LOG_WRN("netlink bind failed: %s (path recovery via timer only)",
-                strerror(errno));
-        close(p->nl_fd);
-        p->nl_fd = -1;
-        return -1;
-    }
-
-    p->ev_netlink = event_new(p->eb, p->nl_fd, EV_READ | EV_PERSIST, on_netlink_event, p);
-    if (!p->ev_netlink) {
-        LOG_WRN("netlink event_new failed (OOM?)");
-        close(p->nl_fd);
-        p->nl_fd = -1;
-        return -1;
-    }
-    event_add(p->ev_netlink, NULL);
-    LOG_INF("netlink path recovery accelerator active");
-    return 0;
-}
 
 /* ================================================================
  *  Main entry point: linux_platform_run_client
@@ -1020,6 +492,8 @@ linux_platform_run_client(const mqvpn_client_cfg_t *cfg)
     }
 
     mqvpn_config_set_server(lib_cfg, cfg->server_addr, cfg->server_port);
+    if (cfg->tls_server_name)
+        mqvpn_config_set_tls_server_name(lib_cfg, cfg->tls_server_name);
     if (cfg->auth_key) mqvpn_config_set_auth_key(lib_cfg, cfg->auth_key);
     mqvpn_config_set_insecure(lib_cfg, cfg->insecure);
     mqvpn_config_set_multipath(lib_cfg, cfg->n_paths > 1 ? 1 : 0);
@@ -1038,10 +512,17 @@ linux_platform_run_client(const mqvpn_client_cfg_t *cfg)
     }
     mqvpn_config_set_scheduler(lib_cfg, lib_sched);
     mqvpn_config_set_cc(lib_cfg, (mqvpn_cc_t)cfg->cc);
+    mqvpn_config_set_reinjection(lib_cfg, (mqvpn_reinjection_t)cfg->reinjection);
+    mqvpn_config_set_reinjection_deadline_params(lib_cfg, cfg->reinj_srtt_factor_pct,
+                                                 cfg->reinj_hard_deadline_ms,
+                                                 cfg->reinj_deadline_lower_bound_ms);
     mqvpn_config_set_init_max_path_id(lib_cfg, cfg->init_max_path_id);
     mqvpn_config_set_tun_mtu(lib_cfg, cfg->tun_mtu);
     mqvpn_config_apply_reorder(lib_cfg,
                                &cfg->reorder); /* INI [Reorder]/[ReorderRule] bridge */
+    mqvpn_config_apply_hybrid(lib_cfg, &cfg->hybrid); /* INI [Hybrid] bridge */
+    if (cfg->recv_rate_limit)
+        mqvpn_config_set_recv_rate_limit(lib_cfg, cfg->recv_rate_limit);
 
     /* Create callbacks */
     mqvpn_client_callbacks_t cbs = MQVPN_CLIENT_CALLBACKS_INIT;
@@ -1211,7 +692,20 @@ cleanup:
  *  Server platform layer
  * ================================================================ */
 
+/* Registry entry tracking readiness interest for one egress TCP fd that
+ * the core (src/hybrid/tcp_egress.c) opened and manages itself — the
+ * platform only maps the fd to the libevent event multiplexing it.
+ * libevent events aren't individually mutable, so a want_read/want_write
+ * change means tearing down and recreating the event (see
+ * platform_egress_fd_register()). */
 typedef struct {
+    int fd; /* -1 = empty slot */
+    struct event *ev;
+    void *fd_ctx;
+    struct server_platform_ctx_s *sp; /* backpointer for the event callback */
+} egress_fd_slot_t;
+
+typedef struct server_platform_ctx_s {
     mqvpn_server_t *server;
     struct event_base *eb;
     struct event *ev_tick;
@@ -1224,6 +718,12 @@ typedef struct {
     int udp_fd;
     int shutting_down;
     ctrl_socket_t *ctrl;
+
+    /* Egress fd registry (hybrid TCP lane, D1). Sized once at server start
+     * from mqvpn_server_egress_fd_budget() so the platform's registry and
+     * the core's own fd cap can never drift apart. */
+    egress_fd_slot_t *egress_fds;
+    int n_egress_fds;
 } server_platform_ctx_t;
 
 static void svr_on_tick(evutil_socket_t fd, short what, void *arg);
@@ -1368,6 +868,104 @@ svr_on_socket_read(evutil_socket_t fd, short what, void *arg)
     svr_schedule_next_tick(sp);
 }
 
+/* ─── Egress fd registry (hybrid TCP lane, D1) ───
+ *
+ * The core (src/hybrid/tcp_egress.c) owns every egress fd's socket()/
+ * connect()/send()/recv()/close() syscalls directly; these callbacks only
+ * (un)register the platform's interest in an already-open fd. Linear scan
+ * is fine — register/unregister fire on state-change, not per-packet. */
+
+static egress_fd_slot_t *
+find_egress_slot(server_platform_ctx_t *sp, int fd)
+{
+    for (int i = 0; i < sp->n_egress_fds; i++) {
+        if (sp->egress_fds[i].fd == fd) return &sp->egress_fds[i];
+    }
+    return NULL;
+}
+
+static egress_fd_slot_t *
+find_or_alloc_egress_slot(server_platform_ctx_t *sp, int fd)
+{
+    egress_fd_slot_t *existing = find_egress_slot(sp, fd);
+    if (existing) return existing;
+
+    for (int i = 0; i < sp->n_egress_fds; i++) {
+        if (sp->egress_fds[i].fd == -1) return &sp->egress_fds[i];
+    }
+    return NULL;
+}
+
+static void
+on_egress_fd_event(evutil_socket_t fd, short what, void *arg)
+{
+    egress_fd_slot_t *slot = (egress_fd_slot_t *)arg;
+    server_platform_ctx_t *sp = slot->sp;
+    mqvpn_server_on_egress_fd_ready(sp->server, (int)fd, slot->fd_ctx,
+                                    (what & EV_READ) != 0, (what & EV_WRITE) != 0);
+    mqvpn_server_tick(sp->server);
+    svr_schedule_next_tick(sp);
+}
+
+static void
+platform_egress_fd_register(int fd, int want_read, int want_write, void *fd_ctx,
+                            void *user_ctx)
+{
+    server_platform_ctx_t *sp = (server_platform_ctx_t *)user_ctx;
+    egress_fd_slot_t *slot = find_or_alloc_egress_slot(sp, fd);
+    if (!slot) {
+        LOG_WRN("egress fd registry full, fd=%d not polled", fd);
+        return;
+    }
+
+    /* Re-register: tear down the old event with stale want_read/want_write
+     * flags first — libevent events aren't individually mutable. */
+    if (slot->ev) {
+        event_del(slot->ev);
+        event_free(slot->ev);
+        slot->ev = NULL;
+    }
+
+    short flags = EV_PERSIST | (want_read ? EV_READ : 0) | (want_write ? EV_WRITE : 0);
+    slot->fd = fd;
+    slot->fd_ctx = fd_ctx;
+    slot->sp = sp;
+    slot->ev = event_new(sp->eb, fd, flags, on_egress_fd_event, slot);
+    if (!slot->ev) {
+        LOG_WRN("event_new failed for egress fd=%d", fd);
+        slot->fd = -1;
+        slot->fd_ctx = NULL;
+        return;
+    }
+    if (event_add(slot->ev, NULL) < 0) {
+        LOG_WRN("event_add failed for egress fd=%d", fd);
+        event_free(slot->ev);
+        slot->ev = NULL;
+        slot->fd = -1;
+        slot->fd_ctx = NULL;
+    }
+}
+
+static void
+platform_egress_fd_unregister(int fd, void *user_ctx)
+{
+    server_platform_ctx_t *sp = (server_platform_ctx_t *)user_ctx;
+    egress_fd_slot_t *slot = find_egress_slot(sp, fd);
+    if (!slot) return;
+
+    /* Load-bearing libevent guarantee: event_del also removes a pending
+     * activation already queued in the current loop pass, so once this
+     * returns, on_egress_fd_event can never fire for this (possibly
+     * already-destroyed) flow again. */
+    if (slot->ev) {
+        event_del(slot->ev);
+        event_free(slot->ev);
+    }
+    slot->ev = NULL;
+    slot->fd = -1;
+    slot->fd_ctx = NULL;
+}
+
 static void
 svr_on_signal(evutil_socket_t sig, short what, void *arg)
 {
@@ -1490,10 +1088,15 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
     }
     mqvpn_config_set_scheduler(lib_cfg, lib_sched);
     mqvpn_config_set_cc(lib_cfg, (mqvpn_cc_t)cfg->cc);
+    mqvpn_config_set_reinjection(lib_cfg, (mqvpn_reinjection_t)cfg->reinjection);
+    mqvpn_config_set_reinjection_deadline_params(lib_cfg, cfg->reinj_srtt_factor_pct,
+                                                 cfg->reinj_hard_deadline_ms,
+                                                 cfg->reinj_deadline_lower_bound_ms);
     mqvpn_config_set_init_max_path_id(lib_cfg, cfg->init_max_path_id);
     mqvpn_config_set_tun_mtu(lib_cfg, cfg->tun_mtu);
     mqvpn_config_apply_reorder(lib_cfg,
                                &cfg->reorder); /* INI [Reorder]/[ReorderRule] bridge */
+    mqvpn_config_apply_hybrid(lib_cfg, &cfg->hybrid); /* INI [Hybrid] bridge */
 
     mqvpn_config_set_log_level(lib_cfg, (mqvpn_log_level_t)cfg->log_level);
 
@@ -1503,6 +1106,8 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
     cbs.tunnel_config_ready = svr_cb_tunnel_config_ready;
     cbs.send_packet = NULL; /* fd-only mode */
     cbs.log = svr_cb_log;
+    cbs.egress_fd_register = platform_egress_fd_register;
+    cbs.egress_fd_unregister = platform_egress_fd_unregister;
 
     /* Create server */
     sp.server = mqvpn_server_new(lib_cfg, &cbs, &sp);
@@ -1510,6 +1115,21 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
     if (!sp.server) {
         LOG_ERR("failed to create mqvpn server");
         return 1;
+    }
+
+    /* Egress fd registry (hybrid TCP lane, D1). Sized from the same budget
+     * tcp_egress.c will itself enforce, so the two caps cannot drift. */
+    sp.n_egress_fds = mqvpn_server_egress_fd_budget(sp.server);
+    if (sp.n_egress_fds > 0) {
+        sp.egress_fds = calloc((size_t)sp.n_egress_fds, sizeof(*sp.egress_fds));
+        if (!sp.egress_fds) {
+            LOG_ERR("failed to allocate egress fd registry");
+            goto cleanup;
+        }
+        for (int i = 0; i < sp.n_egress_fds; i++)
+            sp.egress_fds[i].fd = -1;
+    } else {
+        sp.n_egress_fds = 0;
     }
 
     /* Create UDP socket */
@@ -1592,6 +1212,20 @@ cleanup:
     }
     if (sp.udp_fd >= 0) close(sp.udp_fd);
     mqvpn_server_destroy(sp.server);
+    /* After server destroy: teardown may call egress_fd_unregister for any
+     * still-open egress fds, which scans this registry — free it only once
+     * the server is gone (but before the event base the events belong to). */
+    if (sp.egress_fds) {
+        for (int i = 0; i < sp.n_egress_fds; i++) {
+            if (sp.egress_fds[i].ev) {
+                event_del(sp.egress_fds[i].ev);
+                event_free(sp.egress_fds[i].ev);
+            }
+        }
+        free(sp.egress_fds);
+        sp.egress_fds = NULL;
+        sp.n_egress_fds = 0;
+    }
     if (sp.eb) event_base_free(sp.eb);
 
     return rc;

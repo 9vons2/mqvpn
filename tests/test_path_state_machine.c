@@ -2,6 +2,12 @@
 // Copyright (c) 2026 mp0rta and mqvpn contributors
 
 /* tests/test_path_state_machine.c */
+
+/* Keep assert() live even in Release builds: CI runs ctest on Release too,
+ * where NDEBUG would silently no-op every assertion in this file. */
+#undef NDEBUG
+#include <assert.h>
+
 #include "path_entry_internal.h"
 #include "path_state_machine.h"
 #include "libmqvpn.h"
@@ -691,14 +697,16 @@ test_dispatch_table(void)
          {.result = ACTIVATE_PERMANENT_FAIL, .now_us = 2000},
          PATH_LC_CLOSED_RECOVERABLE,
          0},
-        /* 3: MAX guard — CREATE_WAIT retries=5 + RETRY_TIMER(TRANSIENT) */
-        {"CREATE_WAIT retries=5 + RETRY_TIMER(TRANSIENT) -> MAX",
+        /* 3: MAX guard — CREATE_WAIT one short of the budget + RETRY_TIMER(TRANSIENT).
+         * Derived from PATH_RECREATE_MAX_RETRIES so retuning the retry budget
+         * (see path_state_machine.h) does not silently invalidate this case. */
+        {"CREATE_WAIT retries=MAX-1 + RETRY_TIMER(TRANSIENT) -> MAX",
          PATH_LC_CREATE_WAIT,
          /*pa=*/1,
          /*xpl=*/0,
          /*rec_after=*/1000,
          /*pss=*/0,
-         /*retries=*/5,
+         /*retries=*/PATH_RECREATE_MAX_RETRIES - 1,
          /*xqc=*/0,
          PATH_EVENT_RETRY_TIMER,
          {.result = ACTIVATE_TRANSIENT_FAIL, .now_us = 2000},

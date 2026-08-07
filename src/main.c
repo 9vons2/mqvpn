@@ -9,12 +9,16 @@
 #include "vpn_client.h"
 #include "vpn_server.h"
 #include "flow_sched.h"
+#include "mqvpn_sched_names.h"
 
 #include <xquic/xquic.h> /* for XQC_ENABLE_* compile-time defines */
 
 #ifdef _WIN32
 #  include "platform_windows.h"
 #  include <winsock2.h>
+#elif defined(__APPLE__)
+#  include "platform_darwin.h"
+#  include "status.h"
 #else
 #  include "platform_linux.h"
 #  include "status.h"
@@ -44,10 +48,11 @@ usage(const char *prog)
         "  --listen BIND:PORT        Listen address (server mode, default 0.0.0.0:443)\n"
         "  --subnet CIDR             Client IP pool (server mode, default 10.0.0.0/24)\n"
         "  --subnet6 CIDR            IPv6 client IP pool (server mode, e.g. "
-        "2001:db8:1::/112)\n"
+        "fd00:abcd::/112)\n"
         "  --tun-name NAME           TUN device name (default mqvpn0)\n"
         "  --cert PATH               TLS certificate (server mode)\n"
         "  --key PATH                TLS private key (server mode)\n"
+        "  --tls-server-name NAME    TLS SNI / cert verify name (client mode)\n"
         "  --insecure                Accept untrusted certs (client mode, testing only)\n"
         "  --auth-key KEY            PSK for authentication\n"
         "  --user NAME:KEY           Add a server user credential (repeatable)\n"
@@ -158,6 +163,7 @@ main(int argc, char *argv[])
         {"no-reconnect", no_argument, NULL, 'R'},
         {"kill-switch", no_argument, NULL, 'K'},
         {"no-manage-routes", no_argument, NULL, 0x103},
+        {"tls-server-name", required_argument, NULL, 0x104},
         {"control-port", required_argument, NULL, 'X'},
         {"control-addr", required_argument, NULL, 'x'},
         {"status", no_argument, NULL, 'T'},
@@ -176,6 +182,7 @@ main(int argc, char *argv[])
     const char *cert_file = NULL;
     const char *key_file = NULL;
     int insecure = -1; /* -1 means "not set by CLI" */
+    const char *tls_server_name = NULL;
     const char *auth_key = NULL;
     char cli_user_names[MQVPN_CONFIG_MAX_USERS][64];
     char cli_user_keys[MQVPN_CONFIG_MAX_USERS][256];
@@ -300,6 +307,7 @@ main(int argc, char *argv[])
         case 'R': no_reconnect = 1; break;
         case 'K': kill_switch = 1; break;
         case 0x103: manage_routes = 0; break; /* --no-manage-routes */
+        case 0x104: tls_server_name = optarg; break;
         case 'X':
             control_port = atoi(optarg);
             control_port_set = 1;
@@ -438,43 +446,55 @@ main(int argc, char *argv[])
         log_level = MQVPN_LOG_ERROR;
     mqvpn_log_set_level(log_level);
 
-    /* Parse scheduler */
-    int scheduler = MQVPN_SCHED_MINRTT;
-    if (strcmp(eff_scheduler, "wlb") == 0) {
-        scheduler = MQVPN_SCHED_WLB;
-    } else if (strcmp(eff_scheduler, "wlb_udp_pin") == 0) {
-        scheduler = MQVPN_SCHED_WLB_UDP_PIN;
-    } else if (strcmp(eff_scheduler, "backup_fec") == 0) {
-#if defined(XQC_ENABLE_FEC) && defined(XQC_ENABLE_XOR)
-        scheduler = MQVPN_SCHED_BACKUP_FEC;
-#else
-        fprintf(stderr, "error: --scheduler 'backup_fec' requires rebuild with "
-                        "-DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON in xquic\n");
-        return 1;
-#endif
-    } else if (strcmp(eff_scheduler, "minrtt") != 0) {
+    /* Parse scheduler. Name lookup is the shared table (mqvpn_sched_names.h);
+     * the backup_fec build-flag gate stays here — it's a CLI-surface-only
+     * policy, not a table fact (mqvpn_config.c's JSON path accepts
+     * "backup_fec" unconditionally; see that file's parse_scheduler_name). */
+    int sched_lookup = mqvpn_sched_from_name(eff_scheduler);
+    if (sched_lookup < 0) {
         fprintf(stderr, "error: --scheduler must be 'minrtt', 'wlb', 'wlb_udp_pin', or "
                         "'backup_fec'\n");
         return 1;
     }
+    int scheduler = sched_lookup;
+    if (scheduler == MQVPN_SCHED_BACKUP_FEC) {
+#if !(defined(XQC_ENABLE_FEC) && defined(XQC_ENABLE_XOR))
+        fprintf(stderr, "error: --scheduler 'backup_fec' requires rebuild with "
+                        "-DXQC_ENABLE_FEC=ON -DXQC_ENABLE_XOR=ON in xquic\n");
+        return 1;
+#endif
+    }
 
-    /* Parse congestion control */
-    int cc = MQVPN_CC_BBR2;
-    if (strcmp(eff_cc, "bbr") == 0) {
-        cc = MQVPN_CC_BBR;
-    } else if (strcmp(eff_cc, "cubic") == 0) {
-        cc = MQVPN_CC_CUBIC;
-    } else if (strcmp(eff_cc, "none") == 0) {
-#ifdef XQC_ENABLE_UNLIMITED
-        cc = MQVPN_CC_NONE;
-#else
+    /* Parse congestion control. Same shared-table + site-gate split. */
+    int cc_lookup = mqvpn_cc_from_name(eff_cc);
+    if (cc_lookup < 0) {
+        fprintf(stderr, "error: --cc must be 'bbr2', 'bbr', 'cubic', or 'none'\n");
+        return 1;
+    }
+    int cc = cc_lookup;
+    if (cc == MQVPN_CC_NONE) {
+#ifndef XQC_ENABLE_UNLIMITED
         fprintf(stderr, "error: --cc 'none' requires rebuild with "
                         "-DXQC_ENABLE_UNLIMITED=ON in xquic\n");
         return 1;
 #endif
-    } else if (strcmp(eff_cc, "bbr2") != 0) {
-        fprintf(stderr, "error: --cc must be 'bbr2', 'bbr', 'cubic', or 'none'\n");
-        return 1;
+    }
+
+    /* Parse reinjection mode. No CLI flag (config file/JSON only — YAGNI).
+     * Name lookup is the shared table (mqvpn_sched_names.h). Unlike the
+     * scheduler/cc CLI gates above, an unrecognized value here is a WARN +
+     * fallback to "off", not a fatal error: mqvpn_config.c's JSON surface is
+     * the hard-error surface for this key (see that file's parse_reinj_name
+     * call site). */
+    int reinj_lookup = mqvpn_reinj_from_name(file_cfg.reinjection);
+    int reinjection = MQVPN_REINJ_OFF;
+    if (reinj_lookup < 0) {
+        fprintf(stderr,
+                "warning: [Multipath] Reinjection '%s' not recognized "
+                "(expected 'off', 'deadline', 'idle', or 'dgram'); using 'off'\n",
+                file_cfg.reinjection);
+    } else {
+        reinjection = reinj_lookup;
     }
 
     /* Paths: CLI paths override config paths entirely */
@@ -511,9 +531,15 @@ main(int argc, char *argv[])
 
         int eff_reconnect = no_reconnect ? 0 : file_cfg.reconnect;
 
+        const char *eff_tls_name = tls_server_name ? tls_server_name
+                                   : file_cfg.tls_server_name[0]
+                                       ? file_cfg.tls_server_name
+                                       : NULL;
+
         mqvpn_client_cfg_t cfg = {
             .server_addr = host,
             .server_port = port,
+            .tls_server_name = eff_tls_name,
             .tun_name = eff_tun_name,
             .insecure = eff_insecure,
             .log_level = log_level,
@@ -528,9 +554,18 @@ main(int argc, char *argv[])
             .init_max_path_id = eff_init_max_path_id,
             .tun_mtu = eff_tun_mtu,
             .cc = cc,
+            .reinjection = reinjection,
+            .reinj_srtt_factor_pct = file_cfg.reinjection_srtt_factor_pct,
+            .reinj_hard_deadline_ms = file_cfg.reinjection_hard_deadline_ms,
+            .reinj_deadline_lower_bound_ms = file_cfg.reinjection_deadline_lower_bound_ms,
             /* INI [Reorder]/[ReorderRule]; always valid (mqvpn_config_defaults
              * seeds mode OFF even with no [Reorder] section). No CLI flags in v1. */
             .reorder = file_cfg.reorder,
+            /* INI [Hybrid]; always valid (mqvpn_config_defaults seeds the
+             * disabled defaults even with no [Hybrid] section). */
+            .hybrid = file_cfg.hybrid,
+            /* [Advanced]; 0 = off. Client-only (server path never reads it). */
+            .recv_rate_limit = file_cfg.recv_rate_limit,
         };
         for (int i = 0; i < n_paths; i++) {
             cfg.path_ifaces[i] = path_ifaces[i];
@@ -540,6 +575,8 @@ main(int argc, char *argv[])
         }
 #ifdef _WIN32
         return win_platform_run_client(&cfg);
+#elif defined(__APPLE__)
+        return darwin_platform_run_client(&cfg);
 #else
         return linux_platform_run_client(&cfg);
 #endif
@@ -576,9 +613,16 @@ main(int argc, char *argv[])
             .init_max_path_id = eff_init_max_path_id,
             .tun_mtu = eff_tun_mtu,
             .cc = cc,
+            .reinjection = reinjection,
+            .reinj_srtt_factor_pct = file_cfg.reinjection_srtt_factor_pct,
+            .reinj_hard_deadline_ms = file_cfg.reinjection_hard_deadline_ms,
+            .reinj_deadline_lower_bound_ms = file_cfg.reinjection_deadline_lower_bound_ms,
             /* INI [Reorder]/[ReorderRule]; always valid (mqvpn_config_defaults
              * seeds mode OFF even with no [Reorder] section). No CLI flags in v1. */
             .reorder = file_cfg.reorder,
+            /* INI [Hybrid]; always valid (mqvpn_config_defaults seeds the
+             * disabled defaults even with no [Hybrid] section). */
+            .hybrid = file_cfg.hybrid,
         };
         for (int i = 0; i < eff_n_users; i++) {
             cfg.user_names[i] = eff_user_names[i];
@@ -586,6 +630,9 @@ main(int argc, char *argv[])
         }
 #ifdef _WIN32
         return win_platform_run_server(&cfg);
+#elif defined(__APPLE__)
+        fprintf(stderr, "error: server mode is not supported on macOS yet\n");
+        return 1;
 #else
         return linux_platform_run_server(&cfg);
 #endif

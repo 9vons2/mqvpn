@@ -15,14 +15,18 @@ import com.mqvpn.sdk.core.internal.UdpReaderPool
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnError
 import com.mqvpn.sdk.core.model.MqvpnState
+import com.mqvpn.sdk.core.model.PathInfo
 import com.mqvpn.sdk.core.model.ReconnectInfo
+import com.mqvpn.sdk.core.model.ReorderStats
 import com.mqvpn.sdk.core.model.TunnelInfo
+import com.mqvpn.sdk.core.model.VpnStats
 import com.mqvpn.sdk.network.NetworkMonitor
 import com.mqvpn.sdk.runtime.MqvpnPoller
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -70,8 +74,14 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
                 val result = t?.tick() ?: 0
                 // Poll stats/paths and push to MqvpnManager on each tick
                 if (t != null) {
-                    manager?.updateStats(t.getStats())
-                    manager?.updatePaths(t.getPaths())
+                    val polledStats = t.getStats()
+                    manager?.updateStats(polledStats)
+                    val polledPaths = t.getPaths()
+                    manager?.updatePaths(polledPaths)
+                    onPathsPolled(polledPaths)
+                    val polledReorder = t.getReorderStats()
+                    manager?.updateReorderStats(polledReorder)
+                    onStatsPolled(polledStats, polledReorder)
                 }
                 result
             },
@@ -86,7 +96,7 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
     override fun onDestroy() {
         runBlocking {
             withTimeoutOrNull(2000) {
-                executor.call { cleanup() }
+                executor.call { cleanup("service destroyed") }
             }
         }
         scope.cancel()
@@ -97,7 +107,7 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
     override fun onRevoke() {
         runBlocking {
             withTimeoutOrNull(2000) {
-                executor.call { cleanup() }
+                executor.call { cleanup("system revoked the VPN") }
             }
         }
         scope.cancel()
@@ -135,22 +145,54 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
                 scope.launch(Dispatchers.IO) { pm.handleEvent(event) }
             }
 
+            // A path can die without its network going anywhere, and Android
+            // only reports the latter. Nothing else will ever notice, so this
+            // has to be a poll rather than an event. See
+            // PathManager.rebuildDeadPaths.
+            scope.launch(Dispatchers.IO) {
+                while (true) {
+                    delay(REAP_INTERVAL_MS)
+                    if (tunnel == null) break
+                    try {
+                        pm.rebuildDeadPaths()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "path rebuild failed", e)
+                    }
+                }
+            }
+
             emitState(MqvpnState.Connecting)
         }
     }
 
     /**
-     * Stop VPN tunnel. Called by [MqvpnManager.disconnect].
+     * Stop VPN tunnel. Called by [MqvpnManager.disconnect], and by service
+     * subclasses that tear the tunnel down on their own — a notification
+     * Disconnect action, or parking on a trusted Wi-Fi. `internal` would
+     * cover the manager but not those subclasses, which live in the app
+     * module, so this stays public.
      * Do NOT call from onDestroy — cleanup runs automatically.
      */
-    internal fun stopTunnel() {
-        executor.enqueue { cleanup() }
+    fun stopTunnel(reason: String = "unspecified") {
+        executor.enqueue { cleanup(reason) }
     }
+
+    /**
+     * Called just before the tunnel is torn down, naming what asked for it.
+     *
+     * Disconnected can only be emitted from [cleanup], so it always means
+     * somebody explicitly stopped the tunnel — but a field trace showed three
+     * of them with no caller identified anywhere, which made it impossible to
+     * tell a deliberate teardown from a stray one. Every call site now says
+     * who it is.
+     */
+    open fun onTunnelStopping(reason: String) {}
 
     // --- Internal cleanup (idempotent) ---
 
-    private fun cleanup() {
+    private fun cleanup(reason: String = "unspecified") {
         if (tunnel == null) return // already cleaned up
+        onTunnelStopping(reason)
         networkMonitor?.stop()
         tunnelBridge?.stop()
         udpReaderPool?.stopAll()
@@ -243,9 +285,19 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
      * Emit state to both Manager (StateFlow → UI) and app callback.
      */
     private fun emitState(newState: MqvpnState) {
+        lastState = newState
         manager?.updateState(newState)
         onVpnStateChanged(newState)
     }
+
+    /**
+     * Last state this service emitted. A manager binding to an already-running
+     * service (started at boot or from the QS tile) reads it to adopt the live
+     * state instead of showing Disconnected.
+     */
+    @Volatile
+    var lastState: MqvpnState = MqvpnState.Disconnected
+        private set
 
     // --- Abstract methods (app implements) ---
 
@@ -268,6 +320,16 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
     open fun onLog(level: Int, message: String) {}
     open fun onReconnectScheduled(delaySec: Int) {}
 
+    /** Per-tick snapshot of live paths — subclasses may surface throughput. */
+    open fun onPathsPolled(paths: List<PathInfo>) {}
+
+    /**
+     * Per-tick tunnel-wide counters. Separate from [onPathsPolled] because
+     * datagram loss and reorder behaviour are properties of the connection,
+     * not of any one path, and diagnosing a flaky link needs both.
+     */
+    open fun onStatsPolled(stats: VpnStats, reorder: ReorderStats) {}
+
     // --- Helpers ---
 
     private fun formatIp4(bytes: ByteArray): String =
@@ -278,5 +340,12 @@ abstract class MqvpnVpnService : VpnService(), TunnelCallbacks {
 
     companion object {
         private const val TAG = "MqvpnVpnService"
+
+        /**
+         * How often to look for paths that died over a network that is still
+         * there. Cheap — one getPaths() against an in-memory map — and the
+         * failure it catches otherwise lasts until the user reconnects by hand.
+         */
+        private const val REAP_INTERVAL_MS = 5_000L
     }
 }

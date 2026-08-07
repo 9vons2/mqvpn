@@ -10,6 +10,7 @@
 
 #include "libmqvpn.h"
 #include "mqvpn_scheduler.h"
+#include "mqvpn_sched_names.h"
 
 #include <string.h>
 
@@ -22,6 +23,19 @@
 void
 mqvpn_apply_scheduler(xqc_conn_settings_t *cs, mqvpn_scheduler_t sched)
 {
+    /* Invalid/out-of-range values (e.g. a direct API caller bypassing
+     * mqvpn_config_set_scheduler()'s validation) fall back to MINRTT,
+     * matching the old `default:` case below. Handled up front so the
+     * switch itself can drop `default:` and get compile-time coverage:
+     * with -Werror -Wswitch (see AGENTS.md build gate), a new
+     * mqvpn_scheduler_t enumerator added to libmqvpn.h without a
+     * corresponding case here becomes a build failure instead of a
+     * silently-missed dispatch. */
+    if (!mqvpn_sched_is_valid(sched)) {
+        cs->scheduler_callback = xqc_minrtt_scheduler_cb;
+        return;
+    }
+
     switch (sched) {
     case MQVPN_SCHED_WLB:
     case MQVPN_SCHED_WLB_UDP_PIN: cs->scheduler_callback = xqc_wlb_scheduler_cb; break;
@@ -46,8 +60,56 @@ mqvpn_apply_scheduler(xqc_conn_settings_t *cs, mqvpn_scheduler_t sched)
         cs->scheduler_callback = xqc_minrtt_scheduler_cb;
 #endif
         break;
-    case MQVPN_SCHED_MINRTT:
-    default: cs->scheduler_callback = xqc_minrtt_scheduler_cb; break;
+    case MQVPN_SCHED_MINRTT: cs->scheduler_callback = xqc_minrtt_scheduler_cb; break;
+    }
+}
+
+/* Wires the stock xquic reinjection ctls. Never touches scheduler_callback:
+ * Scheduler and Reinjection are orthogonal axes (see the design doc; the
+ * xquic datagram_redundancy switch is NOT used precisely because it would
+ * override the scheduler). */
+static void
+mqvpn_apply_reinjection(const mqvpn_conn_settings_input_t *in, xqc_conn_settings_t *cs)
+{
+    /* Invalid/out-of-range values fall back to OFF (same treatment as
+     * mqvpn_apply_scheduler above). */
+    mqvpn_reinjection_t mode = in->reinjection;
+    if (!mqvpn_reinj_is_valid(mode)) mode = MQVPN_REINJ_OFF;
+
+    switch (mode) {
+    case MQVPN_REINJ_OFF: break;
+    case MQVPN_REINJ_IDLE:
+        cs->reinj_ctl_callback = xqc_default_reinj_ctl_cb;
+        cs->mp_enable_reinjection = XQC_REINJ_UNACK_AFTER_SCHED;
+        break;
+    case MQVPN_REINJ_DEADLINE:
+        cs->reinj_ctl_callback = xqc_deadline_reinj_ctl_cb;
+        /* AFTER_SEND set explicitly rather than relying on xquic's
+         * BEFORE_SCHED auto-add (xqc_conn.c) so the intent is visible here. */
+        cs->mp_enable_reinjection =
+            XQC_REINJ_UNACK_BEFORE_SCHED | XQC_REINJ_UNACK_AFTER_SEND;
+        cs->reinj_flexible_deadline_srtt_factor =
+            (in->reinj_srtt_factor_pct > 0 ? in->reinj_srtt_factor_pct : 110) / 100.0;
+        cs->reinj_hard_deadline =
+            (uint64_t)(in->reinj_hard_deadline_ms > 0 ? in->reinj_hard_deadline_ms
+                                                      : 500) *
+            1000;
+        cs->reinj_deadline_lower_bound =
+            (uint64_t)(in->reinj_deadline_lower_bound_ms > 0
+                           ? in->reinj_deadline_lower_bound_ms
+                           : 20) *
+            1000;
+        /* xquic computes max(min(factor*min_srtt, hard), lower) — an
+         * unclamped lower > hard would silently dominate the max() and
+         * defeat the documented "hard is the upper clamp" semantics. */
+        if (cs->reinj_deadline_lower_bound > cs->reinj_hard_deadline) {
+            cs->reinj_deadline_lower_bound = cs->reinj_hard_deadline;
+        }
+        break;
+    case MQVPN_REINJ_DGRAM:
+        cs->reinj_ctl_callback = xqc_dgram_reinj_ctl_cb;
+        cs->mp_enable_reinjection = XQC_REINJ_UNACK_AFTER_SEND;
+        break;
     }
 }
 
@@ -66,15 +128,30 @@ mqvpn_build_conn_settings(const mqvpn_conn_settings_input_t *in, xqc_conn_settin
     out->idle_time_out = 120000;
     out->init_idle_time_out = 10000;
 
-    /* --- congestion control --- */
-    switch (in->cc) {
+    /* --- congestion control ---
+     * Invalid/out-of-range values fall back to BBR2, matching the old
+     * `default:` case. Normalized up front so the switch can drop
+     * `default:` and get -Wswitch coverage (same treatment as
+     * mqvpn_apply_scheduler above). */
+    mqvpn_cc_t cc = in->cc;
+    if (!mqvpn_cc_is_valid(cc)) cc = MQVPN_CC_BBR2;
+#ifndef XQC_ENABLE_UNLIMITED
+    /* Built without UNLIMITED — NONE degrades to BBR2, as the old
+     * default: case did (main.c's CLI gate rejects "none" up front; this
+     * only protects direct API callers). */
+    if (cc == MQVPN_CC_NONE) cc = MQVPN_CC_BBR2;
+#endif
+    switch (cc) {
     case MQVPN_CC_BBR: out->cong_ctrl_callback = xqc_bbr_cb; break;
     case MQVPN_CC_CUBIC: out->cong_ctrl_callback = xqc_cubic_cb; break;
+    case MQVPN_CC_NONE:
 #ifdef XQC_ENABLE_UNLIMITED
-    case MQVPN_CC_NONE: out->cong_ctrl_callback = xqc_unlimited_cc_cb; break;
+        out->cong_ctrl_callback = xqc_unlimited_cc_cb;
 #endif
+        /* unreachable when UNLIMITED is off (normalized above); the case
+         * label stays so -Wswitch coverage holds in both build configs. */
+        break;
     case MQVPN_CC_BBR2:
-    default:
         out->cong_ctrl_callback = xqc_bbr2_cb;
         out->cc_params.cc_optimization_flags =
             XQC_BBR2_FLAG_RTTVAR_COMPENSATION | XQC_BBR2_FLAG_FAST_CONVERGENCE;
@@ -99,10 +176,17 @@ mqvpn_build_conn_settings(const mqvpn_conn_settings_input_t *in, xqc_conn_settin
         out->enable_multipath = in->enable_multipath ? 1 : 0;
         out->mp_ping_on = in->enable_multipath ? 1 : 0;
         out->ping_on = 1;
+
+        if (in->recv_rate_bytes_per_sec) {
+            out->recv_rate_bytes_per_sec = in->recv_rate_bytes_per_sec;
+        }
     }
 
     /* --- scheduler / FEC params --- */
     mqvpn_apply_scheduler(out, in->scheduler);
+
+    /* --- reinjection --- */
+    mqvpn_apply_reinjection(in, out);
 
     /* --- init_max_path_id: 0 = keep xquic default (XQC_DEFAULT_INIT_MAX_PATH_ID=8) ---
      */

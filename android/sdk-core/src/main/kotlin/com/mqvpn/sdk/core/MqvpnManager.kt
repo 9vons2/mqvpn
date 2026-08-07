@@ -13,6 +13,7 @@ import android.util.Log
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import com.mqvpn.sdk.core.model.MqvpnState
 import com.mqvpn.sdk.core.model.PathInfo
+import com.mqvpn.sdk.core.model.ReorderStats
 import com.mqvpn.sdk.core.model.VpnStats
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -34,6 +35,9 @@ class MqvpnManager(private val context: Context) {
 
     private val _paths = MutableStateFlow<List<PathInfo>>(emptyList())
     val paths: StateFlow<List<PathInfo>> = _paths.asStateFlow()
+
+    private val _reorderStats = MutableStateFlow(ReorderStats())
+    val reorderStats: StateFlow<ReorderStats> = _reorderStats.asStateFlow()
 
     private var boundService: MqvpnVpnService? = null
     private var serviceConnection: ServiceConnection? = null
@@ -70,8 +74,7 @@ class MqvpnManager(private val context: Context) {
                 boundService?.manager = null
                 boundService = null
                 _vpnState.value = MqvpnState.Disconnected
-                _stats.value = VpnStats()
-                _paths.value = emptyList()
+                resetMetrics()
             }
         }
         serviceConnection = conn
@@ -82,9 +85,43 @@ class MqvpnManager(private val context: Context) {
         }
     }
 
+    /**
+     * Bind to a service that is already running — started at boot or from the
+     * Quick Settings tile — so the UI adopts the live tunnel state instead of
+     * showing Disconnected. No-op when a binding already exists, and the
+     * binding is deliberately not BIND_AUTO_CREATE: this must observe an
+     * existing service, never spawn one.
+     */
+    fun attachIfRunning(serviceClass: Class<out MqvpnVpnService>) {
+        if (serviceConnection != null) return
+
+        val conn = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                val binder = service as? MqvpnVpnService.LocalBinder ?: return
+                val svc = binder.getService()
+                boundService = svc
+                svc.manager = this@MqvpnManager
+                _vpnState.value = svc.lastState
+            }
+
+            override fun onServiceDisconnected(name: ComponentName?) {
+                boundService?.manager = null
+                boundService = null
+                _vpnState.value = MqvpnState.Disconnected
+                resetMetrics()
+            }
+        }
+        serviceConnection = conn
+        try {
+            context.bindService(Intent(context, serviceClass), conn, 0)
+        } catch (e: Exception) {
+            Log.w(TAG, "attachIfRunning bindService failed: ${e.message}")
+        }
+    }
+
     /** Disconnect the VPN. */
     fun disconnect() {
-        boundService?.stopTunnel()
+        boundService?.stopTunnel("MqvpnManager.disconnect")
         _vpnState.value = MqvpnState.Disconnected
     }
 
@@ -107,6 +144,16 @@ class MqvpnManager(private val context: Context) {
     /** Update paths (called from VpnService). */
     internal fun updatePaths(p: List<PathInfo>) {
         _paths.value = p
+    }
+
+    /** Update reorder stats (called from VpnService). */
+    internal fun updateReorderStats(s: ReorderStats) { _reorderStats.value = s }
+
+    /** Reset all metric flows to zero (called on service disconnect). */
+    internal fun resetMetrics() {
+        _stats.value = VpnStats()
+        _paths.value = emptyList()
+        _reorderStats.value = ReorderStats()
     }
 
     fun destroy() {

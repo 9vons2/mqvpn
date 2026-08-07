@@ -616,7 +616,9 @@ path_on_platform_drop(mqvpn_client_t *c, path_entry_t *p, const path_event_ctx_t
     p->platform_attached = 0;
     p->recreate_after_us = 0;
     p->path_stable_since_us = 0;
-    /* xquic close not called — §5.0 contract for PLATFORM_DROP */
+    /* FSM stays xquic-API-free; the PATH_ABANDON for CID/path_id reuse is
+     * emitted by the caller (mqvpn_client_on_platform_path_dropped) before
+     * this event, not here — see Spec §5.0. */
     set_path_state_with_log(c, p, PATH_LC_CLOSED_DROPPED, PATH_REASON_PLATFORM_DROPPED);
 }
 
@@ -710,8 +712,8 @@ path_fsm_tick_confirm_stable(mqvpn_client_t *c, path_entry_t *p, uint64_t now)
         now - p->path_stable_since_us < PATH_STABLE_THRESHOLD_US)
         return;
 
-    client_log(c, MQVPN_LOG_INFO, "path %s: stable for 30s, resetting retry budget",
-               p->name);
+    client_log(c, MQVPN_LOG_INFO, "path %s: stable for %llus, resetting retry budget",
+               p->name, (unsigned long long)(PATH_STABLE_THRESHOLD_US / 1000000));
     p->recreate_retries = 0;
     p->path_stable_since_us = now; /* sec 6.3 re-arm: next 30s window starts now */
 }

@@ -171,6 +171,140 @@ test_propagation_init_max_path_id(void)
     return 0;
 }
 
+/* The server forces multipath ON unconditionally — mqvpn's client is the active
+ * path creator, so the server allows MP regardless of its input flag
+ * (src/mqvpn_conn_settings.c:88-95). test_asymmetry_server_vs_client only feeds
+ * the server enable_multipath=true; this pins the "ignore the input flag" half,
+ * so a regression that made the server honour in->enable_multipath (silently
+ * disabling server-side multipath when a caller passes false) fails here. */
+static int
+test_server_forces_multipath_regardless_of_input(void)
+{
+    xqc_conn_settings_t cs;
+    mqvpn_conn_settings_input_t in = {
+        .is_server = true,
+        .enable_multipath = false, /* client-style "off" — the server must ignore it */
+        .scheduler = MQVPN_SCHED_WLB,
+        .init_max_path_id = 0,
+    };
+
+    mqvpn_build_conn_settings(&in, &cs);
+
+    ASSERT_EQ(cs.enable_multipath, 1);
+    ASSERT_EQ(cs.mp_ping_on, 1);
+    ASSERT_EQ(cs.max_path_id_grant_max_value, 128);
+    ASSERT_EQ(cs.ping_on, 0); /* server never takes the client keep-alive role */
+    return 0;
+}
+
+static int
+test_recv_rate_limit_wiring(void)
+{
+    xqc_conn_settings_t cli, srv;
+    mqvpn_conn_settings_input_t c = {
+        .is_server = false,
+        .enable_multipath = true,
+        .scheduler = MQVPN_SCHED_WLB,
+        .recv_rate_bytes_per_sec = 125000000ULL,
+    };
+    mqvpn_build_conn_settings(&c, &cli);
+    ASSERT_EQ(cli.recv_rate_bytes_per_sec, 125000000ULL);
+
+    /* server MUST stay 0 even if a caller passes a value: a server-side
+     * conn-level cap throttles every client's uplink. */
+    mqvpn_conn_settings_input_t s = {
+        .is_server = true,
+        .enable_multipath = true,
+        .scheduler = MQVPN_SCHED_WLB,
+        .recv_rate_bytes_per_sec = 125000000ULL,
+    };
+    mqvpn_build_conn_settings(&s, &srv);
+    ASSERT_EQ(srv.recv_rate_bytes_per_sec, 0);
+    return 0;
+}
+
+static int
+test_reinjection_mapping(void)
+{
+    xqc_conn_settings_t cs;
+    mqvpn_conn_settings_input_t in = {
+        .is_server = false,
+        .enable_multipath = true,
+        .scheduler = MQVPN_SCHED_WLB,
+        .reinjection = MQVPN_REINJ_OFF,
+    };
+
+    /* off: no reinjection bits, ctl slot untouched (zeroed) */
+    mqvpn_build_conn_settings(&in, &cs);
+    ASSERT_EQ(cs.mp_enable_reinjection, 0);
+    ASSERT_PTR_EQ(cs.reinj_ctl_callback.xqc_reinj_ctl_can_reinject, NULL);
+
+    /* idle */
+    in.reinjection = MQVPN_REINJ_IDLE;
+    mqvpn_build_conn_settings(&in, &cs);
+    ASSERT_EQ(cs.mp_enable_reinjection, XQC_REINJ_UNACK_AFTER_SCHED);
+    ASSERT_PTR_EQ(cs.reinj_ctl_callback.xqc_reinj_ctl_can_reinject,
+                  xqc_default_reinj_ctl_cb.xqc_reinj_ctl_can_reinject);
+
+    /* deadline: explicit BEFORE_SCHED|AFTER_SEND + unit conversions */
+    in.reinjection = MQVPN_REINJ_DEADLINE;
+    in.reinj_srtt_factor_pct = 150;
+    in.reinj_hard_deadline_ms = 300;
+    in.reinj_deadline_lower_bound_ms = 10;
+    mqvpn_build_conn_settings(&in, &cs);
+    ASSERT_EQ(cs.mp_enable_reinjection,
+              XQC_REINJ_UNACK_BEFORE_SCHED | XQC_REINJ_UNACK_AFTER_SEND);
+    ASSERT_PTR_EQ(cs.reinj_ctl_callback.xqc_reinj_ctl_can_reinject,
+                  xqc_deadline_reinj_ctl_cb.xqc_reinj_ctl_can_reinject);
+    if (cs.reinj_flexible_deadline_srtt_factor < 1.49 ||
+        cs.reinj_flexible_deadline_srtt_factor > 1.51)
+        FAIL("factor conversion wrong: %f", cs.reinj_flexible_deadline_srtt_factor);
+    ASSERT_EQ(cs.reinj_hard_deadline, 300000);       /* ms -> us */
+    ASSERT_EQ(cs.reinj_deadline_lower_bound, 10000); /* ms -> us */
+
+    /* deadline with zero params -> engine defaults 110/500/20 */
+    in.reinj_srtt_factor_pct = 0;
+    in.reinj_hard_deadline_ms = 0;
+    in.reinj_deadline_lower_bound_ms = 0;
+    mqvpn_build_conn_settings(&in, &cs);
+    if (cs.reinj_flexible_deadline_srtt_factor < 1.09 ||
+        cs.reinj_flexible_deadline_srtt_factor > 1.11)
+        FAIL("default factor wrong: %f", cs.reinj_flexible_deadline_srtt_factor);
+    ASSERT_EQ(cs.reinj_hard_deadline, 500000);
+    ASSERT_EQ(cs.reinj_deadline_lower_bound, 20000);
+
+    /* negative input pins the `> 0` guard direction: a negative value must
+     * NOT be treated as "explicitly set" and must fall back to the engine
+     * default, same as 0. */
+    in.reinj_hard_deadline_ms = -1;
+    mqvpn_build_conn_settings(&in, &cs);
+    ASSERT_EQ(cs.reinj_hard_deadline, 500000);
+
+    /* lower > hard clamps down to hard; rationale on mqvpn_apply_reinjection */
+    in.reinj_hard_deadline_ms = 100;
+    in.reinj_deadline_lower_bound_ms = 200;
+    mqvpn_build_conn_settings(&in, &cs);
+    ASSERT_EQ(cs.reinj_hard_deadline, 100000);
+    ASSERT_EQ(cs.reinj_deadline_lower_bound, 100000);
+
+    /* dgram: AFTER_SEND only; scheduler_callback must NOT be overridden */
+    in.reinjection = MQVPN_REINJ_DGRAM;
+    mqvpn_build_conn_settings(&in, &cs);
+    ASSERT_EQ(cs.mp_enable_reinjection, XQC_REINJ_UNACK_AFTER_SEND);
+    ASSERT_PTR_EQ(cs.reinj_ctl_callback.xqc_reinj_ctl_can_reinject,
+                  xqc_dgram_reinj_ctl_cb.xqc_reinj_ctl_can_reinject);
+    ASSERT_PTR_EQ(cs.scheduler_callback.xqc_scheduler_get_path,
+                  xqc_wlb_scheduler_cb.xqc_scheduler_get_path); /* WLB survives */
+
+    /* invalid enum value -> off */
+    in.reinjection = (mqvpn_reinjection_t)99;
+    mqvpn_build_conn_settings(&in, &cs);
+    ASSERT_EQ(cs.mp_enable_reinjection, 0);
+    ASSERT_PTR_EQ(cs.reinj_ctl_callback.xqc_reinj_ctl_can_reinject, NULL);
+
+    return 0;
+}
+
 int
 main(void)
 {
@@ -179,6 +313,9 @@ main(void)
     failed += test_propagation_scheduler();
     failed += test_propagation_cc();
     failed += test_propagation_init_max_path_id();
+    failed += test_server_forces_multipath_regardless_of_input();
+    failed += test_recv_rate_limit_wiring();
+    failed += test_reinjection_mapping();
     if (failed) {
         fprintf(stderr, "test_conn_settings: %d FAILED\n", failed);
         return 1;

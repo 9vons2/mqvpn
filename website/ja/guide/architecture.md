@@ -7,30 +7,32 @@ mqvpn は **[sans-I/O](https://sans-io.readthedocs.io/) C ライブラリ**（`l
 ライブラリはプラットフォーム固有のイベントループやデバイス管理を内包せず、`tick()` と入力注入 API で駆動されます。受信した UDP データや TUN パケットは `on_socket_recv()` / `on_tun_packet()` で注入され、送信は xquic の送信コールバック経由で UDP ソケットに書き込まれます（CLI は fd-only モード）。
 
 ```
-┌──────────────────────────────────────────────┐
-│  Platform Layer (owns I/O)                   │
-│  ┌──────────┐ ┌───────────┐ ┌───────────┐    │
-│  │ Linux CLI│ │ Android   │ │ Windows   │    │
-│  │(libevent)│ │ (Handler) │ │ (IOCP)    │    │
-│  └────┬─────┘ └─────┬─────┘ └─────┬─────┘    │
-│       │ tick()      │ tick()      │ tick()   │
-├───────┴─────────────┴─────────────┴──────────┤
-│  libmqvpn (core engine — no I/O)             │
-│  ┌────────────────────────────────────────┐  │
-│  │ mqvpn_client.c / mqvpn_server.c        │  │
-│  │ mqvpn_config.c / auth.c                │  │
-│  │ path_mgr.c / flow_sched.c / addr_pool  │  │
-│  └────────────────────────────────────────┘  │
-│       │ xquic callbacks                      │
-├───────┴──────────────────────────────────────┤
-│  xquic (QUIC / HTTP/3 / MASQUE engine)       │
-│  BoringSSL (TLS 1.3)                         │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Platform Layer (owns I/O)                                       │
+│ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ │
+│ │Linux CLI │ │macOS CLI │ │ Android  │ │ iOS (NE) │ │ Windows  │ │
+│ │(libevent)│ │(libevent)│ │(Handler) │ │(RunLoop) │ │ (IOCP)   │ │
+│ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ │
+│      │ tick()     │ tick()     │ tick()     │ tick()     │ tick()│
+├──────┴────────────┴────────────┴────────────┴────────────┴───────┤
+│  libmqvpn (core engine — event-loop agnostic)                    │
+│  ┌────────────────────────────────────────────┐                  │
+│  │ mqvpn_client.c / mqvpn_server.c            │                  │
+│  │ mqvpn_config.c / auth.c                    │                  │
+│  │ path_mgr.c / flow_sched.c / addr_pool.c    │                  │
+│  └────────────────────────────────────────────┘                  │
+│       │ xquic callbacks                                          │
+├───────┴──────────────────────────────────────────────────────────┤
+│  xquic (QUIC / HTTP/3 / MASQUE engine)                           │
+│  BoringSSL (TLS 1.3)                                             │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### なぜ Sans-I/O か？
+Apple プラットフォームでは 2 つのエントリポイントが異なる構成を取ります: macOS CLI は Darwin プラットフォーム層（`src/platform/darwin/`、libevent イベントループ + `utun` デバイス）を使う一方、iOS Network Extension は sans-I/O コアを Swift で直接ラップします — RunLoop タイマー駆動の専用 tick スレッドで、パケットは `NEPacketTunnelFlow` 経由でやり取りします（libevent も独自の `utun` 操作も使いません）。
 
-- **移植性** — 各プラットフォームが独自のイベントループ（Linux では libevent、Windows では IOCP、Android では Handler — 将来的には GCD や kqueue なども）を提供します。ライブラリはスレッドモデルを強制しません。
+### Sans-I/Oである理由
+
+- **移植性** — 各プラットフォームが独自のイベントループ（Linux / macOS では libevent、Windows では IOCP、Android では Handler 駆動ループ、iOS では Network Extension 内の専用 RunLoop スレッド）を提供します。ライブラリはスレッドモデルを強制しません。
 - **テスト容易性** — `tick()` 関数が状態遷移を同期的に駆動するため、ユニットテストがタイミング問題なく決定的に実行できます。
 - **省電力** — プラットフォームが CPU のウェイクアップタイミングを制御します。ライブラリは `interest.is_idle` でアイドル状態を報告します。
 - **依存の分離** — ライブラリ自体はイベントループ実装を持たず、プラットフォーム層が libevent や OS 依存ライブラリ（Linux では pthread など）を扱います。
@@ -112,5 +114,3 @@ mqvpn を新しいプラットフォームに移植するには、以下を実�
 3. **TUN デバイス** — プラットフォーム固有の TUN を作成、`tun_output` コールバックからのパケットを書き込み、読み取ったパケットを `on_tun_packet()` に渡す
 4. **ルーティング** — TUN デバイス経由でトラフィックを誘導するルートを設定
 5. **DNS** — DNS リークを防止する DNS 設定
-
-リファレンス実装として `src/platform/linux/platform_linux.c` を参照してください。

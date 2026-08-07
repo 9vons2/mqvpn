@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqvpn contributors
 # bench_env_setup.sh — Netns environment setup for mqvpn benchmarks
 #
 # Source this file from other benchmark scripts:
@@ -52,6 +54,45 @@ _BENCH_SERVER_PID=""
 _BENCH_CLIENT_PID=""
 _BENCH_WORK_DIR=""
 _BENCH_PSK=""
+
+# ─── Shared netem profile table (BENCH_ENV_NETEM) ────────────────────────────
+# Used by sweep_reorder.sh and sweep_single_path.sh. Each value is
+# "<pathA netem>|<pathB netem>" (split on '|' for bench_apply_netem).
+#
+# Sourcing this once from a shared file is load-bearing: the 3-way comparison
+# in sweep_reorder_analyze.py joins the perf-sweep CSV, the OFF-baseline CSV
+# and the single-path CSV purely on env_name. Silent drift (raise jit_20
+# jitter in one sweep but not the other) would produce a meaningless
+# comparison with no error surface. Keep this table the single source of
+# truth; the analyzer's RTT_SPREAD_MS map mirrors the delays here.
+#
+# netem syntax notes:
+# - Jitter is the 2nd TIME arg to `delay` (`delay TIME JITTER`); netem has no
+#   literal `jitter` keyword (writing it crashes tc).
+# - Every jittered entry pins `distribution normal`: netem's implicit default
+#   is a bounded-uniform delay whose hard ±JITTER cutoff would bias the
+#   sweep's p99 (and the MaxWaitMs it picks) low; normal gives the heavier,
+#   more realistic tail. Random per-packet delay also induces the reordering
+#   that arms the reorder engine. (Requires /usr/lib*/tc/normal.dist, shipped
+#   with iproute2.)
+declare -gA BENCH_ENV_NETEM=(
+  [baseline]="delay 20ms rate 50mbit|delay 20ms rate 50mbit"
+  [rtt_40]="delay 20ms rate 50mbit|delay 40ms rate 50mbit"
+  [rtt_70]="delay 20ms rate 50mbit|delay 70ms rate 50mbit"
+  [rtt_120]="delay 20ms rate 50mbit|delay 120ms rate 50mbit"
+  [rtt_320]="delay 20ms rate 50mbit|delay 320ms rate 50mbit"
+  [jit_5]="delay 20ms 5ms distribution normal rate 50mbit|delay 20ms 5ms distribution normal rate 50mbit"
+  [jit_20]="delay 20ms 20ms distribution normal rate 50mbit|delay 20ms 20ms distribution normal rate 50mbit"
+  [loss_05]="delay 20ms loss 0.5% rate 50mbit|delay 20ms loss 0.5% rate 50mbit"
+  [loss_2]="delay 20ms loss 2% rate 50mbit|delay 20ms loss 2% rate 50mbit"
+  [bw_4to1]="delay 20ms rate 50mbit|delay 20ms rate 12mbit"
+  [bw_10to1]="delay 20ms rate 100mbit|delay 20ms rate 10mbit"
+  [dual_lte]="delay 30ms 5ms distribution normal loss 0.5% rate 40mbit|delay 45ms 8ms distribution normal loss 0.5% rate 25mbit"
+  [fiber_lte]="delay 8ms rate 300mbit|delay 40ms 8ms distribution normal loss 0.5% rate 30mbit"
+  [lte_starlink]="delay 35ms 8ms distribution normal rate 40mbit|delay 50ms 25ms distribution normal loss 1% rate 100mbit"
+  [lte_geo]="delay 35ms rate 40mbit|delay 320ms 20ms distribution normal loss 0.5% rate 20mbit"
+  [congested]="delay 50ms 20ms distribution normal loss 2% rate 20mbit|delay 60ms 25ms distribution normal loss 2% rate 15mbit"
+)
 
 # Lightweight dep check for e2e tests (deps differ from bench_check_deps which
 # requires iperf3/openssl). Verifies binaries listed in $@ exist; if "nc" is
@@ -224,10 +265,10 @@ bench_apply_netem() {
     ip netns exec "$NS_SERVER" tc qdisc del dev "$VETH_B1" root 2>/dev/null || true
 
     # Apply on both ends for realistic behavior
-    ip netns exec "$NS_CLIENT" tc qdisc add dev "$VETH_A0" root netem ${netem_a}
-    ip netns exec "$NS_SERVER" tc qdisc add dev "$VETH_A1" root netem ${netem_a}
-    ip netns exec "$NS_CLIENT" tc qdisc add dev "$VETH_B0" root netem ${netem_b}
-    ip netns exec "$NS_SERVER" tc qdisc add dev "$VETH_B1" root netem ${netem_b}
+    ip netns exec "$NS_CLIENT" tc qdisc add dev "$VETH_A0" root netem ${netem_a} || return 1
+    ip netns exec "$NS_SERVER" tc qdisc add dev "$VETH_A1" root netem ${netem_a} || return 1
+    ip netns exec "$NS_CLIENT" tc qdisc add dev "$VETH_B0" root netem ${netem_b} || return 1
+    ip netns exec "$NS_SERVER" tc qdisc add dev "$VETH_B1" root netem ${netem_b} || return 1
 
     echo "OK: tc netem applied"
 }
@@ -333,6 +374,10 @@ bench_stop_vpn() {
         _BENCH_SERVER_PID=""
         sleep 1
     fi
+    if [ -n "${_BENCH_WORK_DIR:-}" ] && [ -d "$_BENCH_WORK_DIR" ]; then
+        rm -rf "$_BENCH_WORK_DIR"
+        _BENCH_WORK_DIR=""
+    fi
 }
 
 bench_cleanup() {
@@ -365,6 +410,12 @@ bench_cleanup() {
     ip netns del "$NS_SERVER" 2>/dev/null || true
     ip netns del "$NS_CLIENT" 2>/dev/null || true
 
-    # Remove temp dir
-    [ -n "$_BENCH_WORK_DIR" ] && rm -rf "$_BENCH_WORK_DIR"
+    # Remove temp dir. Keep the if-form: a trailing `[ -n ] && rm` returns 1
+    # when the dir was already reaped by bench_stop_vpn, and that status
+    # aborts the callers' set -e EXIT traps, turning a passing suite into
+    # exit 1.
+    if [ -n "$_BENCH_WORK_DIR" ]; then
+        rm -rf "$_BENCH_WORK_DIR"
+        _BENCH_WORK_DIR=""
+    fi
 }

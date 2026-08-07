@@ -5,7 +5,7 @@
  * libmqvpn — Multipath QUIC VPN library
  *
  * Public API header (single file).
- * Version: 0.7.0 (callback ABI version 2)
+ * Version: 0.15.0 (callback ABI version 2)
  *
  * Thread safety: All functions must be called from a single thread
  * (the "tick thread"). Debug builds assert this via MQVPN_ASSERT_TICK_THREAD.
@@ -38,7 +38,7 @@ extern "C" {
 /* ─── Version ─── */
 
 #define MQVPN_VERSION_MAJOR 0
-#define MQVPN_VERSION_MINOR 7
+#define MQVPN_VERSION_MINOR 15
 #define MQVPN_VERSION_PATCH 0
 
 /* ─── ABI ─── */
@@ -103,6 +103,13 @@ typedef enum {
     MQVPN_SCHED_WLB_UDP_PIN = 3, /* WLB + 5-tuple pin for UDP flows. */
 } mqvpn_scheduler_t;
 
+typedef enum {
+    MQVPN_REINJ_OFF = 0,
+    MQVPN_REINJ_DEADLINE = 1, /* stream lane: lateness + LOW-class duplication */
+    MQVPN_REINJ_IDLE = 2,     /* stream lane: duplicate unacked when send queue idle */
+    MQVPN_REINJ_DGRAM = 3,    /* datagram lane: duplicate every DATAGRAM once */
+} mqvpn_reinjection_t;
+
 /* Flow-aware reorder-only datagram delivery (see reorder design spec).
  * AUTO is deferred to a later phase and will be appended as = 2. */
 typedef enum {
@@ -145,7 +152,7 @@ typedef enum {
  *
  *   PENDING   → add_path_fd() called, awaiting activation
  *   ACTIVE    → xquic path created (validation async)
- *   DEGRADED  → transport failed, library timer retries with backoff (5s→60s, max 6)
+ *   DEGRADED  → transport failed, library timer retries with backoff (1s→15s, max 30)
  *   CLOSED    → retries exhausted (platform can still call reactivate_path if
  * platform_attached==1) OR explicitly removed via remove_path() (platform_attached==0, no
  * recovery)
@@ -210,11 +217,14 @@ typedef enum {
  * Fields:
  *   iface  - interface name (NUL-terminated, may be empty if N/A).
  *            Diagnostic only - library does not parse this.
- *   reason - platform-specific reason code. Currently only
- *            MQVPN_PLATFORM_REASON_RTM_DELLINK is emitted (Linux PR5).
+ *   reason - platform-specific reason code. Linux emits RTM_DELLINK
+ *            (interface gone), CARRIER_LOST (cable unplugged / peer down),
+ *            ADMIN_DOWN (ip link set down) and ADDR_REMOVED (last usable
+ *            source address removed while the link stayed up — nmcli
+ *            disconnect / DHCP lease loss).
  *            Library does not branch on this - log only.
- *            More values added when concrete emitter ships (CARRIER_LOST,
- *            NM_IFDOWN, iOS variants etc) - ABI-additive.
+ *            More values added when concrete emitter ships (iOS variants
+ *            etc) - ABI-additive.
  *
  * Future: `platform_net_id` (Android Network handle) is intentionally NOT
  * included now. Android path management uses existing
@@ -226,10 +236,12 @@ typedef enum {
  * semantic). */
 typedef enum {
     MQVPN_PLATFORM_REASON_UNKNOWN = 0,
-    MQVPN_PLATFORM_REASON_RTM_DELLINK = 1,
-    /* extend ABI-additively when concrete emitter ships:
-     * MQVPN_PLATFORM_REASON_CARRIER_LOST = 2,
-     * MQVPN_PLATFORM_REASON_NM_IFDOWN    = 3, ... */
+    MQVPN_PLATFORM_REASON_RTM_DELLINK = 1,  /* interface removed */
+    MQVPN_PLATFORM_REASON_CARRIER_LOST = 2, /* IFF_UP set, operstate DOWN */
+    MQVPN_PLATFORM_REASON_ADMIN_DOWN = 3,   /* IFF_UP cleared (ip link set down) */
+    MQVPN_PLATFORM_REASON_ADDR_REMOVED = 4, /* no usable source address left
+                                             * (RTM_DELADDR, link stays up) */
+    /* extend ABI-additively when concrete emitter ships (iOS variants etc) */
 } mqvpn_platform_reason_t;
 
 typedef struct {
@@ -260,6 +272,32 @@ typedef struct {
     uint64_t dgram_lost;
     uint64_t dgram_acked;
     int srtt_ms;
+    /* Hybrid-mode per-lane counters (0 unless hybrid classifier active).
+     * tcp/dgram/raw partition every classified packet exactly once. */
+    uint64_t pkts_lane_tcp;   /* packets actually handed to the TCP lane (lwIP) */
+    uint64_t pkts_lane_dgram; /* packets sent via the datagram lane */
+    uint64_t pkts_lane_raw;   /* packets sent via the raw lane, incl. TCP
+                               * candidates that fell back to RAW (sticky-RAW,
+                               * cap-rejected, non-SYN unknown, lane-less build) */
+    /* tcp_flows_active: currently open TCP-lane flows. Client: the TCP-lane
+     * flow table's live count. Server: the whole-server count of open
+     * egress TCP flows (mqvpn_server_get_stats). */
+    uint64_t tcp_flows_active;
+    /* tcp_flows_total: cumulative TCP-lane flows opened (never decrements).
+     * Client: SYNs the flow table admitted. Server: egress flows admitted. */
+    uint64_t tcp_flows_total;
+    /* tcp_flows_rejected: cumulative flows refused by a cap. Client: SYNs
+     * rejected pre-lwIP (flow-table cap or alloc failure). Server: cap-503s
+     * (global fd-budget + per-session tcp_max_flows; ACL 403s / 5xx syscall
+     * failures are not counted). */
+    uint64_t tcp_flows_rejected;
+    /* pkts_lane_tcp_dropped: client-only — TCP-lane packets lwIP refused
+     * (e.g. no matching pcb). Always 0 server-side. */
+    uint64_t pkts_lane_tcp_dropped;
+    /* raw_markers_active: client-only gauge — sticky-RAW markers currently
+     * held in the TCP-lane flow table (5-tuples pinned to RAW under
+     * tcp=auto). Always 0 server-side. */
+    uint64_t raw_markers_active;
 } mqvpn_stats_t;
 
 typedef struct {
@@ -376,7 +414,8 @@ typedef struct {
     mqvpn_mtu_updated_fn mtu_updated;
     mqvpn_log_fn log;
 
-    /* v5: reconnect control */
+    /* Reconnect control — appended under ABI 2 (additive struct_size
+     * growth; older callers with a shorter struct leave this NULL). */
     void (*reconnect_scheduled)(int delay_sec, void *user_ctx);
 } mqvpn_client_callbacks_t;
 
@@ -404,6 +443,21 @@ typedef struct {
                                 void *user_ctx);
     void (*on_client_disconnected)(uint32_t session_id, mqvpn_error_t reason,
                                    void *user_ctx);
+
+    /* Hybrid TCP lane egress fd interest — appended under ABI 2 (additive
+     * struct_size growth; OPTIONAL — NULL disables
+     * tcp_egress; connect-tcp-style requests get 503 if unset). The core
+     * (src/hybrid/tcp_egress.c) owns every egress fd's socket()/connect()/
+     * send()/recv()/close() syscalls directly — same "fd-path mode"
+     * convention the client's UDP path fds already use. These two
+     * callbacks only ask the platform to (un)register interest in an
+     * ALREADY-OPEN fd with its reactor. want_read/want_write may be
+     * updated on an already-registered fd (egress_fd_register is called
+     * again with new flags, not just once at creation) — on Linux this
+     * means replacing the libevent event, not mutating one in place. */
+    void (*egress_fd_register)(int fd, int want_read, int want_write, void *fd_ctx,
+                               void *user_ctx);
+    void (*egress_fd_unregister)(int fd, void *user_ctx);
 } mqvpn_server_callbacks_t;
 
 #define MQVPN_SERVER_CALLBACKS_INIT                      \
@@ -421,6 +475,7 @@ MQVPN_API mqvpn_config_t *mqvpn_config_new(void);
 MQVPN_API void mqvpn_config_free(mqvpn_config_t *cfg);
 
 MQVPN_API int mqvpn_config_set_server(mqvpn_config_t *cfg, const char *host, int port);
+MQVPN_API int mqvpn_config_set_tls_server_name(mqvpn_config_t *cfg, const char *name);
 MQVPN_API int mqvpn_config_set_auth_key(mqvpn_config_t *cfg, const char *key);
 MQVPN_API int mqvpn_config_add_user(mqvpn_config_t *cfg, const char *username,
                                     const char *key);
@@ -429,6 +484,17 @@ MQVPN_API int mqvpn_config_load_json(mqvpn_config_t *cfg, const char *json_text)
 MQVPN_API int mqvpn_config_set_insecure(mqvpn_config_t *cfg, int insecure);
 MQVPN_API int mqvpn_config_set_scheduler(mqvpn_config_t *cfg, mqvpn_scheduler_t sched);
 MQVPN_API int mqvpn_config_set_cc(mqvpn_config_t *cfg, mqvpn_cc_t cc);
+
+/* Reinjection (speculative multipath duplication of unacked data). OFF by
+ * default. The deadline-mode params are validated as a group: srtt_factor_pct
+ * in [100,1000] (percent, e.g. 110 = 1.10x srtt), hard_deadline_ms and
+ * deadline_lower_bound_ms in [1,60000]. Values are only consulted when mode
+ * is MQVPN_REINJ_DEADLINE — see mqvpn_conn_settings.c. */
+MQVPN_API int mqvpn_config_set_reinjection(mqvpn_config_t *cfg, mqvpn_reinjection_t mode);
+MQVPN_API int mqvpn_config_set_reinjection_deadline_params(mqvpn_config_t *cfg,
+                                                           int srtt_factor_pct,
+                                                           int hard_deadline_ms,
+                                                           int deadline_lower_bound_ms);
 MQVPN_API int mqvpn_config_set_log_level(mqvpn_config_t *cfg, mqvpn_log_level_t level);
 MQVPN_API int mqvpn_config_set_multipath(mqvpn_config_t *cfg, int enable);
 MQVPN_API int mqvpn_config_set_reconnect(mqvpn_config_t *cfg, int enable,
@@ -469,6 +535,72 @@ MQVPN_API int mqvpn_config_set_reorder_limits(mqvpn_config_t *cfg, uint32_t max_
 MQVPN_API int mqvpn_config_add_reorder_rule(mqvpn_config_t *cfg, uint8_t proto,
                                             uint16_t port,
                                             mqvpn_reorder_profile_t profile);
+
+/* ─── Hybrid-mode config (H1) ───
+ *
+ * Hybrid mode classifies inner TUN packets into per-lane transports (TCP
+ * stream lane / datagram lane / raw CONNECT-IP lane). Disabled by default.
+ * The TCP mode enum stays internal; the setter takes a plain int:
+ * 0 = stream (always use the TCP stream lane), 1 = raw (never), 2 = auto
+ * (per-flow decision at SYN time, the default). */
+MQVPN_API int mqvpn_config_set_hybrid_enabled(mqvpn_config_t *cfg, int enabled);
+/* mode: 0=stream 1=raw 2=auto. Other values → MQVPN_ERR_INVALID_ARG. */
+MQVPN_API int mqvpn_config_set_hybrid_tcp_mode(mqvpn_config_t *cfg, int mode);
+/* Limits for the future tcp_lane. tcp_max_flows must be > 0 (defaults:
+ * 256 flows, 300 s idle timeout). On the CLIENT the effective cap is
+ * additionally clamped at lane creation to half the lwIP pcb pool of the
+ * build profile (default 512/2 = 256; mobile 128/2 = 64) — above that,
+ * pcb exhaustion would hang new connections before the cap's documented
+ * reject-with-RST behavior could apply. */
+MQVPN_API int mqvpn_config_set_hybrid_limits(mqvpn_config_t *cfg, uint32_t tcp_max_flows,
+                                             uint32_t tcp_idle_timeout_sec);
+/* Server-side egress connect() timeout for the connect-tcp lane, in
+ * seconds (default 10). sec must be > 0. */
+MQVPN_API int mqvpn_config_set_hybrid_connect_timeout(mqvpn_config_t *cfg, uint32_t sec);
+/* Server-wide cap on concurrent egress TCP fds the connect-tcp lane will
+ * ever open (default MQVPN_TCP_MAX_GLOBAL_FLOWS_DEFAULT = 4096), narrowed
+ * further at startup by available rlimit headroom — see
+ * mqvpn_server_egress_fd_budget(). Distinct from
+ * mqvpn_config_set_hybrid_limits()'s tcp_max_flows, which caps concurrent
+ * flows per H3 connection, not server-wide. max_flows must be > 0. */
+MQVPN_API int mqvpn_config_set_hybrid_max_global_flows(mqvpn_config_t *cfg,
+                                                       uint32_t max_flows);
+/* Egress ACL for the connect-tcp lane's destination check (server-side
+ * only; harmless but unused on clients). `allow` punches holes through the
+ * mandatory default-deny (loopback/RFC1918/link-local/CGNAT/multicast/
+ * broadcast/the server's own tunnel subnet); `deny` adds extra blocks
+ * evaluated after the default-deny set. Each entry is a strict "a.b.c.d/n"
+ * IPv4 CIDR string (n = 0..32, no bare-address form). Unlike the INI/JSON
+ * file-config loaders (which skip malformed entries with a warning), this
+ * setter validates the WHOLE call atomically: any malformed entry rejects
+ * the entire call with MQVPN_ERR_INVALID_ARG and leaves cfg unmodified.
+ * n_allow/n_deny may be 0 with allow/deny NULL; either list capped at
+ * MQVPN_EGRESS_ACL_MAX entries (src/hybrid/classifier.h). Caution:
+ * "0.0.0.0/0" in the allow list disables the built-in protections
+ * (loopback/RFC1918/...); enumerate specific ranges instead. */
+MQVPN_API int mqvpn_config_set_hybrid_egress_acl(mqvpn_config_t *cfg, const char **allow,
+                                                 int n_allow, const char **deny,
+                                                 int n_deny);
+
+/* Conn-level receive-rate cap in bytes/sec (0 = library default, no cap).
+ * Bounds the aggregate QUIC transport receive window to rate x srtt.
+ * CLIENT-ONLY: the server connection-settings path ignores it — a
+ * server-side cap would throttle every client's uplink.
+ *
+ * Values above MQVPN_RECV_RATE_LIMIT_MAX are rejected
+ * (MQVPN_ERR_INVALID_ARG): the transport computes the window as
+ * rate x srtt(us) in uint64, so an unbounded rate overflows the product
+ * and pins the window at the MINIMUM — the opposite of the caller's
+ * intent. 10^10 B/s (10 GB/s, 80 Gbit/s) keeps that product in range for
+ * any srtt below ~1800 s while sitting far above any real link rate;
+ * "no cap" is expressed as 0, not a huge value. The srtt precondition is
+ * structural, not probabilistic: an RTT sample needs its packet still
+ * tracked as unacked at ACK time, and both loss detection (a few srtt)
+ * and mqvpn's 120 s idle timeout (mqvpn_conn_settings.c) retire packets
+ * or the connection itself orders of magnitude before 1800 s. */
+#define MQVPN_RECV_RATE_LIMIT_MAX 10000000000ULL
+MQVPN_API int mqvpn_config_set_recv_rate_limit(mqvpn_config_t *cfg,
+                                               uint64_t bytes_per_sec);
 
 /* Clock injection (Android: CLOCK_BOOTTIME, testing: mock clock) */
 typedef uint64_t (*mqvpn_clock_fn)(void *ctx);
@@ -525,10 +657,13 @@ MQVPN_API mqvpn_path_handle_t mqvpn_client_add_path_fd_with_outcome(
 MQVPN_API int mqvpn_client_remove_path(mqvpn_client_t *client, mqvpn_path_handle_t path);
 
 /*
- * Drop a path slot without notifying xquic (no PATH_ABANDON, no draining).
- * Used when the platform detects interface removal (RTM_DELLINK) — the fd is
- * already dead, so xquic will detect the failure naturally via sendto() errors
- * (same as link-down). This frees the slot for re-use by add_path_fd().
+ * Drop a path slot on platform-detected removal (carrier loss, RTM_DELLINK,
+ * address loss). Moves the slot to the CLOSED_DROPPED cleanup state and emits
+ * a non-blocking PATH_ABANDON so xquic releases the dead path's CID/path_id
+ * slot for reuse (draft-21); this does not stall surviving paths. The fd is
+ * assumed already dead: close it and call mqvpn_client_on_platform_fd_closed()
+ * to drive the lazy cleanup to completion (CLOSED_FREE), after which the slot
+ * is reusable by add_path_fd().
  */
 MQVPN_API int mqvpn_client_drop_path(mqvpn_client_t *client, mqvpn_path_handle_t path);
 
@@ -639,6 +774,21 @@ MQVPN_API int mqvpn_server_stop(mqvpn_server_t *server);
 MQVPN_API int mqvpn_server_on_socket_recv(mqvpn_server_t *server, const uint8_t *pkt,
                                           size_t len, const struct sockaddr *peer,
                                           socklen_t peer_len);
+
+/* Platform calls this when a previously-registered egress fd (via
+ * egress_fd_register) becomes readable and/or writable. fd_ctx is the
+ * opaque pointer the core passed to egress_fd_register for that fd. */
+MQVPN_API void mqvpn_server_on_egress_fd_ready(mqvpn_server_t *server, int fd,
+                                               void *fd_ctx, int readable, int writable);
+
+/* Upper bound on concurrent egress TCP fds the server will ever open
+ * (min(rlimit_nofile - reserve, configured cap)). Computed once at
+ * mqvpn_server_new and frozen for the server's lifetime: platforms size
+ * their fd->event registries from this, and the server's own admission cap
+ * uses the same snapshot, so the two bounds cannot drift (a runtime
+ * setrlimit changes neither). Returns 0 on NULL server; a value <= 0 means
+ * "treat tcp_egress as disabled — do not allocate a registry". */
+MQVPN_API int mqvpn_server_egress_fd_budget(mqvpn_server_t *server);
 
 MQVPN_API int mqvpn_server_on_tun_packet(mqvpn_server_t *server, const uint8_t *pkt,
                                          size_t len);

@@ -15,6 +15,9 @@
 
 #include "libmqvpn.h"
 #include "mqvpn_internal.h"
+/* PATH_RECREATE_DELAY_US — the recovery-wake assertions below derive their
+ * expected deadline from it instead of hardcoding the backoff in ms. */
+#include "path_state_machine.h"
 
 /* ── Test infrastructure ── */
 
@@ -154,6 +157,7 @@ TEST(config_load_json)
     const char *json = "{"
                        "\"server_host\":\"vpn.example.com\","
                        "\"server_port\":8443,"
+                       "\"tls_server_name\":\"sni.example.com\","
                        "\"auth_key\":\"legacy-key\","
                        "\"insecure\":true,"
                        "\"multipath\":false,"
@@ -180,6 +184,7 @@ TEST(config_load_json)
     ASSERT_EQ(mqvpn_config_load_json(cfg, json), MQVPN_OK);
     ASSERT_STR_EQ(cfg->server_host, "vpn.example.com");
     ASSERT_EQ(cfg->server_port, 8443);
+    ASSERT_STR_EQ(cfg->tls_server_name, "sni.example.com");
     ASSERT_STR_EQ(cfg->auth_key, "legacy-key");
     ASSERT_EQ(cfg->insecure, 1);
     ASSERT_EQ(cfg->multipath, 0);
@@ -232,6 +237,24 @@ TEST(config_load_json_invalid_users)
     mqvpn_config_free(cfg);
 }
 
+TEST(config_load_json_users_brace_in_string_value)
+{
+    /* A '}' inside a string value must not be mistaken for the object's
+     * closing brace (regression for the naive strchr(p, '}') scan). */
+    const char *json = "{"
+                       "\"users\":[{\"name\":\"a}b\",\"key\":\"k1\"},\"carol:c3\"]"
+                       "}";
+
+    mqvpn_config_t *cfg = mqvpn_config_new();
+    ASSERT_EQ(mqvpn_config_load_json(cfg, json), MQVPN_OK);
+    ASSERT_EQ(cfg->n_users, 2);
+    ASSERT_STR_EQ(cfg->user_names[0], "a}b");
+    ASSERT_STR_EQ(cfg->user_keys[0], "k1");
+    ASSERT_STR_EQ(cfg->user_names[1], "carol");
+    ASSERT_STR_EQ(cfg->user_keys[1], "c3");
+    mqvpn_config_free(cfg);
+}
+
 TEST(config_load_json_invalid_tuning)
 {
     mqvpn_config_t *cfg = mqvpn_config_new();
@@ -239,6 +262,18 @@ TEST(config_load_json_invalid_tuning)
               MQVPN_ERR_INVALID_ARG);
     ASSERT_EQ(mqvpn_config_load_json(cfg, "{\"cc\":\"reno\"}"), MQVPN_ERR_INVALID_ARG);
     ASSERT_EQ(mqvpn_config_load_json(cfg, "{\"mtu\":\"bad\"}"), MQVPN_ERR_INVALID_ARG);
+    mqvpn_config_free(cfg);
+}
+
+TEST(config_set_tls_server_name)
+{
+    mqvpn_config_t *cfg = mqvpn_config_new();
+    ASSERT_EQ(cfg->tls_server_name[0], '\0');
+    ASSERT_EQ(mqvpn_config_set_tls_server_name(cfg, "vpn.example.com"), MQVPN_OK);
+    ASSERT_STR_EQ(cfg->tls_server_name, "vpn.example.com");
+    ASSERT_EQ(mqvpn_config_set_tls_server_name(cfg, NULL), MQVPN_OK);
+    ASSERT_EQ(cfg->tls_server_name[0], '\0');
+    ASSERT_EQ(mqvpn_config_set_tls_server_name(NULL, "x"), MQVPN_ERR_INVALID_ARG);
     mqvpn_config_free(cfg);
 }
 
@@ -297,6 +332,102 @@ TEST(config_set_cc)
     ASSERT_EQ(cfg->cc, MQVPN_CC_NONE);
     ASSERT_EQ(mqvpn_config_set_cc(cfg, (mqvpn_cc_t)99), MQVPN_ERR_INVALID_ARG);
     ASSERT_EQ(mqvpn_config_set_cc(NULL, MQVPN_CC_BBR2), MQVPN_ERR_INVALID_ARG);
+    mqvpn_config_free(cfg);
+}
+
+TEST(config_load_json_reinjection)
+{
+    mqvpn_config_t *cfg = mqvpn_config_new();
+
+    /* absent keys keep the off/0 defaults (0 for the numeric fields means
+     * "engine default" 110/500/20 at conn-settings build time — see
+     * mqvpn_conn_settings.c; the opaque config itself stores 0). */
+    ASSERT_EQ(mqvpn_config_load_json(cfg, "{}"), MQVPN_OK);
+    ASSERT_EQ(cfg->reinjection, MQVPN_REINJ_OFF);
+    ASSERT_EQ(cfg->reinj_srtt_factor_pct, 0);
+    ASSERT_EQ(cfg->reinj_hard_deadline_ms, 0);
+    ASSERT_EQ(cfg->reinj_deadline_lower_bound_ms, 0);
+
+    /* valid values land in the config */
+    const char *json = "{"
+                       "\"reinjection\":\"deadline\","
+                       "\"reinjection_srtt_factor_pct\":150,"
+                       "\"reinjection_hard_deadline_ms\":300,"
+                       "\"reinjection_deadline_lower_bound_ms\":15"
+                       "}";
+    ASSERT_EQ(mqvpn_config_load_json(cfg, json), MQVPN_OK);
+    ASSERT_EQ(cfg->reinjection, MQVPN_REINJ_DEADLINE);
+    ASSERT_EQ(cfg->reinj_srtt_factor_pct, 150);
+    ASSERT_EQ(cfg->reinj_hard_deadline_ms, 300);
+    ASSERT_EQ(cfg->reinj_deadline_lower_bound_ms, 15);
+
+    /* invalid mode string -> hard error (unlike the INI/main.c surface,
+     * which warns and falls back to "off") */
+    ASSERT_EQ(mqvpn_config_load_json(cfg, "{\"reinjection\":\"bogus\"}"),
+              MQVPN_ERR_INVALID_ARG);
+
+    /* out-of-range numeric params -> hard error, both directions each */
+    ASSERT_EQ(mqvpn_config_load_json(cfg, "{\"reinjection_srtt_factor_pct\":99}"),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_load_json(cfg, "{\"reinjection_srtt_factor_pct\":1001}"),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_load_json(cfg, "{\"reinjection_hard_deadline_ms\":0}"),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_load_json(cfg, "{\"reinjection_hard_deadline_ms\":60001}"),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_load_json(cfg, "{\"reinjection_deadline_lower_bound_ms\":0}"),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(
+        mqvpn_config_load_json(cfg, "{\"reinjection_deadline_lower_bound_ms\":60001}"),
+        MQVPN_ERR_INVALID_ARG);
+
+    mqvpn_config_free(cfg);
+}
+
+TEST(config_set_reinjection)
+{
+    mqvpn_config_t *cfg = mqvpn_config_new();
+    ASSERT_EQ(mqvpn_config_set_reinjection(cfg, MQVPN_REINJ_DEADLINE), MQVPN_OK);
+    ASSERT_EQ(cfg->reinjection, MQVPN_REINJ_DEADLINE);
+    ASSERT_EQ(mqvpn_config_set_reinjection(cfg, MQVPN_REINJ_DGRAM), MQVPN_OK);
+    ASSERT_EQ(cfg->reinjection, MQVPN_REINJ_DGRAM);
+    ASSERT_EQ(mqvpn_config_set_reinjection(cfg, MQVPN_REINJ_OFF), MQVPN_OK);
+    ASSERT_EQ(cfg->reinjection, MQVPN_REINJ_OFF);
+    ASSERT_EQ(mqvpn_config_set_reinjection(cfg, (mqvpn_reinjection_t)99),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_set_reinjection(NULL, MQVPN_REINJ_DEADLINE),
+              MQVPN_ERR_INVALID_ARG);
+    mqvpn_config_free(cfg);
+}
+
+TEST(config_set_reinjection_deadline_params)
+{
+    mqvpn_config_t *cfg = mqvpn_config_new();
+    ASSERT_EQ(mqvpn_config_set_reinjection_deadline_params(cfg, 150, 300, 15), MQVPN_OK);
+    ASSERT_EQ(cfg->reinj_srtt_factor_pct, 150);
+    ASSERT_EQ(cfg->reinj_hard_deadline_ms, 300);
+    ASSERT_EQ(cfg->reinj_deadline_lower_bound_ms, 15);
+
+    /* range boundaries, both directions, each parameter independently */
+    ASSERT_EQ(mqvpn_config_set_reinjection_deadline_params(cfg, 99, 300, 15),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_set_reinjection_deadline_params(cfg, 1001, 300, 15),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_set_reinjection_deadline_params(cfg, 150, 0, 15),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_set_reinjection_deadline_params(cfg, 150, 60001, 15),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_set_reinjection_deadline_params(cfg, 150, 300, 0),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_set_reinjection_deadline_params(cfg, 150, 300, 60001),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_set_reinjection_deadline_params(NULL, 150, 300, 15),
+              MQVPN_ERR_INVALID_ARG);
+
+    /* boundary values themselves are valid (inclusive range) */
+    ASSERT_EQ(mqvpn_config_set_reinjection_deadline_params(cfg, 100, 1, 1), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_set_reinjection_deadline_params(cfg, 1000, 60000, 60000),
+              MQVPN_OK);
     mqvpn_config_free(cfg);
 }
 
@@ -395,6 +526,60 @@ TEST(config_set_multipath)
     ASSERT_EQ(cfg->multipath, 1);
     ASSERT_EQ(mqvpn_config_set_multipath(cfg, 0), MQVPN_OK);
     ASSERT_EQ(mqvpn_config_set_multipath(NULL, 1), MQVPN_ERR_INVALID_ARG);
+    mqvpn_config_free(cfg);
+}
+
+TEST(config_set_hybrid)
+{
+    mqvpn_config_t *cfg = mqvpn_config_new();
+    /* Defaults from mqvpn_hybrid_config_default() */
+    ASSERT_EQ(cfg->hybrid.enabled, 0);
+    ASSERT_EQ(cfg->hybrid.tcp_mode, MQVPN_HYBRID_TCP_AUTO);
+    ASSERT_EQ(cfg->hybrid.tcp_max_flows, 256);
+    ASSERT_EQ(cfg->hybrid.tcp_idle_timeout_sec, 300);
+
+    ASSERT_EQ(mqvpn_config_set_hybrid_enabled(cfg, 1), MQVPN_OK);
+    ASSERT_EQ(cfg->hybrid.enabled, 1);
+    ASSERT_EQ(mqvpn_config_set_hybrid_enabled(NULL, 1), MQVPN_ERR_INVALID_ARG);
+
+    ASSERT_EQ(mqvpn_config_set_hybrid_tcp_mode(cfg, 1), MQVPN_OK);
+    ASSERT_EQ(cfg->hybrid.tcp_mode, MQVPN_HYBRID_TCP_RAW);
+    ASSERT_EQ(mqvpn_config_set_hybrid_tcp_mode(cfg, 3), MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_set_hybrid_tcp_mode(cfg, -1), MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(cfg->hybrid.tcp_mode, MQVPN_HYBRID_TCP_RAW); /* rejected → unchanged */
+    ASSERT_EQ(mqvpn_config_set_hybrid_tcp_mode(NULL, 0), MQVPN_ERR_INVALID_ARG);
+
+    ASSERT_EQ(mqvpn_config_set_hybrid_limits(cfg, 128, 60), MQVPN_OK);
+    ASSERT_EQ(cfg->hybrid.tcp_max_flows, 128);
+    ASSERT_EQ(cfg->hybrid.tcp_idle_timeout_sec, 60);
+    ASSERT_EQ(mqvpn_config_set_hybrid_limits(cfg, 0, 60), MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(cfg->hybrid.tcp_max_flows, 128); /* rejected → unchanged */
+    ASSERT_EQ(mqvpn_config_set_hybrid_limits(NULL, 128, 60), MQVPN_ERR_INVALID_ARG);
+
+    ASSERT_EQ(mqvpn_config_set_hybrid_connect_timeout(cfg, 20), MQVPN_OK);
+    ASSERT_EQ(cfg->hybrid.tcp_connect_timeout_sec, 20);
+    ASSERT_EQ(mqvpn_config_set_hybrid_connect_timeout(cfg, 0), MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(cfg->hybrid.tcp_connect_timeout_sec, 20); /* rejected → unchanged */
+    ASSERT_EQ(mqvpn_config_set_hybrid_connect_timeout(NULL, 5), MQVPN_ERR_INVALID_ARG);
+
+    ASSERT_EQ(mqvpn_config_set_hybrid_max_global_flows(cfg, 8192), MQVPN_OK);
+    ASSERT_EQ(cfg->hybrid.tcp_max_global_flows, 8192);
+    ASSERT_EQ(mqvpn_config_set_hybrid_max_global_flows(cfg, 0), MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(cfg->hybrid.tcp_max_global_flows, 8192); /* rejected → unchanged */
+    ASSERT_EQ(mqvpn_config_set_hybrid_max_global_flows(NULL, 1), MQVPN_ERR_INVALID_ARG);
+
+    /* [Advanced] RecvRateLimit setter (client-only knob; 0 = off).
+     * Values above MQVPN_RECV_RATE_LIMIT_MAX are rejected: they would
+     * overflow xquic's rate x srtt(us) u64 window product and pin the
+     * receive window at the minimum instead of raising it. */
+    ASSERT_EQ(mqvpn_config_set_recv_rate_limit(cfg, 125000000ULL), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_set_recv_rate_limit(cfg, MQVPN_RECV_RATE_LIMIT_MAX), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_set_recv_rate_limit(cfg, MQVPN_RECV_RATE_LIMIT_MAX + 1),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(cfg->recv_rate_limit, MQVPN_RECV_RATE_LIMIT_MAX); /* unchanged */
+    ASSERT_EQ(mqvpn_config_set_recv_rate_limit(cfg, 0), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_set_recv_rate_limit(NULL, 1), MQVPN_ERR_INVALID_ARG);
+
     mqvpn_config_free(cfg);
 }
 
@@ -673,6 +858,32 @@ TEST(client_get_interest)
     /* NULL args */
     ASSERT_EQ(mqvpn_client_get_interest(NULL, &interest), MQVPN_ERR_INVALID_ARG);
     ASSERT_EQ(mqvpn_client_get_interest(c, NULL), MQVPN_ERR_INVALID_ARG);
+
+    mqvpn_client_destroy(c);
+}
+
+TEST(client_get_reorder_stats_null_args)
+{
+    mqvpn_reorder_stats_t st;
+    ASSERT_EQ(mqvpn_client_get_reorder_stats(NULL, &st), -1);
+    mqvpn_client_t *c = make_test_client();
+    ASSERT_NOT_NULL(c);
+    ASSERT_EQ(mqvpn_client_get_reorder_stats(c, NULL), -1);
+    mqvpn_client_destroy(c);
+}
+
+TEST(client_get_reorder_stats_zero_fill_when_unconnected)
+{
+    mqvpn_client_t *c = make_test_client();
+    ASSERT_NOT_NULL(c);
+
+    mqvpn_reorder_stats_t st;
+    memset(&st, 0xAB, sizeof(st));
+    ASSERT_EQ(mqvpn_client_get_reorder_stats(c, &st), 0);
+    ASSERT_EQ(st.delivered_count, 0u);
+    ASSERT_EQ(st.gap_count, 0u);
+    ASSERT_EQ(st.gap_filled_count, 0u);
+    ASSERT_EQ(st.residence_max_us, 0u);
 
     mqvpn_client_destroy(c);
 }
@@ -1128,6 +1339,37 @@ TEST(cb_path_removed_validating_to_create_wait)
     mqvpn_client_destroy(c);
 }
 
+/* Primary-removal abandon regression pin — the primary path bootstraps as
+ * xqc_path_id=0, xquic_path_live=1 (id 0 is the live initial QUIC path,
+ * not an unset sentinel). Its removal must emit the xquic abandon
+ * (PATH_ABANDON) exactly like a secondary's; the id-0 guard introduced by
+ * the PR4 refactor (#116) skipped it and cost a ~95-115 s server-side
+ * downlink blackout on primary loss (iOS PoC gate G-i3). */
+extern int mqvpn_client_test_force_validating(mqvpn_client_t *c,
+                                              mqvpn_path_handle_t handle,
+                                              uint64_t xqc_path_id);
+extern int mqvpn_client_test_abandon_due(mqvpn_client_t *c, mqvpn_path_handle_t handle);
+
+TEST(remove_live_primary_emits_abandon)
+{
+    mqvpn_client_t *c = make_test_client();
+    mqvpn_path_handle_t h = mqvpn_client_add_path_fd(c, 42, NULL);
+    ASSERT_NE(h, (mqvpn_path_handle_t)-1);
+
+    /* Fresh PENDING slot: no live xquic path -> no abandon. */
+    ASSERT_EQ(mqvpn_client_test_abandon_due(c, h), 0);
+
+    /* Seed the primary bootstrap shape: live path with xqc_path_id=0. */
+    ASSERT_EQ(mqvpn_client_test_force_validating(c, h, 0), 0);
+    ASSERT_EQ(mqvpn_client_test_abandon_due(c, h), 1);
+
+    /* Secondary shape (non-zero id) keeps emitting too. */
+    ASSERT_EQ(mqvpn_client_test_force_validating(c, h, 7), 0);
+    ASSERT_EQ(mqvpn_client_test_abandon_due(c, h), 1);
+
+    mqvpn_client_destroy(c);
+}
+
 /* ── Permanent path-create failure (xquic budget exhausted / OOM) ──
  *
  * When xqc_conn_create_path() returns -XQC_EMP_CREATE_PATH (652), retrying
@@ -1553,6 +1795,423 @@ TEST(client_set_state_leaving_connecting_clears_handshake_start)
     mqvpn_client_destroy(c);
 }
 
+/* ── CONNECT-IP failure classification (wrong-PSK fast-fail) ──
+ *
+ * cli_classify_status maps a non-200 CONNECT-IP :status to a pre-establishment
+ * failure reason: 401/403 -> AUTH (RFC 9110 §15.5.2 / §15.5.4), everything
+ * else (incl. 0 = no headers seen) -> PROTOCOL. Pure function, no live
+ * connection needed. */
+
+extern int mqvpn_client_test_classify_status(int status);
+
+TEST(classify_status_401_is_auth)
+{
+    ASSERT_EQ(mqvpn_client_test_classify_status(401), MQVPN_ERR_AUTH);
+}
+
+TEST(classify_status_403_is_auth)
+{
+    ASSERT_EQ(mqvpn_client_test_classify_status(403), MQVPN_ERR_AUTH);
+}
+
+TEST(classify_status_404_is_protocol)
+{
+    ASSERT_EQ(mqvpn_client_test_classify_status(404), MQVPN_ERR_PROTOCOL);
+}
+
+TEST(classify_status_500_is_protocol)
+{
+    ASSERT_EQ(mqvpn_client_test_classify_status(500), MQVPN_ERR_PROTOCOL);
+}
+
+TEST(classify_status_zero_is_protocol)
+{
+    /* status 0 = no :status header observed (e.g. malformed / stream reset
+     * before headers) — treated as PROTOCOL. */
+    ASSERT_EQ(mqvpn_client_test_classify_status(0), MQVPN_ERR_PROTOCOL);
+}
+
+/* ── Callback-ordering once-flag (tunnel_notified latch) ──
+ *
+ * Two callbacks can witness a pre-establishment failure (non-200 headers vs
+ * tunnel-stream RST), and cb_h3_conn_close follows both. The per-conn
+ * tunnel_notified latch must guarantee exactly ONE tunnel_closed per failed
+ * conn, and cb_h3_conn_close's CLOSED notification must be skipped when the
+ * latch is set — but still fire for an un-latched (genuine
+ * post-establishment) close. Driven through the real
+ * cli_signal_connect_fail / cli_notify_conn_closed via test hooks, on a bare
+ * conn attached by mqvpn_client_test_conn_alloc. */
+
+extern int mqvpn_client_test_conn_alloc(mqvpn_client_t *c);
+extern int mqvpn_client_test_conn_free(mqvpn_client_t *c);
+extern int mqvpn_client_test_conn_tunnel_notified(const mqvpn_client_t *c);
+extern int mqvpn_client_test_signal_connect_fail(mqvpn_client_t *c, int reason,
+                                                 int status);
+extern int mqvpn_client_test_notify_conn_closed(mqvpn_client_t *c);
+
+static int g_tunnel_closed_count = 0;
+static mqvpn_error_t g_last_tunnel_closed_reason;
+
+static void
+mock_tunnel_closed(mqvpn_error_t reason, void *u)
+{
+    (void)u;
+    g_tunnel_closed_count++;
+    g_last_tunnel_closed_reason = reason;
+}
+
+/* Helper: make_test_client + counting tunnel_closed callback. */
+static mqvpn_client_t *
+make_test_client_with_closed_cb(void)
+{
+    mqvpn_config_t *cfg = mqvpn_config_new();
+    mqvpn_config_set_server(cfg, "1.2.3.4", 443);
+
+    mqvpn_client_callbacks_t cbs = MQVPN_CLIENT_CALLBACKS_INIT;
+    cbs.tun_output = dummy_tun_output;
+    cbs.tunnel_config_ready = dummy_config_ready;
+    cbs.tunnel_closed = mock_tunnel_closed;
+
+    mqvpn_client_t *c = mqvpn_client_new(cfg, &cbs, NULL);
+    mqvpn_config_free(cfg);
+    g_tunnel_closed_count = 0;
+    return c;
+}
+
+TEST(connect_fail_signals_tunnel_closed_exactly_once)
+{
+    mqvpn_client_t *c = make_test_client_with_closed_cb();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+    ASSERT_EQ(mqvpn_client_test_conn_tunnel_notified(c), 0);
+
+    /* First witness (e.g. 403 headers) fires the callback and latches. */
+    ASSERT_EQ(mqvpn_client_test_signal_connect_fail(c, MQVPN_ERR_AUTH, 403), 0);
+    ASSERT_EQ(g_tunnel_closed_count, 1);
+    ASSERT_EQ(g_last_tunnel_closed_reason, MQVPN_ERR_AUTH);
+    ASSERT_EQ(mqvpn_client_test_conn_tunnel_notified(c), 1);
+
+    /* Second witness (e.g. the stream RST that follows the 403) must be a
+     * no-op: still exactly one callback, first reason preserved. */
+    ASSERT_EQ(mqvpn_client_test_signal_connect_fail(c, MQVPN_ERR_PROTOCOL, 0), 0);
+    ASSERT_EQ(g_tunnel_closed_count, 1);
+    ASSERT_EQ(g_last_tunnel_closed_reason, MQVPN_ERR_AUTH);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(conn_close_skips_closed_after_connect_fail)
+{
+    mqvpn_client_t *c = make_test_client_with_closed_cb();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    /* Pre-establishment failure latches and fires once... */
+    ASSERT_EQ(mqvpn_client_test_signal_connect_fail(c, MQVPN_ERR_AUTH, 403), 0);
+    ASSERT_EQ(g_tunnel_closed_count, 1);
+
+    /* ...then cb_h3_conn_close's notify gate must NOT add a second
+     * (CLOSED) callback for the same conn. */
+    ASSERT_EQ(mqvpn_client_test_notify_conn_closed(c), 0);
+    ASSERT_EQ(g_tunnel_closed_count, 1);
+    ASSERT_EQ(g_last_tunnel_closed_reason, MQVPN_ERR_AUTH);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(conn_close_fires_closed_when_not_latched)
+{
+    mqvpn_client_t *c = make_test_client_with_closed_cb();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    /* Genuine post-establishment drop: no pre-establishment failure fired,
+     * so the conn-close notify must deliver exactly one CLOSED. */
+    ASSERT_EQ(mqvpn_client_test_notify_conn_closed(c), 0);
+    ASSERT_EQ(g_tunnel_closed_count, 1);
+    ASSERT_EQ(g_last_tunnel_closed_reason, MQVPN_ERR_CLOSED);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+/* ── CONNECT-IP :status scan hardening + close classification (v0.13.0
+ *    pre-release review findings) ──
+ *
+ * The scan must pick exactly one FINAL (>=200) :status per conn: a
+ * duplicate :status pseudo-header is server-controlled input and must not
+ * reach cli_signal_connect_fail's !tunnel_ok invariant; RFC 9110 §15.2.1
+ * interim (1xx) responses are not final and must not be classified as
+ * failures. A locally initiated shutdown must keep reporting
+ * MQVPN_ERR_CLOSED, not a spurious PROTOCOL connect-fail. */
+
+extern int mqvpn_client_test_conn_tunnel_ok(const mqvpn_client_t *c);
+extern int mqvpn_client_test_set_shutting_down(mqvpn_client_t *c, int v);
+extern int mqvpn_client_test_scan_headers(mqvpn_client_t *c, const char **names,
+                                          const char **values, int n);
+extern int mqvpn_client_test_conn_peer_reorder(const mqvpn_client_t *c);
+
+/* All-":status" convenience wrapper over the (name, value) scan hook. */
+static int
+scan_status_headers(mqvpn_client_t *c, const char **values, int n)
+{
+    const char *names[8];
+    for (int i = 0; i < n && i < 8; i++)
+        names[i] = ":status";
+    return mqvpn_client_test_scan_headers(c, names, values, n);
+}
+extern int mqvpn_client_test_request_close_connect_ip(mqvpn_client_t *c);
+
+TEST(headers_duplicate_status_first_final_wins)
+{
+    mqvpn_client_t *c = make_test_client_with_closed_cb();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    /* One header section carrying ":status: 200" then a duplicate non-200:
+     * the first final status wins; the duplicate must neither fire
+     * tunnel_closed nor (Debug builds) trip the connect-fail assert. */
+    const char *vals[] = {"200", "403"};
+    ASSERT_EQ(scan_status_headers(c, vals, 2), 0);
+    ASSERT_EQ(mqvpn_client_test_conn_tunnel_ok(c), 1);
+    ASSERT_EQ(g_tunnel_closed_count, 0);
+    ASSERT_EQ(mqvpn_client_test_conn_tunnel_notified(c), 0);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(headers_status_after_failure_latch_ignored)
+{
+    mqvpn_client_t *c = make_test_client_with_closed_cb();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    /* First final status 403 decides the conn; a trailing duplicate "200"
+     * must not resurrect tunnel_ok on a conn already latched failed. */
+    const char *vals[] = {"403", "200"};
+    ASSERT_EQ(scan_status_headers(c, vals, 2), 0);
+    ASSERT_EQ(g_tunnel_closed_count, 1);
+    ASSERT_EQ(g_last_tunnel_closed_reason, MQVPN_ERR_AUTH);
+    ASSERT_EQ(mqvpn_client_test_conn_tunnel_ok(c), 0);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(headers_status_across_sections_first_wins)
+{
+    mqvpn_client_t *c = make_test_client_with_closed_cb();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    /* A later header section (e.g. trailers) carrying a non-200 :status
+     * after the tunnel is up must be ignored, not classified as failure. */
+    const char *ok[] = {"200"};
+    const char *late[] = {"403"};
+    ASSERT_EQ(scan_status_headers(c, ok, 1), 0);
+    ASSERT_EQ(scan_status_headers(c, late, 1), 0);
+    ASSERT_EQ(mqvpn_client_test_conn_tunnel_ok(c), 1);
+    ASSERT_EQ(g_tunnel_closed_count, 0);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(headers_interim_1xx_not_a_failure)
+{
+    mqvpn_client_t *c = make_test_client_with_closed_cb();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    /* RFC 9110 §15.2.1: interim responses may precede the final one and a
+     * client MUST be able to parse them; they are not a terminal status. */
+    const char *interim[] = {"103"};
+    ASSERT_EQ(scan_status_headers(c, interim, 1), 0);
+    ASSERT_EQ(mqvpn_client_test_conn_tunnel_ok(c), 0);
+    ASSERT_EQ(g_tunnel_closed_count, 0);
+    ASSERT_EQ(mqvpn_client_test_conn_tunnel_notified(c), 0);
+
+    /* The final 200 that follows must still establish the tunnel. */
+    const char *final_ok[] = {"200"};
+    ASSERT_EQ(scan_status_headers(c, final_ok, 1), 0);
+    ASSERT_EQ(mqvpn_client_test_conn_tunnel_ok(c), 1);
+    ASSERT_EQ(g_tunnel_closed_count, 0);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(headers_malformed_status_length_latches_failure)
+{
+    mqvpn_client_t *c = make_test_client_with_closed_cb();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    /* A :status whose value is not exactly 3 digits is malformed; it must
+     * latch a PROTOCOL failure, not be skipped so that a later duplicate
+     * "200" establishes the tunnel. */
+    const char *vals[] = {"2000", "200"};
+    ASSERT_EQ(scan_status_headers(c, vals, 2), 0);
+    ASSERT_EQ(g_tunnel_closed_count, 1);
+    ASSERT_EQ(g_last_tunnel_closed_reason, MQVPN_ERR_PROTOCOL);
+    ASSERT_EQ(mqvpn_client_test_conn_tunnel_ok(c), 0);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(reorder_echo_ignored_outside_deciding_200_section)
+{
+    mqvpn_client_t *c = make_test_client_with_closed_cb();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    /* §19.2: the server echoes mqvpn-reorder in its 200 response only. An
+     * echo smuggled into an interim response, followed by a 200 WITHOUT the
+     * echo, must not enable TX stamping. */
+    const char *n1[] = {":status", "mqvpn-reorder"};
+    const char *v1[] = {"103", "v1"};
+    ASSERT_EQ(mqvpn_client_test_scan_headers(c, n1, v1, 2), 0);
+    ASSERT_EQ(mqvpn_client_test_conn_peer_reorder(c), 0);
+
+    const char *n2[] = {":status"};
+    const char *v2[] = {"200"};
+    ASSERT_EQ(mqvpn_client_test_scan_headers(c, n2, v2, 1), 0);
+    ASSERT_EQ(mqvpn_client_test_conn_tunnel_ok(c), 1);
+    ASSERT_EQ(mqvpn_client_test_conn_peer_reorder(c), 0);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(reorder_echo_in_deciding_200_section_sets_flag)
+{
+    mqvpn_client_t *c = make_test_client_with_closed_cb();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    /* Happy path pin: echo in the same section as the deciding 200 (order
+     * independent — echo may precede :status). */
+    const char *n1[] = {"mqvpn-reorder", ":status"};
+    const char *v1[] = {"v1", "200"};
+    ASSERT_EQ(mqvpn_client_test_scan_headers(c, n1, v1, 2), 0);
+    ASSERT_EQ(mqvpn_client_test_conn_tunnel_ok(c), 1);
+    ASSERT_EQ(mqvpn_client_test_conn_peer_reorder(c), 1);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(request_close_during_local_shutdown_keeps_closed_reason)
+{
+    mqvpn_client_t *c = make_test_client_with_closed_cb();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    /* mqvpn_client_disconnect sets shutting_down before xqc_conn_close,
+     * and xquic destroys streams before the conn close-notify: the
+     * pre-establishment stream close seen during a LOCAL shutdown must not
+     * be classified as a PROTOCOL connect failure... */
+    ASSERT_EQ(mqvpn_client_test_set_shutting_down(c, 1), 0);
+    ASSERT_EQ(mqvpn_client_test_request_close_connect_ip(c), 0);
+    ASSERT_EQ(g_tunnel_closed_count, 0);
+
+    /* ...so the conn close-notify that follows still reports CLOSED. */
+    ASSERT_EQ(mqvpn_client_test_notify_conn_closed(c), 0);
+    ASSERT_EQ(g_tunnel_closed_count, 1);
+    ASSERT_EQ(g_last_tunnel_closed_reason, MQVPN_ERR_CLOSED);
+
+    ASSERT_EQ(mqvpn_client_test_set_shutting_down(c, 0), 0);
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(request_close_server_rst_still_signals_protocol)
+{
+    mqvpn_client_t *c = make_test_client_with_closed_cb();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    /* Regression pin for the iOS unblock path: a server RST of the tunnel
+     * stream before 200, with no local shutdown in progress, must still
+     * signal a PROTOCOL connect failure. */
+    ASSERT_EQ(mqvpn_client_test_request_close_connect_ip(c), 0);
+    ASSERT_EQ(g_tunnel_closed_count, 1);
+    ASSERT_EQ(g_last_tunnel_closed_reason, MQVPN_ERR_PROTOCOL);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+#ifdef MQVPN_HYBRID_TCP_LANE_ENABLED
+/* ── Hybrid tcp_max_flows pool-bound warn at client_new (config-load-time
+ *    visibility for the lane's silent clamp) ── */
+
+extern uint32_t mqvpn_tcp_lane_pool_flow_bound(void);
+
+static int g_clamp_warn_count = 0;
+
+static void
+clamp_warn_log(mqvpn_log_level_t level, const char *msg, void *u)
+{
+    (void)u;
+    if (level == MQVPN_LOG_WARN && strstr(msg, "tcp_max_flows") != NULL &&
+        strstr(msg, "clamp") != NULL)
+        g_clamp_warn_count++;
+}
+
+static mqvpn_client_t *
+make_hybrid_client_with_flows(uint32_t flows)
+{
+    mqvpn_config_t *cfg = mqvpn_config_new();
+    mqvpn_config_set_server(cfg, "1.2.3.4", 443);
+    /* Mirror the INI [Hybrid] bridge (mqvpn_config_apply_hybrid): a raw
+     * struct copy with no setter validation, so flows==0 — which the file
+     * parser accepts and the public setter rejects — reaches the library
+     * exactly as it does from a config file. */
+    mqvpn_hybrid_config_t h;
+    mqvpn_hybrid_config_default(&h);
+    h.enabled = 1;
+    h.tcp_max_flows = flows;
+    mqvpn_config_apply_hybrid(cfg, &h);
+
+    mqvpn_client_callbacks_t cbs = MQVPN_CLIENT_CALLBACKS_INIT;
+    cbs.tun_output = dummy_tun_output;
+    cbs.tunnel_config_ready = dummy_config_ready;
+    cbs.log = clamp_warn_log;
+
+    g_clamp_warn_count = 0;
+    mqvpn_client_t *c = mqvpn_client_new(cfg, &cbs, NULL);
+    mqvpn_config_free(cfg);
+    return c;
+}
+
+TEST(client_new_warns_tcp_max_flows_above_pool_bound)
+{
+    mqvpn_client_t *c =
+        make_hybrid_client_with_flows(mqvpn_tcp_lane_pool_flow_bound() + 1);
+    ASSERT_EQ(c != NULL, 1);
+    /* The operator must learn at startup — not at tunnel establishment —
+     * that the configured value will be clamped. */
+    ASSERT_EQ(g_clamp_warn_count, 1);
+    mqvpn_client_destroy(c);
+}
+
+TEST(client_new_quiet_tcp_max_flows_at_pool_bound)
+{
+    mqvpn_client_t *c = make_hybrid_client_with_flows(mqvpn_tcp_lane_pool_flow_bound());
+    ASSERT_EQ(c != NULL, 1);
+    ASSERT_EQ(g_clamp_warn_count, 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(client_new_warn_keys_on_sanitized_flows)
+{
+    /* TcpMaxFlows=0 sanitizes to MQVPN_TCP_MAX_FLOWS_DEFAULT at tunnel
+     * setup; the startup warn must key on that sanitized value, or the
+     * iOS profile (default 256 > bound 64) misses the clamp until
+     * establishment. Expectation is profile-derived so this test is exact
+     * on every profile: quiet where the default fits the bound
+     * (desktop/router 256 < 4096, Android 256 == 256), warning on iOS. */
+    int expect = MQVPN_TCP_MAX_FLOWS_DEFAULT > mqvpn_tcp_lane_pool_flow_bound() ? 1 : 0;
+    mqvpn_client_t *c = make_hybrid_client_with_flows(0);
+    ASSERT_EQ(c != NULL, 1);
+    ASSERT_EQ(g_clamp_warn_count, expect);
+    mqvpn_client_destroy(c);
+}
+#endif /* MQVPN_HYBRID_TCP_LANE_ENABLED */
+
 TEST(client_set_state_reconnecting_clears_handshake_start)
 {
     mqvpn_client_t *c = make_test_client();
@@ -1589,6 +2248,355 @@ TEST(get_interest_includes_handshake_stall_deadline)
      * not exceed that, else the platform's libevent timer would not wake the
      * client to run the watchdog before idle_time_out (120s) takes over. */
     ASSERT_EQ(i.next_timer_ms <= 5000, 1);
+
+    mqvpn_client_destroy(c);
+}
+
+/* ── get_interest Recovery timer: retry-deadline wake (regression pin for
+ *    commit 220a2e6) ──
+ *
+ * The Recovery block in mqvpn_client_get_interest must shorten next_timer_ms
+ * to a path's `recreate_after_us` retry deadline. The bug (fixed in 220a2e6)
+ * gated on `p->status == MQVPN_PATH_DEGRADED`, which missed CREATE_WAIT slots:
+ * a slot that fails activation before it ever validated lands in CREATE_WAIT,
+ * which projects to the public PENDING status, so the DEGRADED gate skipped
+ * its armed retry timer and the tick fired only on some unrelated (30s+)
+ * timer. The fix keys on `p->recreate_after_us > 0`, which is non-zero in
+ * exactly CREATE_WAIT and DEGRADED. These are pure-function tests over
+ * get_interest so the deadline-wake never needs a netns to verify.
+ *
+ * A fixed injected clock makes the arithmetic exact:
+ * apply_path_activation_failure arms recreate_after_us = now + 5s
+ * (PATH_RECREATE_DELAY_US, the first-retry backoff). */
+static uint64_t g_recovery_fake_now_us = 0;
+static uint64_t
+recovery_fake_clock(void *ctx)
+{
+    (void)ctx;
+    return g_recovery_fake_now_us;
+}
+
+static mqvpn_client_t *
+make_recovery_test_client(void)
+{
+    mqvpn_config_t *cfg = mqvpn_config_new();
+    mqvpn_config_set_server(cfg, "1.2.3.4", 443);
+    mqvpn_config_set_clock(cfg, recovery_fake_clock, NULL);
+
+    mqvpn_client_callbacks_t cbs = MQVPN_CLIENT_CALLBACKS_INIT;
+    cbs.tun_output = dummy_tun_output;
+    cbs.tunnel_config_ready = dummy_config_ready;
+    cbs.state_changed = mock_state_changed;
+    cbs.path_event = mock_path_event;
+
+    mqvpn_client_t *c = mqvpn_client_new(cfg, &cbs, NULL);
+    mqvpn_config_free(cfg);
+    return c;
+}
+
+extern int mqvpn_client_test_force_established(mqvpn_client_t *c);
+extern int mqvpn_client_test_set_next_wake_us(mqvpn_client_t *c, uint64_t us);
+
+/* Case 1: CREATE_WAIT slot with recreate_after_us = now + 5s. The retry
+ * deadline (5000 ms) must clamp next_timer_ms below the 30s xquic wake. */
+TEST(get_interest_recovery_create_wait_future_clamps_wake)
+{
+    g_recovery_fake_now_us = 1000000000ULL; /* arbitrary 1000 s base */
+    mqvpn_client_t *c = make_recovery_test_client();
+    mqvpn_path_handle_t h = mqvpn_client_add_path_fd(c, 42, NULL);
+    ASSERT_NE(h, (mqvpn_path_handle_t)-1);
+
+    /* PENDING -> CREATE_WAIT, arming recreate_after_us = base + first backoff. */
+    ASSERT_EQ(mqvpn_client_apply_path_activation_failure(c, h, g_recovery_fake_now_us),
+              0);
+    ASSERT_EQ(mqvpn_client_test_force_established(c), 0);
+    ASSERT_EQ(mqvpn_client_test_set_next_wake_us(c, 30ULL * 1000000), 0);
+
+    mqvpn_interest_t i = {0};
+    i.struct_size = sizeof(i);
+    ASSERT_EQ(mqvpn_client_get_interest(c, &i), MQVPN_OK);
+
+    const int first_backoff_ms = (int)(PATH_RECREATE_DELAY_US / 1000);
+    ASSERT_EQ(i.next_timer_ms > 0, 1);
+    ASSERT_EQ(i.next_timer_ms <= first_backoff_ms, 1);
+    /* Exact: clamped to the retry deadline, not the 30s xquic wake. */
+    ASSERT_EQ(i.next_timer_ms, first_backoff_ms);
+
+    mqvpn_client_destroy(c);
+}
+
+/* Case 2: same CREATE_WAIT slot but the deadline is already in the past —
+ * get_interest must force next_timer_ms to 1 (wake immediately). */
+TEST(get_interest_recovery_create_wait_past_forces_1ms)
+{
+    g_recovery_fake_now_us = 1000000000ULL;
+    mqvpn_client_t *c = make_recovery_test_client();
+    mqvpn_path_handle_t h = mqvpn_client_add_path_fd(c, 42, NULL);
+    ASSERT_NE(h, (mqvpn_path_handle_t)-1);
+
+    ASSERT_EQ(mqvpn_client_apply_path_activation_failure(c, h, g_recovery_fake_now_us),
+              0);
+    ASSERT_EQ(mqvpn_client_test_force_established(c), 0);
+    ASSERT_EQ(mqvpn_client_test_set_next_wake_us(c, 30ULL * 1000000), 0);
+
+    /* Advance past the base+5s retry deadline. */
+    g_recovery_fake_now_us += 10ULL * 1000000;
+
+    mqvpn_interest_t i = {0};
+    i.struct_size = sizeof(i);
+    ASSERT_EQ(mqvpn_client_get_interest(c, &i), MQVPN_OK);
+    ASSERT_EQ(i.next_timer_ms, 1);
+
+    mqvpn_client_destroy(c);
+}
+
+/* Case 3: a fresh PENDING slot has recreate_after_us == 0, so the Recovery
+ * block must contribute nothing — the xquic-requested wake passes through
+ * untouched (NOT clamped to 5000, NOT forced to 1). Isolates the block by
+ * seeding next_wake_us to a distinctive 8000 ms. */
+TEST(get_interest_recovery_ignores_slot_without_retry_deadline)
+{
+    g_recovery_fake_now_us = 1000000000ULL;
+    mqvpn_client_t *c = make_recovery_test_client();
+    mqvpn_path_handle_t h = mqvpn_client_add_path_fd(c, 42, NULL);
+    ASSERT_NE(h, (mqvpn_path_handle_t)-1);
+    /* Fresh PENDING: recreate_after_us == 0, path_stable_since_us == 0. */
+
+    ASSERT_EQ(mqvpn_client_test_force_established(c), 0);
+    ASSERT_EQ(mqvpn_client_test_set_next_wake_us(c, 8ULL * 1000000), 0);
+
+    mqvpn_interest_t i = {0};
+    i.struct_size = sizeof(i);
+    ASSERT_EQ(mqvpn_client_get_interest(c, &i), MQVPN_OK);
+    ASSERT_EQ(i.next_timer_ms, 8000);
+
+    mqvpn_client_destroy(c);
+}
+
+/* Case 4: an overdue retry deadline must stay inert while the client is not
+ * ESTABLISHED. We arm CREATE_WAIT, force ESTABLISHED+multipath_ready, then
+ * move to RECONNECTING (valid transition) so multipath_ready stays 1 and only
+ * the state gate differs. reconnect_scheduled_us is 0, so the RECONNECTING
+ * block does not fire either — the wake must pass through, not be forced to 1. */
+TEST(get_interest_recovery_inert_when_not_established)
+{
+    g_recovery_fake_now_us = 1000000000ULL;
+    mqvpn_client_t *c = make_recovery_test_client();
+    mqvpn_path_handle_t h = mqvpn_client_add_path_fd(c, 42, NULL);
+    ASSERT_NE(h, (mqvpn_path_handle_t)-1);
+
+    ASSERT_EQ(mqvpn_client_apply_path_activation_failure(c, h, g_recovery_fake_now_us),
+              0);
+    ASSERT_EQ(mqvpn_client_test_set_next_wake_us(c, 8ULL * 1000000), 0);
+    ASSERT_EQ(mqvpn_client_test_force_established(c), 0);
+    ASSERT_EQ(mqvpn_client_test_force_state(c, MQVPN_STATE_RECONNECTING), 0);
+
+    /* Deadline (base+5s) now in the past. */
+    g_recovery_fake_now_us += 10ULL * 1000000;
+
+    mqvpn_interest_t i = {0};
+    i.struct_size = sizeof(i);
+    ASSERT_EQ(mqvpn_client_get_interest(c, &i), MQVPN_OK);
+    ASSERT_EQ(i.next_timer_ms, 8000);
+
+    mqvpn_client_destroy(c);
+}
+
+/* ── get_interest: Stability timer (mqvpn_client.c §get_interest) ──
+ *
+ * The parallel of the Recovery-timer block above, but keyed on
+ * path_stable_since_us (set on VALIDATING -> ACTIVE) instead of
+ * recreate_after_us. Deadline = path_stable_since_us + PATH_STABLE_THRESHOLD_US
+ * (30 s). Guard: path_stable_since_us > 0 && xquic_path_live. The block was a
+ * documented ~3-4x throughput regression when it EXTENDED `ms` (0 -> 30000);
+ * these tests pin the shorten-only / force-1ms / inert-guard behaviour so that
+ * regression cannot silently return. Seeded via the fixed injected clock. */
+extern int mqvpn_client_test_set_path_stable_us(mqvpn_client_t *c,
+                                                mqvpn_path_handle_t handle,
+                                                uint64_t stable_since_us, int xquic_live);
+
+/* Deadline in the future: clamp next_timer_ms down to the remaining time,
+ * never past it. base-10s anchor -> stable_at = base+20s -> 20000 ms, below
+ * the 30s xquic wake it must win against. */
+TEST(get_interest_stability_future_clamps_wake)
+{
+    g_recovery_fake_now_us = 1000000000ULL; /* 1000 s base */
+    mqvpn_client_t *c = make_recovery_test_client();
+    mqvpn_path_handle_t h = mqvpn_client_add_path_fd(c, 42, NULL);
+    ASSERT_NE(h, (mqvpn_path_handle_t)-1);
+
+    ASSERT_EQ(mqvpn_client_test_force_established(c), 0);
+    ASSERT_EQ(mqvpn_client_test_set_next_wake_us(c, 30ULL * 1000000), 0);
+    /* stable_at = (base - 10s) + 30s = base + 20s. */
+    ASSERT_EQ(mqvpn_client_test_set_path_stable_us(
+                  c, h, g_recovery_fake_now_us - 10ULL * 1000000, 1),
+              0);
+
+    mqvpn_interest_t i = {0};
+    i.struct_size = sizeof(i);
+    ASSERT_EQ(mqvpn_client_get_interest(c, &i), MQVPN_OK);
+    ASSERT_EQ(i.next_timer_ms, 20000);
+
+    mqvpn_client_destroy(c);
+}
+
+/* Deadline already in the past: force next_timer_ms to 1 (wake immediately). */
+TEST(get_interest_stability_past_forces_1ms)
+{
+    g_recovery_fake_now_us = 1000000000ULL;
+    mqvpn_client_t *c = make_recovery_test_client();
+    mqvpn_path_handle_t h = mqvpn_client_add_path_fd(c, 42, NULL);
+    ASSERT_NE(h, (mqvpn_path_handle_t)-1);
+
+    ASSERT_EQ(mqvpn_client_test_force_established(c), 0);
+    ASSERT_EQ(mqvpn_client_test_set_next_wake_us(c, 30ULL * 1000000), 0);
+    /* stable_at = (base - 40s) + 30s = base - 10s (overdue). */
+    ASSERT_EQ(mqvpn_client_test_set_path_stable_us(
+                  c, h, g_recovery_fake_now_us - 40ULL * 1000000, 1),
+              0);
+
+    mqvpn_interest_t i = {0};
+    i.struct_size = sizeof(i);
+    ASSERT_EQ(mqvpn_client_get_interest(c, &i), MQVPN_OK);
+    ASSERT_EQ(i.next_timer_ms, 1);
+
+    mqvpn_client_destroy(c);
+}
+
+/* Guard: the block must stay inert unless BOTH path_stable_since_us > 0 AND
+ * xquic_path_live. A future deadline (would clamp to <30000) is seeded, but
+ * with each half of the guard missing in turn the 8000 ms xquic wake must pass
+ * through untouched. */
+TEST(get_interest_stability_ignores_dead_path)
+{
+    g_recovery_fake_now_us = 1000000000ULL;
+    mqvpn_client_t *c = make_recovery_test_client();
+    mqvpn_path_handle_t h = mqvpn_client_add_path_fd(c, 42, NULL);
+    ASSERT_NE(h, (mqvpn_path_handle_t)-1);
+
+    ASSERT_EQ(mqvpn_client_test_force_established(c), 0);
+    ASSERT_EQ(mqvpn_client_test_set_next_wake_us(c, 8ULL * 1000000), 0);
+
+    /* Case A: stability anchor set but xquic_path_live == 0 -> inert. The
+     * anchor is deliberately OVERDUE (base-40s -> stable_at = base-10s): if a
+     * regression dropped only the `&& xquic_path_live` half of the guard, the
+     * overdue branch would force ms to 1, diverging from the asserted 8000. A
+     * future-dated anchor here would be vacuous (30000 > 8000 never shortens). */
+    ASSERT_EQ(mqvpn_client_test_set_path_stable_us(
+                  c, h, g_recovery_fake_now_us - 40ULL * 1000000, 0),
+              0);
+    mqvpn_interest_t i = {0};
+    i.struct_size = sizeof(i);
+    ASSERT_EQ(mqvpn_client_get_interest(c, &i), MQVPN_OK);
+    ASSERT_EQ(i.next_timer_ms, 8000);
+
+    /* Case B: xquic_path_live == 1 but no stability anchor -> inert. */
+    ASSERT_EQ(mqvpn_client_test_set_path_stable_us(c, h, 0, 1), 0);
+    mqvpn_interest_t i2 = {0};
+    i2.struct_size = sizeof(i2);
+    ASSERT_EQ(mqvpn_client_get_interest(c, &i2), MQVPN_OK);
+    ASSERT_EQ(i2.next_timer_ms, 8000);
+
+    mqvpn_client_destroy(c);
+}
+
+/* Two live-stable paths: next_timer_ms binds to the EARLIEST deadline. */
+TEST(get_interest_stability_two_paths_takes_min_deadline)
+{
+    g_recovery_fake_now_us = 1000000000ULL;
+    mqvpn_client_t *c = make_recovery_test_client();
+    mqvpn_path_handle_t h1 = mqvpn_client_add_path_fd(c, 42, NULL);
+    mqvpn_path_handle_t h2 = mqvpn_client_add_path_fd(c, 43, NULL);
+    ASSERT_NE(h1, (mqvpn_path_handle_t)-1);
+    ASSERT_NE(h2, (mqvpn_path_handle_t)-1);
+
+    ASSERT_EQ(mqvpn_client_test_force_established(c), 0);
+    ASSERT_EQ(mqvpn_client_test_set_next_wake_us(c, 30ULL * 1000000), 0);
+    /* Put the MINIMUM deadline on the FIRST-processed path (h1 = paths[0]) so a
+     * genuine per-path min-comparison is REQUIRED to land on 5000: h1 stable_at
+     * = base + 5s (sms 5000), h2 stable_at = base + 20s (sms 20000). If the loop
+     * merely overwrote ms with each path's value (no `sms < ms` guard), h2 would
+     * clobber 5000 back up to 20000 and the assertion would fail. */
+    ASSERT_EQ(mqvpn_client_test_set_path_stable_us(
+                  c, h1, g_recovery_fake_now_us - 25ULL * 1000000, 1),
+              0);
+    ASSERT_EQ(mqvpn_client_test_set_path_stable_us(
+                  c, h2, g_recovery_fake_now_us - 10ULL * 1000000, 1),
+              0);
+
+    mqvpn_interest_t i = {0};
+    i.struct_size = sizeof(i);
+    ASSERT_EQ(mqvpn_client_get_interest(c, &i), MQVPN_OK);
+    ASSERT_EQ(i.next_timer_ms, 5000);
+
+    mqvpn_client_destroy(c);
+}
+
+/* Mixed: one FUTURE-deadline path and one OVERDUE path. The overdue path forces
+ * ms to 1, and the future path (sms=20000) must NOT reopen it — the force-1 is a
+ * floor, not a shorten candidate. Order-independent (whichever path lands last,
+ * an overdue path anywhere yields 1). Distinct failure mode from the single-path
+ * overdue case: it exercises the interaction between the shorten branch and the
+ * force-1 branch across paths (a mutant that let a later future path re-extend
+ * past the forced 1 would return 20000 here but still pass the single-path test). */
+TEST(get_interest_stability_overdue_wins_over_future_path)
+{
+    g_recovery_fake_now_us = 1000000000ULL;
+    mqvpn_client_t *c = make_recovery_test_client();
+    mqvpn_path_handle_t h1 = mqvpn_client_add_path_fd(c, 42, NULL);
+    mqvpn_path_handle_t h2 = mqvpn_client_add_path_fd(c, 43, NULL);
+    ASSERT_NE(h1, (mqvpn_path_handle_t)-1);
+    ASSERT_NE(h2, (mqvpn_path_handle_t)-1);
+
+    ASSERT_EQ(mqvpn_client_test_force_established(c), 0);
+    ASSERT_EQ(mqvpn_client_test_set_next_wake_us(c, 30ULL * 1000000), 0);
+    /* Overdue on the FIRST-processed path (h1 = paths[0]) so it forces ms=1
+     * BEFORE the future path is seen; the future path (h2, sms 20000) must not
+     * reopen that floor. Exercises the else-branch (force-1) → if-branch
+     * (shorten) sequence across loop iterations, which neither the single-path
+     * nor the both-future tests reach. h1 overdue: stable_at = base - 10s;
+     * h2 future: stable_at = base + 20s. The reversed seed order (future first)
+     * would not have required the overdue path to win. */
+    ASSERT_EQ(mqvpn_client_test_set_path_stable_us(
+                  c, h1, g_recovery_fake_now_us - 40ULL * 1000000, 1),
+              0);
+    ASSERT_EQ(mqvpn_client_test_set_path_stable_us(
+                  c, h2, g_recovery_fake_now_us - 10ULL * 1000000, 1),
+              0);
+
+    mqvpn_interest_t i = {0};
+    i.struct_size = sizeof(i);
+    ASSERT_EQ(mqvpn_client_get_interest(c, &i), MQVPN_OK);
+    ASSERT_EQ(i.next_timer_ms,
+              1); /* overdue forces 1; later future 20000 never reopens it */
+
+    mqvpn_client_destroy(c);
+}
+
+/* Direct guard for the documented regression the Stability block once caused:
+ * it EXTENDED ms (0 -> 30000), pinning the libevent tick 30 s out and stalling
+ * BBR pacing (~3-4x throughput loss). The block is shorten-ONLY. Here the xquic
+ * wake (8000 ms) is already SHORTER than the stability deadline (base+20s ->
+ * 20000 ms); the block must leave it untouched, NOT push it out to 20000. A
+ * revived `sms < ms ? ...` -> `ms = sms` / extend regression fails here. */
+TEST(get_interest_stability_future_does_not_extend_smaller_wake)
+{
+    g_recovery_fake_now_us = 1000000000ULL;
+    mqvpn_client_t *c = make_recovery_test_client();
+    mqvpn_path_handle_t h = mqvpn_client_add_path_fd(c, 42, NULL);
+    ASSERT_NE(h, (mqvpn_path_handle_t)-1);
+
+    ASSERT_EQ(mqvpn_client_test_force_established(c), 0);
+    ASSERT_EQ(mqvpn_client_test_set_next_wake_us(c, 8ULL * 1000000), 0);
+    /* stable_at = base + 20s -> sms = 20000, deliberately LARGER than 8000. */
+    ASSERT_EQ(mqvpn_client_test_set_path_stable_us(
+                  c, h, g_recovery_fake_now_us - 10ULL * 1000000, 1),
+              0);
+
+    mqvpn_interest_t i = {0};
+    i.struct_size = sizeof(i);
+    ASSERT_EQ(mqvpn_client_get_interest(c, &i), MQVPN_OK);
+    ASSERT_EQ(i.next_timer_ms, 8000); /* unchanged — never extended to 20000 */
 
     mqvpn_client_destroy(c);
 }
@@ -1753,11 +2761,16 @@ main(void)
     run_config_load_json();
     run_config_load_json_duplicate_users_last_wins();
     run_config_load_json_invalid_users();
+    run_config_load_json_users_brace_in_string_value();
     run_config_load_json_invalid_tuning();
+    run_config_set_tls_server_name();
     run_config_set_insecure();
     run_config_set_tun_mtu();
     run_config_set_scheduler();
     run_config_set_cc();
+    run_config_load_json_reinjection();
+    run_config_set_reinjection();
+    run_config_set_reinjection_deadline_params();
     run_config_set_init_max_path_id();
     run_config_set_log_level();
     run_config_set_reconnect();
@@ -1767,6 +2780,7 @@ main(void)
     run_config_set_tls_cert();
     run_config_set_max_clients();
     run_config_set_multipath();
+    run_config_set_hybrid();
 
     /* ABI tests */
     run_callbacks_abi_init();
@@ -1794,6 +2808,8 @@ main(void)
     /* Query tests */
     run_client_get_state_null();
     run_client_get_stats();
+    run_client_get_reorder_stats_null_args();
+    run_client_get_reorder_stats_zero_fill_when_unconnected();
     run_client_get_interest();
 
     /* Path management tests */
@@ -1832,6 +2848,7 @@ main(void)
     run_activation_failure_invalid_handle_returns_error();
     run_activation_failure_eventually_closes_path();
     run_cb_path_removed_validating_to_create_wait();
+    run_remove_live_primary_emits_abandon();
 
     /* path_event close-out semantics */
     run_remove_path_emits_closed_event_when_active();
@@ -1858,8 +2875,47 @@ main(void)
     run_handshake_stall_only_in_connecting_state();
     run_client_set_state_to_connecting_records_handshake_start();
     run_client_set_state_leaving_connecting_clears_handshake_start();
+
+    /* CONNECT-IP failure classification */
+    run_classify_status_401_is_auth();
+    run_classify_status_403_is_auth();
+    run_classify_status_404_is_protocol();
+    run_classify_status_500_is_protocol();
+    run_classify_status_zero_is_protocol();
+    run_connect_fail_signals_tunnel_closed_exactly_once();
+    run_conn_close_skips_closed_after_connect_fail();
+    run_conn_close_fires_closed_when_not_latched();
+
+    /* CONNECT-IP :status scan hardening + close classification */
+    run_headers_duplicate_status_first_final_wins();
+    run_headers_status_after_failure_latch_ignored();
+    run_headers_status_across_sections_first_wins();
+    run_headers_interim_1xx_not_a_failure();
+    run_headers_malformed_status_length_latches_failure();
+    run_reorder_echo_ignored_outside_deciding_200_section();
+    run_reorder_echo_in_deciding_200_section_sets_flag();
+    run_request_close_during_local_shutdown_keeps_closed_reason();
+    run_request_close_server_rst_still_signals_protocol();
+#ifdef MQVPN_HYBRID_TCP_LANE_ENABLED
+    run_client_new_warns_tcp_max_flows_above_pool_bound();
+    run_client_new_quiet_tcp_max_flows_at_pool_bound();
+    run_client_new_warn_keys_on_sanitized_flows();
+#endif
+
     run_client_set_state_reconnecting_clears_handshake_start();
     run_get_interest_includes_handshake_stall_deadline();
+
+    /* get_interest Recovery timer: CREATE_WAIT retry-deadline wake (220a2e6) */
+    run_get_interest_recovery_create_wait_future_clamps_wake();
+    run_get_interest_recovery_create_wait_past_forces_1ms();
+    run_get_interest_recovery_ignores_slot_without_retry_deadline();
+    run_get_interest_recovery_inert_when_not_established();
+    run_get_interest_stability_future_clamps_wake();
+    run_get_interest_stability_past_forces_1ms();
+    run_get_interest_stability_ignores_dead_path();
+    run_get_interest_stability_two_paths_takes_min_deadline();
+    run_get_interest_stability_overdue_wins_over_future_path();
+    run_get_interest_stability_future_does_not_extend_smaller_wake();
 
     /* Path reactivation tests */
     run_reactivate_path_null_client();

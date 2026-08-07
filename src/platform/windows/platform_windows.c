@@ -17,7 +17,9 @@
 
 #  include "platform_internal_win.h"
 #  include "platform_windows.h"
+#  include "net_mon.h"
 #  include "log.h"
+#  include "mqvpn_internal.h" /* mqvpn_config_apply_hybrid (INI [Hybrid] bridge) */
 
 #  include <stdio.h>
 #  include <stdlib.h>
@@ -50,7 +52,7 @@ static platform_win_ctx_t *g_signal_ctx = NULL;
  *
  * Internal log level is WRN; the caller decides whether failure is fatal.
  */
-static int
+int
 win_pin_socket_to_iface(int fd, const char *friendly_name, ADDRESS_FAMILY af)
 {
     wchar_t wname[IF_MAX_STRING_SIZE + 1];
@@ -108,7 +110,6 @@ win_pin_socket_to_iface(int fd, const char *friendly_name, ADDRESS_FAMILY af)
  * ================================================================ */
 
 static void on_tun_read(evutil_socket_t fd, short what, void *arg);
-static void on_socket_read(evutil_socket_t fd, short what, void *arg);
 
 static void
 cb_tun_output(const uint8_t *pkt, size_t len, void *user_ctx)
@@ -211,6 +212,15 @@ cb_tunnel_config_ready(const mqvpn_tunnel_info_t *info, void *user_ctx)
 
     /* Tell library the TUN is active */
     mqvpn_client_set_tun_active(p->client, 1, -1);
+
+    /* Start periodic dropped-path recovery poll (Linux canon:
+     * platform_linux.c's ev_recover). Create-if-absent because
+     * cb_tunnel_config_ready re-fires on reconnect. */
+    if (!p->ev_recover) p->ev_recover = evtimer_new(p->eb, recover_dropped_paths_cb, p);
+    if (p->ev_recover) {
+        struct timeval tv = {.tv_sec = RECOVER_INTERVAL_SEC};
+        event_add(p->ev_recover, &tv);
+    }
     return;
 
 fail:
@@ -254,6 +264,12 @@ cb_state_changed(mqvpn_client_state_t old_state, mqvpn_client_state_t new_state,
     LOG_INF("state: %s -> %s", os, ns);
 
     if (new_state == MQVPN_STATE_RECONNECTING || new_state == MQVPN_STATE_CLOSED) {
+        /* Pause the recovery poll and reset its failure budget — reused on
+         * reconnect. route_gate_blocked is intentionally left untouched;
+         * it self-resets in the reconciler (net_mon.c) when a route
+         * reappears, per the field comment in platform_internal_win.h. */
+        if (p->ev_recover) event_del(p->ev_recover);
+        memset(p->path_recover_failures, 0, sizeof(p->path_recover_failures));
         win_cleanup_killswitch(p);
         if (p->manage_routes) win_cleanup_routes(p);
         win_cleanup_dns(p);
@@ -314,7 +330,7 @@ cb_reconnect_scheduled(int delay_sec, void *user_ctx)
 
 static void on_tick_timer(evutil_socket_t fd, short what, void *arg);
 
-static void
+void
 schedule_next_tick(platform_win_ctx_t *p)
 {
     mqvpn_interest_t interest;
@@ -381,9 +397,18 @@ on_tun_read(evutil_socket_t fd, short what, void *arg)
             break;
         }
     }
+
+    /* The sends above updated the engine's requested wake (pacing flush,
+     * PTO) — drive the engine and re-arm the tick from it, exactly as
+     * on_socket_read does. Without this, outbound-only traffic leaves the
+     * old timer armed: if the sent packet is lost, no ACK arrives to
+     * re-arm, and the PTO probe waits on the stale (possibly seconds-out)
+     * timer. */
+    mqvpn_client_tick(p->client);
+    schedule_next_tick(p);
 }
 
-static void
+void
 on_socket_read(evutil_socket_t fd, short what, void *arg)
 {
     (void)what;
@@ -536,6 +561,8 @@ win_platform_run_client(const mqvpn_client_cfg_t *cfg)
     }
 
     mqvpn_config_set_server(lib_cfg, cfg->server_addr, cfg->server_port);
+    if (cfg->tls_server_name)
+        mqvpn_config_set_tls_server_name(lib_cfg, cfg->tls_server_name);
     if (cfg->auth_key) mqvpn_config_set_auth_key(lib_cfg, cfg->auth_key);
     mqvpn_config_set_insecure(lib_cfg, cfg->insecure);
     mqvpn_config_set_multipath(lib_cfg, cfg->n_paths > 1 ? 1 : 0);
@@ -554,7 +581,16 @@ win_platform_run_client(const mqvpn_client_cfg_t *cfg)
     }
     mqvpn_config_set_scheduler(lib_cfg, lib_sched);
     mqvpn_config_set_cc(lib_cfg, (mqvpn_cc_t)cfg->cc);
+    mqvpn_config_set_reinjection(lib_cfg, (mqvpn_reinjection_t)cfg->reinjection);
+    mqvpn_config_set_reinjection_deadline_params(lib_cfg, cfg->reinj_srtt_factor_pct,
+                                                 cfg->reinj_hard_deadline_ms,
+                                                 cfg->reinj_deadline_lower_bound_ms);
     mqvpn_config_set_tun_mtu(lib_cfg, cfg->tun_mtu);
+    mqvpn_config_apply_reorder(lib_cfg,
+                               &cfg->reorder); /* INI [Reorder]/[ReorderRule] bridge */
+    mqvpn_config_apply_hybrid(lib_cfg, &cfg->hybrid); /* INI [Hybrid] bridge */
+    if (cfg->recv_rate_limit)
+        mqvpn_config_set_recv_rate_limit(lib_cfg, cfg->recv_rate_limit);
 
     /* Create callbacks */
     mqvpn_client_callbacks_t cbs = MQVPN_CLIENT_CALLBACKS_INIT;
@@ -685,6 +721,11 @@ cleanup:
     if (ctx.ev_tick) {
         event_del(ctx.ev_tick);
         event_free(ctx.ev_tick);
+    }
+
+    if (ctx.ev_recover) {
+        event_del(ctx.ev_recover);
+        event_free(ctx.ev_recover);
     }
 
     mqvpn_path_mgr_destroy(&ctx.path_mgr);

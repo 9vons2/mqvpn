@@ -70,6 +70,22 @@ const latestAggregate = computed(() => {
 
 </ClientOnly>
 
+## ハイブリッド TCP レーン集約（v0.9.0）
+
+<p class="section-desc">対称 2×100 Mbit / 25 ms、TCP 上り、<code>iperf3 -P {1,2,4,8,16}</code>、3 回。</p>
+
+ハイブリッドの TCP **ストリームレーン**はクライアント側で TCP を終端し、順序保証つきの QUIC STREAM で中継します。そのため単一フローでも両パスを集約でき、全ストリーム数で **~187 Mbps**（200 Mbps 集約上限の約 93 %）に到達します。一方、生のマルチパス（データグラムトンネリング）は単一フローがパス間の並べ替えでバックオフするため、並列ストリームが増えて初めて追いつきます（WLB <code>-P 1</code>：96 → 187 Mbps、**+95 %**）。
+
+![ハイブリッド TCP レーン — MinRTT スケジューラ](/img/bench-hybrid-minrtt.png)
+
+![ハイブリッド TCP レーン — WLB スケジューラ](/img/bench-hybrid-wlb.png)
+
+**非対称パス** — 同じベンチを非対称 A = 300 Mbit / 10 ms + B = 80 Mbit / 30 ms（集約 380 Mbps）で実施。ハイブリッド ON は非対称パスでも集約を飽和させ、<code>-P ≥ 2</code> で **350–357 Mbps**（380 Mbps の約 93 %）に到達します。一方、生のマルチパスはここでは追いつききれません。WLB はパス間の並べ替えペナルティ（RTT 20 ms と 60 ms の差）により 16 ストリームでも 330 Mbps で頭打ちになり、MinRTT は cwnd が詰まったときしか遅い側へあふれない設計のため、ほぼ高速パス単独（~275 Mbps）に留まります。そのため対称構成と異なり、レーンの利得は全ストリーム数で持続します：MinRTT **+29–35 %**、WLB **+26 %**（<code>-P 1</code>）→ **+7 %**（<code>-P 16</code>）。
+
+![ハイブリッド TCP レーン（非対称パス）— MinRTT スケジューラ](/img/bench-hybrid-asym-minrtt.png)
+
+![ハイブリッド TCP レーン（非対称パス）— WLB スケジューラ](/img/bench-hybrid-asym-wlb.png)
+
 <style scoped>
 .page-desc {
   font-size: 0.9em;

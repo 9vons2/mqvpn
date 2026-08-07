@@ -171,10 +171,33 @@ MQVPN_INTERNAL int path_is_real_transition(mqvpn_path_status_t old,
 /* PR4 - Path retry/stability constants (relocated from mqvpn_client.c).
  * Both mqvpn_client.c (for logging) and path_state_machine.c (for retry
  * helper + stable timer) need these. */
-#define PATH_RECREATE_DELAY_US     (5ULL * 1000000)  /* 5 sec initial */
-#define PATH_RECREATE_MAX_DELAY_US (60ULL * 1000000) /* 60 sec max backoff */
-#define PATH_RECREATE_MAX_RETRIES  6                 /* max consecutive failures */
-#define PATH_STABLE_THRESHOLD_US   (30ULL * 1000000) /* 30 sec to confirm stable */
+/* Mobile-blink tuning (fork). Upstream's schedule (5s initial, 60s ceiling,
+ * budget reset only after 30s continuously up, hard stop after 6 failures) is
+ * sized for links that fail rarely and stay failed. Links used in motion —
+ * Starlink obstruction/handover, cellular handover — die and recover on a
+ * far shorter cycle, and critically they often die while the OS still reports
+ * the network as up, so no platform event arrives to rescue the slot.
+ *
+ * With the upstream numbers such a link never reaches the 30s stability
+ * window, so the retry budget never resets: the backoff escalates toward 60s
+ * and the slot is abandoned into CLOSED_RECOVERABLE with its retry timer
+ * disarmed — losing the path exactly when both links are needed.
+ *
+ * These values retry fast and forgive quickly. The budget stays under the 32
+ * failures that tests/test_api.c hammers when asserting a path eventually
+ * reaches CLOSED, so the exhaustion contract is preserved. Retries only run
+ * while the fd is still platform-attached, so a genuinely removed interface
+ * still leaves via PLATFORM_DROP rather than spinning here. */
+#define PATH_RECREATE_DELAY_US     (1ULL * 1000000)  /* 1 sec initial  (was 5)  */
+#define PATH_RECREATE_MAX_DELAY_US (15ULL * 1000000) /* 15 sec ceiling (was 60) */
+#define PATH_RECREATE_MAX_RETRIES  30                /* ~7 min persistent (was 6) */
+/* Left at upstream's 30s: the stability window only governs how fast the retry
+ * budget is forgiven, and a 30-failure budget already defangs the exhaustion
+ * case. Lowering it would also invalidate the get_interest stability tests,
+ * which seed their offsets relative to this exact window. Full immunity to
+ * abandonment is handled above the library, by re-activating paths whose
+ * interface the platform still reports as present. */
+#define PATH_STABLE_THRESHOLD_US (30ULL * 1000000) /* 30 sec to confirm stable */
 
 /* PR4 - Relocated from mqvpn_client.c (originally static). path_on_event()
  * body and the residual callsites that still emit explicit reason tags

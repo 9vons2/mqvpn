@@ -3,12 +3,16 @@
 
 package com.mqvpn.sdk.core
 
+import android.os.Parcel
 import com.mqvpn.sdk.core.model.MqvpnConfig
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 
+@RunWith(RobolectricTestRunner::class)
 class MqvpnConfigTest {
 
     @Test
@@ -18,6 +22,7 @@ class MqvpnConfigTest {
             authKey = "test-key",
         )
         assertEquals(443, config.serverPort)
+        assertEquals(null, config.tlsServerName)
         assertFalse(config.insecure)
         assertTrue(config.multipathEnabled)
         assertEquals(MqvpnConfig.Scheduler.MIN_RTT, config.scheduler)
@@ -32,6 +37,7 @@ class MqvpnConfigTest {
         val config = MqvpnConfig(
             serverAddress = "10.0.0.1",
             serverPort = 8443,
+            tlsServerName = "vpn.example.com",
             authKey = "secret-key-123",
             insecure = true,
             multipathEnabled = false,
@@ -61,5 +67,89 @@ class MqvpnConfigTest {
         assertEquals(1, MqvpnConfig.LogLevel.INFO.native)
         assertEquals(2, MqvpnConfig.LogLevel.WARN.native)
         assertEquals(3, MqvpnConfig.LogLevel.ERROR.native)
+    }
+
+    @Test
+    fun reorderFields_defaultsAreOff() {
+        val c = MqvpnConfig(serverAddress = "h", authKey = "k")
+        assertFalse(c.reorderEnabled)
+        assertEquals(MqvpnConfig.ReorderProfile.CELLULAR_BOND, c.reorderProfile)
+        assertTrue(c.reorderPorts.isEmpty())
+    }
+
+    @Test
+    fun reorderFields_jsonRoundTrip() {
+        val c = MqvpnConfig(serverAddress = "h", authKey = "k",
+            reorderEnabled = true, reorderProfile = MqvpnConfig.ReorderProfile.FIBER_LTE,
+            reorderPorts = listOf(443, 853))
+        val back = MqvpnConfig.fromJson(c.toJson())
+        assertEquals(c, back)
+        assertEquals(4, back.reorderProfile.native)
+    }
+
+    @Test
+    fun oldJsonWithoutReorderFields_decodesWithDefaults() {
+        val oldJson = """{"serverAddress":"h","authKey":"k"}"""
+        val c = MqvpnConfig.fromJson(oldJson)
+        assertFalse(c.reorderEnabled)
+        assertTrue(c.reorderPorts.isEmpty())
+    }
+
+    @Test
+    fun reorderFields_parcelRoundTrip() {
+        val c = MqvpnConfig(serverAddress = "h", authKey = "k",
+            reorderEnabled = true, reorderProfile = MqvpnConfig.ReorderProfile.FIBER_LTE,
+            reorderPorts = listOf(443, 853))
+        val p = Parcel.obtain()
+        p.writeParcelable(c, 0)
+        p.setDataPosition(0)
+        @Suppress("DEPRECATION")
+        val back = p.readParcelable<MqvpnConfig>(MqvpnConfig::class.java.classLoader)
+        p.recycle()
+        assertEquals(c, back)
+    }
+
+    @Test
+    fun hybridFields_defaultsAreOff() {
+        val c = MqvpnConfig(serverAddress = "h", authKey = "k")
+        assertFalse(c.hybridEnabled)
+        assertEquals(MqvpnConfig.HybridTcpMode.AUTO, c.hybridTcpMode)
+    }
+
+    @Test
+    fun hybridFields_jsonRoundTrip() {
+        val c = MqvpnConfig(serverAddress = "h", authKey = "k",
+            hybridEnabled = true, hybridTcpMode = MqvpnConfig.HybridTcpMode.RAW)
+        val back = MqvpnConfig.fromJson(c.toJson())
+        assertEquals(c, back)
+        assertEquals(1, back.hybridTcpMode.native)
+    }
+
+    @Test
+    fun `hybrid tcp mode native values are correct`() {
+        assertEquals(0, MqvpnConfig.HybridTcpMode.STREAM.native)
+        assertEquals(1, MqvpnConfig.HybridTcpMode.RAW.native)
+        assertEquals(2, MqvpnConfig.HybridTcpMode.AUTO.native)
+    }
+
+    @Test
+    fun oldJsonWithoutHybridFields_decodesWithDefaults() {
+        val oldJson = """{"serverAddress":"h","authKey":"k"}"""
+        val c = MqvpnConfig.fromJson(oldJson)
+        assertFalse(c.hybridEnabled)
+        assertEquals(MqvpnConfig.HybridTcpMode.AUTO, c.hybridTcpMode)
+    }
+
+    @Test
+    fun hybridFields_parcelRoundTrip() {
+        val c = MqvpnConfig(serverAddress = "h", authKey = "k",
+            hybridEnabled = true, hybridTcpMode = MqvpnConfig.HybridTcpMode.RAW)
+        val p = Parcel.obtain()
+        p.writeParcelable(c, 0)
+        p.setDataPosition(0)
+        @Suppress("DEPRECATION")
+        val back = p.readParcelable<MqvpnConfig>(MqvpnConfig::class.java.classLoader)
+        p.recycle()
+        assertEquals(c, back)
     }
 }

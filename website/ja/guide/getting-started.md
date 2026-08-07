@@ -1,6 +1,6 @@
 # はじめに
 
-mqvpn は MASQUE CONNECT-IP (RFC 9484) を使用し、Multipath QUIC 上で標準準拠の IP トンネリングを実現するマルチパス QUIC VPN です。
+mqvpn は MASQUE CONNECT-IP (RFC 9484) と、Multipath QUIC をベースとしたL3 マルチパス VPN です。
 
 ## インストール
 
@@ -45,6 +45,10 @@ sudo dpkg -i mqvpn_*.deb
 ### Windows クライアント
 
 Windows amd64 / arm64 向けにビルド済みバイナリを配布しています。[Releases](https://github.com/mp0rta/mqvpn/releases/latest) から `mqvpn_<VERSION>_windows_<ARCH>.zip` をダウンロードし、展開して同梱の `README.txt` に従ってください（管理者 PowerShell 必須）。
+
+### macOS クライアント
+
+Apple silicon (arm64) 向けにビルド済みバイナリを配布しています。[Releases](https://github.com/mp0rta/mqvpn/releases/latest) から `mqvpn_<VERSION>_darwin_arm64.tar.gz` をダウンロードし、展開して同梱の `README.txt` に従ってください（sudo 必須）。
 
 ### ソースからビルド
 
@@ -102,6 +106,7 @@ mqvpn --mode client|server [options]
   --auth-key KEY         PSK 認証
   --user NAME:KEY        ユーザー個別の PSK（複数指定可、サーバー）
   --dns ADDR             DNS サーバー（複数指定可）
+  --tls-server-name NAME TLS SNI / 証明書検証名（クライアント）
   --insecure             信頼されていない証明書を受け入れる（テスト用）
   --tun-name NAME        TUN デバイス名（デフォルト: mqvpn0）
   --listen BIND:PORT     リッスンアドレス（サーバー、デフォルト: 0.0.0.0:443）
@@ -109,7 +114,10 @@ mqvpn --mode client|server [options]
   --subnet6 CIDR         クライアント IPv6 プール（サーバー）
   --cert PATH            TLS 証明書（サーバー）
   --key PATH             TLS 秘密鍵（サーバー）
-  --scheduler minrtt|wlb マルチパススケジューラ（デフォルト: wlb）
+  --scheduler SCHED      マルチパススケジューラ: minrtt|wlb|wlb_udp_pin|backup_fec
+                         （デフォルト: wlb）
+  --cc ALGO              輻輳制御アルゴリズム: bbr2|bbr|cubic|none（デフォルト: bbr2）
+  --mtu N                TUN MTU（1280-9000、デフォルト: auto）
   --max-clients N        最大同時接続クライアント数（サーバー、デフォルト: 64）
   --control-port PORT    Control API の TCP ポート（サーバー）
   --control-addr ADDR    Control API のバインドアドレス（デフォルト: 127.0.0.1）
@@ -117,7 +125,9 @@ mqvpn --mode client|server [options]
   --log-level LVL        ログレベル（debug|info|warn|error）
   --no-reconnect         自動再接続を無効化（クライアント）
   --kill-switch          VPN 外への通信を遮断（クライアント）
+  --no-manage-routes     ホストのルーティングテーブルを変更しない（クライアント）
   --genkey               PSK を生成して終了
+  --version              バージョンを表示して終了
   --help                 すべてのオプションを表示
 ```
 

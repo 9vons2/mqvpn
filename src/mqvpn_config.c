@@ -9,6 +9,7 @@
 
 #include "libmqvpn.h"
 #include "mqvpn_internal.h"
+#include "mqvpn_sched_names.h"
 #include "json_mini.h"
 
 #include <stdlib.h>
@@ -56,131 +57,79 @@ json_read_string_array(const char *p, char out[][32], int max_items, int *n_item
 }
 
 static int
+json_add_user_cb(void *ctx, const char *name, const char *key)
+{
+    return (mqvpn_config_add_user((mqvpn_config_t *)ctx, name, key) == MQVPN_OK) ? 0 : -1;
+}
+
+static int
 json_read_users(mqvpn_config_t *cfg, const char *p)
 {
     if (!cfg || !p || *p != '[') return MQVPN_ERR_INVALID_ARG;
-    p = json_skip_ws(p + 1);
     cfg->n_users = 0;
-
-    while (*p && *p != ']') {
-        char uname[64] = {0};
-        char key[256] = {0};
-
-        if (*p == '"') {
-            char pair[320] = {0};
-            if (json_read_string(p, pair, sizeof(pair)) != MQVPN_OK) {
-                return MQVPN_ERR_INVALID_ARG;
-            }
-            char *sep = strchr(pair, ':');
-            if (!sep) return MQVPN_ERR_INVALID_ARG;
-            *sep = '\0';
-            mqvpn_copy_str(uname, sizeof(uname), pair);
-            mqvpn_copy_str(key, sizeof(key), sep + 1);
-
-            const char *e = p + 1;
-            while (*e && *e != '"') {
-                if (*e == '\\' && e[1]) e++;
-                e++;
-            }
-            if (*e != '"') return MQVPN_ERR_INVALID_ARG;
-            p = json_skip_ws(e + 1);
-        } else if (*p == '{') {
-            const char *obj_end = strchr(p, '}');
-            if (!obj_end) return MQVPN_ERR_INVALID_ARG;
-
-            char obj[512];
-            size_t obj_len = (size_t)(obj_end - p + 1);
-            if (obj_len >= sizeof(obj)) return MQVPN_ERR_INVALID_ARG;
-            memcpy(obj, p, obj_len);
-            obj[obj_len] = '\0';
-
-            const char *name_val = json_find_key(obj, "name");
-            const char *key_val = json_find_key(obj, "key");
-            if (!name_val || !key_val) return MQVPN_ERR_INVALID_ARG;
-            if (json_read_string(name_val, uname, sizeof(uname)) != MQVPN_OK) {
-                return MQVPN_ERR_INVALID_ARG;
-            }
-            if (json_read_string(key_val, key, sizeof(key)) != MQVPN_OK) {
-                return MQVPN_ERR_INVALID_ARG;
-            }
-
-            p = json_skip_ws(obj_end + 1);
-        } else {
-            return MQVPN_ERR_INVALID_ARG;
-        }
-
-        if (mqvpn_config_add_user(cfg, uname, key) != MQVPN_OK) {
-            return MQVPN_ERR_INVALID_ARG;
-        }
-
-        if (*p == ',') {
-            p = json_skip_ws(p + 1);
-        } else if (*p != ']') {
-            return MQVPN_ERR_INVALID_ARG;
-        }
-    }
-
-    return (*p == ']') ? MQVPN_OK : MQVPN_ERR_INVALID_ARG;
+    return (mqvpn_json_parse_users(p, cfg, json_add_user_cb) == 0)
+               ? MQVPN_OK
+               : MQVPN_ERR_INVALID_ARG;
 }
 
+/* JSON path deliberately does NOT gate "backup_fec" on XQC_ENABLE_FEC (that
+ * gate lives only at the main.c CLI call site) — known, intentional drift
+ * per mqvpn_sched_names.h's header comment; config format is a compat
+ * surface, do not unify. */
 static int
 parse_scheduler_name(const char *s, mqvpn_scheduler_t *out)
 {
     if (!s || !out) return MQVPN_ERR_INVALID_ARG;
-    if (strcmp(s, "minrtt") == 0) {
-        *out = MQVPN_SCHED_MINRTT;
-        return MQVPN_OK;
-    }
-    if (strcmp(s, "wlb") == 0) {
-        *out = MQVPN_SCHED_WLB;
-        return MQVPN_OK;
-    }
-    if (strcmp(s, "wlb_udp_pin") == 0) {
-        *out = MQVPN_SCHED_WLB_UDP_PIN;
-        return MQVPN_OK;
-    }
-    if (strcmp(s, "backup_fec") == 0) {
-        *out = MQVPN_SCHED_BACKUP_FEC;
-        return MQVPN_OK;
-    }
-    return MQVPN_ERR_INVALID_ARG;
+    int v = mqvpn_sched_from_name(s);
+    if (v < 0) return MQVPN_ERR_INVALID_ARG;
+    *out = (mqvpn_scheduler_t)v;
+    return MQVPN_OK;
 }
 
 static int
 parse_cc_name(const char *s, mqvpn_cc_t *out)
 {
     if (!s || !out) return MQVPN_ERR_INVALID_ARG;
-    if (strcmp(s, "bbr2") == 0) {
-        *out = MQVPN_CC_BBR2;
-        return MQVPN_OK;
-    }
-    if (strcmp(s, "bbr") == 0) {
-        *out = MQVPN_CC_BBR;
-        return MQVPN_OK;
-    }
-    if (strcmp(s, "cubic") == 0) {
-        *out = MQVPN_CC_CUBIC;
-        return MQVPN_OK;
-    }
-    if (strcmp(s, "none") == 0) {
-        *out = MQVPN_CC_NONE;
-        return MQVPN_OK;
-    }
-    return MQVPN_ERR_INVALID_ARG;
+    int v = mqvpn_cc_from_name(s);
+    if (v < 0) return MQVPN_ERR_INVALID_ARG;
+    *out = (mqvpn_cc_t)v;
+    return MQVPN_OK;
+}
+
+static int
+parse_reinj_name(const char *s, mqvpn_reinjection_t *out)
+{
+    if (!s || !out) return MQVPN_ERR_INVALID_ARG;
+    int v = mqvpn_reinj_from_name(s);
+    if (v < 0) return MQVPN_ERR_INVALID_ARG;
+    *out = (mqvpn_reinjection_t)v;
+    return MQVPN_OK;
+}
+
+/* Shared by the JSON loader and the public setter (ranges must not drift
+ * between the two; the INI layer keeps its own cfgk_* validators). */
+static int
+reinj_factor_pct_ok(int v)
+{
+    return v >= 100 && v <= 1000;
+}
+
+static int
+reinj_deadline_ms_ok(int v)
+{
+    return v >= 1 && v <= 60000;
 }
 
 static int
 is_valid_scheduler(mqvpn_scheduler_t sched)
 {
-    return sched == MQVPN_SCHED_MINRTT || sched == MQVPN_SCHED_WLB ||
-           sched == MQVPN_SCHED_BACKUP_FEC || sched == MQVPN_SCHED_WLB_UDP_PIN;
+    return mqvpn_sched_is_valid(sched);
 }
 
 static int
 is_valid_cc(mqvpn_cc_t cc)
 {
-    return cc == MQVPN_CC_BBR2 || cc == MQVPN_CC_BBR || cc == MQVPN_CC_CUBIC ||
-           cc == MQVPN_CC_NONE;
+    return mqvpn_cc_is_valid(cc);
 }
 
 /* ─── Config new/free ─── */
@@ -205,6 +154,9 @@ mqvpn_config_new(void)
     /* §16: reorder shim defaults (mode OFF until explicitly enabled). */
     mqvpn_reorder_config_default(&cfg->reorder);
 
+    /* H1: hybrid classifier defaults (disabled until explicitly enabled). */
+    mqvpn_hybrid_config_default(&cfg->hybrid);
+
     return cfg;
 }
 
@@ -224,6 +176,17 @@ mqvpn_config_set_server(mqvpn_config_t *cfg, const char *host, int port)
 
     snprintf(cfg->server_host, sizeof(cfg->server_host), "%s", host);
     cfg->server_port = port;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_tls_server_name(mqvpn_config_t *cfg, const char *name)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    if (name)
+        snprintf(cfg->tls_server_name, sizeof(cfg->tls_server_name), "%s", name);
+    else
+        cfg->tls_server_name[0] = '\0';
     return MQVPN_OK;
 }
 
@@ -310,6 +273,11 @@ mqvpn_config_load_json(mqvpn_config_t *cfg, const char *json_text)
         cfg->server_port = iv;
     }
 
+    v = json_find_key(json_text, "tls_server_name");
+    if (v && json_read_string(v, tmp, sizeof(tmp)) == MQVPN_OK) {
+        mqvpn_copy_str(cfg->tls_server_name, sizeof(cfg->tls_server_name), tmp);
+    }
+
     v = json_find_key(json_text, "auth_key");
     if (v && json_read_string(v, tmp, sizeof(tmp)) == MQVPN_OK) {
         mqvpn_copy_str(cfg->auth_key, sizeof(cfg->auth_key), tmp);
@@ -376,6 +344,43 @@ mqvpn_config_load_json(mqvpn_config_t *cfg, const char *json_text)
             return MQVPN_ERR_INVALID_ARG;
         }
         cfg->cc = cc;
+    }
+
+    /* Reinjection — hard error on unrecognized mode / out-of-range numeric
+     * params (unlike the INI/main.c surface, which warns and falls back to
+     * "off"; the JSON surface follows the same hard-error precedent as
+     * "scheduler"/"cc" above). Absent keys keep the off/110/500/20 defaults. */
+    v = json_find_key(json_text, "reinjection");
+    if (v && json_read_string(v, tmp, sizeof(tmp)) == MQVPN_OK) {
+        mqvpn_reinjection_t reinj = MQVPN_REINJ_OFF;
+        if (parse_reinj_name(tmp, &reinj) != MQVPN_OK) {
+            return MQVPN_ERR_INVALID_ARG;
+        }
+        cfg->reinjection = reinj;
+    }
+
+    v = json_find_key(json_text, "reinjection_srtt_factor_pct");
+    if (v) {
+        if (json_read_int_strict(v, &iv) != 0 || !reinj_factor_pct_ok(iv)) {
+            return MQVPN_ERR_INVALID_ARG;
+        }
+        cfg->reinj_srtt_factor_pct = iv;
+    }
+
+    v = json_find_key(json_text, "reinjection_hard_deadline_ms");
+    if (v) {
+        if (json_read_int_strict(v, &iv) != 0 || !reinj_deadline_ms_ok(iv)) {
+            return MQVPN_ERR_INVALID_ARG;
+        }
+        cfg->reinj_hard_deadline_ms = iv;
+    }
+
+    v = json_find_key(json_text, "reinjection_deadline_lower_bound_ms");
+    if (v) {
+        if (json_read_int_strict(v, &iv) != 0 || !reinj_deadline_ms_ok(iv)) {
+            return MQVPN_ERR_INVALID_ARG;
+        }
+        cfg->reinj_deadline_lower_bound_ms = iv;
     }
 
     v = json_find_key(json_text, "reconnect_enable");
@@ -457,6 +462,30 @@ mqvpn_config_set_cc(mqvpn_config_t *cfg, mqvpn_cc_t cc)
     if (!cfg) return MQVPN_ERR_INVALID_ARG;
     if (!is_valid_cc(cc)) return MQVPN_ERR_INVALID_ARG;
     cfg->cc = cc;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_reinjection(mqvpn_config_t *cfg, mqvpn_reinjection_t mode)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    if (!mqvpn_reinj_is_valid(mode)) return MQVPN_ERR_INVALID_ARG;
+    cfg->reinjection = mode;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_reinjection_deadline_params(mqvpn_config_t *cfg, int srtt_factor_pct,
+                                             int hard_deadline_ms,
+                                             int deadline_lower_bound_ms)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    if (!reinj_factor_pct_ok(srtt_factor_pct)) return MQVPN_ERR_INVALID_ARG;
+    if (!reinj_deadline_ms_ok(hard_deadline_ms)) return MQVPN_ERR_INVALID_ARG;
+    if (!reinj_deadline_ms_ok(deadline_lower_bound_ms)) return MQVPN_ERR_INVALID_ARG;
+    cfg->reinj_srtt_factor_pct = srtt_factor_pct;
+    cfg->reinj_hard_deadline_ms = hard_deadline_ms;
+    cfg->reinj_deadline_lower_bound_ms = deadline_lower_bound_ms;
     return MQVPN_OK;
 }
 
@@ -668,4 +697,116 @@ mqvpn_config_apply_reorder(mqvpn_config_t *cfg, const mqvpn_reorder_config_t *sr
     int eval = cfg->reorder.eval_force_no_demotion; /* internal-only, not bridged */
     cfg->reorder = *src; /* scalars, has_explicit_*, rules incl. explicit_*, n_rules */
     cfg->reorder.eval_force_no_demotion = eval;
+}
+
+/* ─── Hybrid setters (H1) ───
+ *
+ * The public setters take plain int/uint32_t so libmqvpn.h stays free of the
+ * internal hybrid/classifier.h enum. The 0/1/2 ↔ enum mapping is pinned below. */
+
+_Static_assert(MQVPN_HYBRID_TCP_STREAM == 0 && MQVPN_HYBRID_TCP_RAW == 1 &&
+                   MQVPN_HYBRID_TCP_AUTO == 2,
+               "public setter doc pins tcp mode values 0=stream 1=raw 2=auto");
+
+int
+mqvpn_config_set_hybrid_enabled(mqvpn_config_t *cfg, int enabled)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    cfg->hybrid.enabled = enabled ? 1 : 0;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_hybrid_tcp_mode(mqvpn_config_t *cfg, int mode)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    /* Range-check the raw int BEFORE casting to the internal enum. */
+    if (mode < 0 || mode > (int)MQVPN_HYBRID_TCP_AUTO) return MQVPN_ERR_INVALID_ARG;
+    cfg->hybrid.tcp_mode = (mqvpn_hybrid_tcp_mode_t)mode;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_hybrid_limits(mqvpn_config_t *cfg, uint32_t tcp_max_flows,
+                               uint32_t tcp_idle_timeout_sec)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    /* mqvpn_hybrid_config_validate semantics: max_flows == 0 is invalid. */
+    if (tcp_max_flows == 0) return MQVPN_ERR_INVALID_ARG;
+    cfg->hybrid.tcp_max_flows = tcp_max_flows;
+    cfg->hybrid.tcp_idle_timeout_sec = tcp_idle_timeout_sec;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_recv_rate_limit(mqvpn_config_t *cfg, uint64_t bytes_per_sec)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    /* Over-range rates overflow the transport's rate x srtt(us) u64
+     * window product — see MQVPN_RECV_RATE_LIMIT_MAX (libmqvpn.h). */
+    if (bytes_per_sec > MQVPN_RECV_RATE_LIMIT_MAX) return MQVPN_ERR_INVALID_ARG;
+    cfg->recv_rate_limit = bytes_per_sec;
+    return MQVPN_OK;
+}
+
+void
+mqvpn_config_apply_hybrid(mqvpn_config_t *cfg, const mqvpn_hybrid_config_t *src)
+{
+    if (!cfg || !src) return;
+    cfg->hybrid = *src;
+}
+
+int
+mqvpn_config_set_hybrid_connect_timeout(mqvpn_config_t *cfg, uint32_t sec)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    if (sec == 0) return MQVPN_ERR_INVALID_ARG;
+    cfg->hybrid.tcp_connect_timeout_sec = sec;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_hybrid_max_global_flows(mqvpn_config_t *cfg, uint32_t max_flows)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    /* Same not-zero rule as tcp_max_flows/tcp_connect_timeout above: this is
+     * an admission cap, not an idle-style opt-out field, so 0 (admit
+     * nothing, server-wide) is rejected as a misconfiguration rather than
+     * accepted as "disabled". */
+    if (max_flows == 0) return MQVPN_ERR_INVALID_ARG;
+    cfg->hybrid.tcp_max_global_flows = max_flows;
+    return MQVPN_OK;
+}
+
+int
+mqvpn_config_set_hybrid_egress_acl(mqvpn_config_t *cfg, const char **allow, int n_allow,
+                                   const char **deny, int n_deny)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    if (n_allow < 0 || n_allow > MQVPN_EGRESS_ACL_MAX || n_deny < 0 ||
+        n_deny > MQVPN_EGRESS_ACL_MAX)
+        return MQVPN_ERR_INVALID_ARG;
+    if ((n_allow > 0 && !allow) || (n_deny > 0 && !deny)) return MQVPN_ERR_INVALID_ARG;
+
+    /* Validate into scratch buffers first: the whole call is atomic, so a
+     * malformed entry anywhere must leave cfg untouched. */
+    mqvpn_cidr_entry_t parsed_allow[MQVPN_EGRESS_ACL_MAX];
+    mqvpn_cidr_entry_t parsed_deny[MQVPN_EGRESS_ACL_MAX];
+    for (int i = 0; i < n_allow; i++) {
+        if (mqvpn_parse_cidr(allow[i], &parsed_allow[i]) < 0)
+            return MQVPN_ERR_INVALID_ARG;
+    }
+    for (int i = 0; i < n_deny; i++) {
+        if (mqvpn_parse_cidr(deny[i], &parsed_deny[i]) < 0) return MQVPN_ERR_INVALID_ARG;
+    }
+
+    if (n_allow > 0)
+        memcpy(cfg->hybrid.egress_allow, parsed_allow,
+               sizeof(parsed_allow[0]) * (size_t)n_allow);
+    cfg->hybrid.n_egress_allow = n_allow;
+    if (n_deny > 0)
+        memcpy(cfg->hybrid.egress_deny, parsed_deny,
+               sizeof(parsed_deny[0]) * (size_t)n_deny);
+    cfg->hybrid.n_egress_deny = n_deny;
+    return MQVPN_OK;
 }

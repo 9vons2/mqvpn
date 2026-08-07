@@ -4,6 +4,10 @@ layout: home
 hero:
   name: mqvpn
   text: Modern multipath VPN built on open standards
+  image:
+    light: /img/mqvpn-lockup-violet.svg
+    dark: /img/mqvpn-lockup-violet-dark.svg
+    alt: mqvpn
   actions:
     - theme: brand
       text: Get Started
@@ -18,7 +22,7 @@ features:
     details: Minimize disruption during path changes while combining multiple paths for better performance and stability.
   - icon: 🖥️
     title: Multi-Platform
-    details: Available on Linux (client and server), with Windows (client) and Android/Kotlin support.
+    details: Available on Linux (client and server), with Windows (client), macOS (client), Android/Kotlin and iOS (in development) support.
   - icon: 🏗️
     title: Built on QUIC + MASQUE
     details: A modern VPN architecture built on open Internet standards.

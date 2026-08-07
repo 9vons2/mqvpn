@@ -11,11 +11,28 @@
 #define MQVPN_INTERNAL_H
 
 #include "libmqvpn.h"
-#include "reorder.h" /* mqvpn_reorder_config_t embedded in the builder config */
+#include "reorder.h"           /* mqvpn_reorder_config_t embedded in the builder config */
+#include "hybrid/classifier.h" /* mqvpn_hybrid_config_t embedded in the builder config */
 #include <stdbool.h>
 
 /* ─── Constants ─── */
 /* MQVPN_MAX_PATHS and MQVPN_MAX_USERS are defined in libmqvpn.h */
+
+/* Mirror of xquic's private xqc_path_state_t (third_party/xquic/
+ * src/transport/xqc_multipath.h). The library links shared xquic and sees
+ * only its public header, which types xqc_path_metrics_t.path_state as a
+ * bare uint8_t, so the enum symbols are not visible here. mqvpn depends on
+ * these values by number: the validation poll / mp-state label test ACTIVE,
+ * mqvpn_path_state_label() maps all five, and the raw value is surfaced
+ * through the public control API (mqvpn_path_stat_t.state). Use these named
+ * constants instead of bare literals; every value is pinned to the real
+ * enum at compile time by tests/test_xquic_abi_pin.c, so an upstream
+ * renumber fails the build instead of silently mislabeling paths. */
+#define MQVPN_XQC_PATH_STATE_INIT       0
+#define MQVPN_XQC_PATH_STATE_VALIDATING 1
+#define MQVPN_XQC_PATH_STATE_ACTIVE     2
+#define MQVPN_XQC_PATH_STATE_CLOSING    3
+#define MQVPN_XQC_PATH_STATE_CLOSED     4
 
 /* Server "auto" TUN MTU.  The true MASQUE datagram MSS is per-connection
  * (peer TPs, CID length, FEC headroom, PMTUD) and unknowable at server
@@ -30,6 +47,7 @@
 
 struct mqvpn_config_s {
     char server_host[256];
+    char tls_server_name[256];
     int server_port;
     char auth_key[256];
     char user_names[MQVPN_MAX_USERS][64];
@@ -39,6 +57,16 @@ struct mqvpn_config_s {
 
     mqvpn_scheduler_t scheduler;
     mqvpn_cc_t cc;
+
+    /* Reinjection (speculative multipath duplication). 0 = OFF (default,
+     * matches calloc). The three numeric fields are only consulted in
+     * DEADLINE mode; 0 there means "engine default" (110/500/20) — see
+     * mqvpn_conn_settings.c. */
+    mqvpn_reinjection_t reinjection;
+    int reinj_srtt_factor_pct;
+    int reinj_hard_deadline_ms;
+    int reinj_deadline_lower_bound_ms;
+
     mqvpn_log_level_t log_level;
     int multipath;
     int reconnect_enable;
@@ -69,6 +97,13 @@ struct mqvpn_config_s {
      * mqvpn_reorder_config_default() in mqvpn_config_new(); the library
      * consumer reads cfg->reorder. */
     mqvpn_reorder_config_t reorder;
+
+    /* Hybrid-mode classifier policy (H1). Seeded with
+     * mqvpn_hybrid_config_default() in mqvpn_config_new(); the library
+     * consumer reads cfg->hybrid. */
+    mqvpn_hybrid_config_t hybrid;
+
+    uint64_t recv_rate_limit; /* 0 = off; client-only, see libmqvpn.h */
 };
 
 /* ─── State transition validation (M0-5) ─── */
@@ -82,6 +117,13 @@ int mqvpn_state_transition_valid(mqvpn_client_state_t from, mqvpn_client_state_t
  * the platform layers so every surface honors reorder config identically. The
  * internal-only eval_force_no_demotion knob is intentionally NOT bridged. */
 void mqvpn_config_apply_reorder(mqvpn_config_t *cfg, const mqvpn_reorder_config_t *src);
+
+/* ─── Hybrid config bridge (H1) ─── */
+
+/* Translate a parsed/built hybrid config (e.g. from INI [Hybrid] via
+ * mqvpn_file_config_t) into `cfg`. Shared by the platform layers so every
+ * surface honors hybrid config identically. */
+void mqvpn_config_apply_hybrid(mqvpn_config_t *cfg, const mqvpn_hybrid_config_t *src);
 
 /* ─── Scheduler precondition predicate ─── */
 
@@ -114,10 +156,10 @@ MQVPN_INTERNAL const char *mqvpn_server_scheduler_label(const mqvpn_server_t *s)
  * Strings are URL-safe and lowercase to be usable as Prometheus label values.
  * Unknown values map to "unknown". Static storage — do not free.
  *
- * Pinned values (xqc_multipath.h xqc_path_state_t enum):
- *   0 init, 1 validating, 2 active, 3 closing, 4 closed.
- * If xquic re-orders this enum the labels become wrong; the corresponding
- * _Static_assert lives in mqvpn_server.c next to the implementation. */
+ * Values mirror xqc_multipath.h xqc_path_state_t (MQVPN_XQC_PATH_STATE_*
+ * above): 0 init, 1 validating, 2 active, 3 closing, 4 closed.
+ * If xquic re-orders this enum the labels become wrong; every value is
+ * pinned to the real enum by tests/test_xquic_abi_pin.c. */
 MQVPN_INTERNAL const char *mqvpn_path_state_label(int state);
 
 /* Snapshot of FEC / multipath counters for one client.
@@ -194,5 +236,35 @@ MQVPN_INTERNAL int mqvpn_server_get_all_fec_stats(const mqvpn_server_t *s,
  * (gap_count > 0), and per-conn detail is not required at this layer. */
 MQVPN_INTERNAL int mqvpn_server_get_reorder_stats(const mqvpn_server_t *s,
                                                   mqvpn_reorder_stats_t *out);
+MQVPN_INTERNAL int mqvpn_client_get_reorder_stats(const mqvpn_client_t *c,
+                                                  mqvpn_reorder_stats_t *out);
+
+/* Per-client snapshot of per-path reinjection TX byte counters
+ * (xqc_path_metrics_t.path_send_reinject_bytes). INTERNAL — not in public
+ * libmqvpn.h. mqvpn_path_stats_t (the public per-path struct embedded in
+ * mqvpn_client_info_t) cannot grow a field without breaking ABI (fixed
+ * array stride), so this snapshot is control_socket.c's own side channel.
+ * Index-alignment contract: see mqvpn_server_get_client_reinject() below. */
+typedef struct {
+    int n_paths;
+    struct {
+        uint64_t path_id;
+        uint64_t reinject_tx_bytes;
+    } paths[MQVPN_MAX_PATHS];
+} mqvpn_internal_client_reinject_t;
+
+/* Fills out[0..max) with each active (tunnel-established) session's
+ * per-path reinject_tx_bytes, in the SAME session-iteration order and with
+ * the SAME tunnel_established guard as mqvpn_server_get_client_info(), so
+ * the two result arrays are index-aligned within one control-command
+ * handler (the session set cannot change between the two calls — both run
+ * inside a single-threaded control-command handler). out[i] corresponds to
+ * the i-th entry of that call's client array.
+ *
+ * Returns the number of entries filled (clamped to max). Callers should
+ * still match by path_id when emitting, not rely on array-order alone. */
+MQVPN_INTERNAL int mqvpn_server_get_client_reinject(const mqvpn_server_t *s,
+                                                    mqvpn_internal_client_reinject_t *out,
+                                                    int max);
 
 #endif /* MQVPN_INTERNAL_H */

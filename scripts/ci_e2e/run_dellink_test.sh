@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 mp0rta and mqvpn contributors
 # run_dellink_test.sh — E2E test for RTM_DELLINK path removal/re-addition
 #
 # Verifies that when a network interface is removed (ip link del / USB unplug),
@@ -241,10 +243,16 @@ else
     exit 1
 fi
 
-if grep -qiE "interface.*removed|netlink.*removed" "${WORK_DIR}/client.log" 2>/dev/null; then
-    echo "OK: RTM_DELLINK handler fired"
+# `ip link del` on an UP interface makes the kernel emit a link-down
+# RTM_NEWLINK (IFF_UP cleared) BEFORE the RTM_DELLINK. Since admin down
+# drops the path immediately (v0.8.1), the drop usually fires on that
+# first event ("admin down") and the DELLINK-time call is an idempotent
+# no-op — so accept either wording for the interface-removal drop.
+if grep -qiE "interface.*(removed|admin down), closing path" \
+        "${WORK_DIR}/client.log" 2>/dev/null; then
+    echo "OK: interface removal drop fired (admin-down or DELLINK)"
 else
-    echo "=== FAIL: RTM_DELLINK not detected in client log ==="
+    echo "=== FAIL: interface-removal path drop not detected in client log ==="
     cat "${WORK_DIR}/client.log"
     exit 1
 fi
