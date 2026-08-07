@@ -68,6 +68,9 @@ class MyVpnService : MqvpnVpnService() {
 
     private val diag: DiagnosticsLog by lazy { diagnosticsLog(applicationContext) }
 
+    /** Recognises a Wi-Fi by its addressing when Android withholds the name. */
+    private val trustedNetworks: TrustedNetworks by lazy { TrustedNetworks(applicationContext) }
+
     override fun onCreate() {
         super.onCreate()
         isRunning = true
@@ -499,6 +502,7 @@ class MyVpnService : MqvpnVpnService() {
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .build()
         trustedList = trusted
+        trustedNetworks.retain(trusted)
         val handler = Handler(mainLooper)
         val onWifiCaps: (Network, NetworkCapabilities) -> Unit = { network, caps ->
             currentWifi = network to caps
@@ -607,14 +611,35 @@ class MyVpnService : MqvpnVpnService() {
      */
     private fun trustedSsidOf(network: Network, caps: NetworkCapabilities): String? {
         val key = "wifi-${ProviderDirectory.networkId(network)}"
-        val cached = providers.labels.value[key]?.takeIf { it != "Wi-Fi" }
         // Deliberately NOT falling back to currentWifiSsid(): that reports
         // whichever Wi-Fi the phone is associated with right now, not the one
         // being asked about, so during a switch it confidently returns the
         // wrong name. The 08-06 trace has it labelling wifi-478 and wifi-481 —
         // both RT-AX52-5G — as netis_82EFBC, which decides NOT_TRUSTED for a
         // trusted network. No name is recoverable; a wrong name is not.
-        return cached ?: ssidFromCaps(caps)
+        val named = providers.labels.value[key]?.takeIf { it != "Wi-Fi" }
+            ?: ssidFromCaps(caps)
+        val lp = try {
+            getSystemService(ConnectivityManager::class.java)?.getLinkProperties(network)
+        } catch (_: Exception) {
+            null
+        }
+
+        // Any moment the name does resolve is a chance to learn what this
+        // network looks like from the inside, so it can be recognised later
+        // when Android will not say the name at all.
+        if (named != null && lp != null && named in trustedList) {
+            if (trustedNetworks.learn(named, lp)) {
+                diag.log("learned the fingerprint of trusted Wi-Fi \"$named\"")
+            }
+        }
+        if (named != null) return named
+
+        // No name: fall back to recognising the network by its addressing,
+        // which arrives in the background and with location off.
+        val byFingerprint = lp?.let { trustedNetworks.identify(it) } ?: return null
+        diag.log("recognised $key as \"$byFingerprint\" by its addressing (no SSID)")
+        return byFingerprint
     }
 
     private fun ssidFromCaps(caps: NetworkCapabilities): String? {
