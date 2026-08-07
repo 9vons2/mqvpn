@@ -39,18 +39,26 @@ data class NetFingerprint(
     /**
      * Whether this is the same network as [other].
      *
-     * Either the link-local matches — one network, one randomised MAC — or the
-     * gateway and subnet both do. Gateway alone is not enough: 192.168.1.1 is
-     * the default on half the routers ever sold, and a false match here would
-     * park the tunnel on a network that needs it.
+     * A false match is the expensive direction: it parks the tunnel on a
+     * network that needs it. So every rule here is written to refuse rather
+     * than guess.
      */
     fun matches(other: NetFingerprint): Boolean {
-        val ll = linkLocal
-        if (ll != null && ll == other.linkLocal) return true
+        // When both sides have one it settles the question outright, in both
+        // directions: a per-network MAC that differs is positive evidence of
+        // a different network, not merely absence of evidence.
+        if (linkLocal != null && other.linkLocal != null) return linkLocal == other.linkLocal
+
+        // Otherwise the addressing has to carry it — and gateway plus subnet
+        // is not enough on its own. The 08-07 trace has two of this user's
+        // networks, LEDE and netis_82EFBC, both handing out 192.168.1.0/24
+        // behind 192.168.1.1; only their DNS tells them apart. Matching on
+        // the first two alone would have parked the tunnel in the car.
         return gateways.isNotEmpty() &&
             gateways == other.gateways &&
             subnets.isNotEmpty() &&
-            subnets == other.subnets
+            subnets == other.subnets &&
+            dns == other.dns
     }
 
     /** Round-trips through [parse]; stored in SharedPreferences as one string. */

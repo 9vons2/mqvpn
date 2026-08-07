@@ -81,6 +81,35 @@ class NetFingerprintTest {
         assertFalse(empty.matches(empty))
     }
 
+    /**
+     * The collision this rule exists for. Both of these are real: the Starlink
+     * router in the car and the plain router in the house hand out the same
+     * subnet behind the same gateway, and only their DNS differs. Treating
+     * them as one network would park the tunnel on the road.
+     */
+    @Test
+    fun `same subnet and gateway but different DNS is not a match`() {
+        val lede = NetFingerprint(
+            gateways = setOf("192.168.1.1"),
+            subnets = setOf("192.168.1.0/24"),
+            dns = setOf("192.168.1.1"),
+            linkLocal = null,
+        )
+        assertFalse(netis.matches(lede))
+        assertFalse(lede.matches(netis))
+    }
+
+    /**
+     * Android keeps a MAC per saved network, so two different link-locals
+     * are evidence of two different networks — not merely a failure to
+     * confirm one. The addressing must not be able to override that.
+     */
+    @Test
+    fun `two different link-locals never match, whatever the addressing says`() {
+        val twin = omr.copy(linkLocal = "fe80::dead:beef:dead:beef")
+        assertFalse(omr.matches(twin))
+    }
+
     @Test
     fun `serialize round-trips`() {
         assertEquals(omr, NetFingerprint.parse(omr.serialize()))
